@@ -1,0 +1,1042 @@
+#include <Arduino.h>
+#include <math.h>
+
+#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
+#include <SPI.h>
+#endif
+
+// Full-arm ESP32-S3 controller for the PC dashboard protocol.
+// Current v1 assumption: the PC plans trajectories and streams MOVEJ waypoints.
+// The ESP follows targets open-loop, drives only configured hardware axes, and
+// simulates disabled axes in its reported pose.
+
+#if defined(ARM_CONTROLLER_NATIVE_USB) || defined(ARM_PROTOCOL_NATIVE_USB)
+#define ARM_SERIAL Serial
+#else
+#define ARM_SERIAL Serial0
+#endif
+
+#ifndef ESP_RGB_LED_PIN
+#define ESP_RGB_LED_PIN 48
+#endif
+
+namespace {
+constexpr unsigned long kSerialWaitMs = 3000;
+constexpr uint32_t kStatusIntervalMs = 1000;
+constexpr int kJointCount = 4;
+constexpr int kMaxLineLength = 320;
+constexpr int kServoPwmResolutionBits = 14;
+constexpr int kServoPwmChannelBase = 0;
+constexpr uint32_t kServoPwmMaxDuty = (1UL << kServoPwmResolutionBits) - 1UL;
+constexpr float kDefaultHome[kJointCount] = {0.0f, 20.0f, 20.0f, 0.0f};
+constexpr float kDefaultMin[kJointCount] = {-160.0f, -30.0f, -120.0f, -120.0f};
+constexpr float kDefaultMax[kJointCount] = {160.0f, 115.0f, 120.0f, 120.0f};
+const char* kDefaultNames[kJointCount] = {"base", "shoulder", "elbow", "wrist"};
+
+#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
+#ifndef ARM_ENCODER_SCK_PIN
+#define ARM_ENCODER_SCK_PIN 18
+#endif
+#ifndef ARM_ENCODER_MISO_PIN
+#define ARM_ENCODER_MISO_PIN 19
+#endif
+#ifndef ARM_ENCODER_MOSI_PIN
+#define ARM_ENCODER_MOSI_PIN 23
+#endif
+#ifndef ARM_ENCODER_BASE_CS_PIN
+#define ARM_ENCODER_BASE_CS_PIN 5
+#endif
+#ifndef ARM_ENCODER_SHOULDER_CS_PIN
+#define ARM_ENCODER_SHOULDER_CS_PIN 7
+#endif
+constexpr uint32_t kEncoderSpiClockHz = 1000000;
+constexpr uint16_t kAs5048ReadAngleCommand = 0xFFFF;
+constexpr uint16_t kAs5048ClearErrorCommand = 0x4001;
+constexpr uint16_t kAs5048AngleMask = 0x3FFF;
+constexpr uint16_t kAs5048ErrorFlag = 0x4000;
+constexpr int kEncoderCsPins[kJointCount] = {ARM_ENCODER_BASE_CS_PIN, ARM_ENCODER_SHOULDER_CS_PIN, -1, -1};
+SPISettings encoderSpiSettings(kEncoderSpiClockHz, MSBFIRST, SPI_MODE1);
+#endif
+
+enum class ControllerState {
+  Idle,
+  Moving,
+  Stopped,
+  Estop,
+  Fault,
+};
+
+enum class ActuatorType {
+  Stepper,
+  Servo,
+  Unknown,
+};
+
+enum class AxisState {
+  Simulated,
+  Hardware,
+  Invalid,
+};
+
+struct StepperConfig {
+  int stepPin = -1;
+  int dirPin = -1;
+  int enablePin = -1;
+  bool enableActiveLow = true;
+  int m0Pin = -1;
+  int m1Pin = -1;
+  int m2Pin = -1;
+  int fullStepsPerRev = 200;
+  int microsteps = 16;
+  float gearRatio = 1.0f;
+};
+
+struct ServoConfig {
+  int pwmPin = -1;
+  int pulseMinUs = 500;
+  int pulseMaxUs = 2500;
+  int pwmFrequencyHz = 50;
+  float rangeDeg = 270.0f;
+  float neutralDeg = 135.0f;
+  float gearRatio = 1.0f;
+};
+
+struct JointConfig {
+  char name[20] = "";
+  ActuatorType actuator = ActuatorType::Unknown;
+  bool enabled = false;
+  bool received = false;
+  float zeroOffsetDeg = 0.0f;
+  int directionSign = 1;
+  float minDeg = -180.0f;
+  float maxDeg = 180.0f;
+  float homeDeg = 0.0f;
+  float maxSpeedDegS = 45.0f;
+  float maxAccelDegS2 = 120.0f;
+  StepperConfig stepper;
+  ServoConfig servo;
+  AxisState axisState = AxisState::Simulated;
+};
+
+struct StepperRuntime {
+  long currentSteps = 0;
+  long targetSteps = 0;
+  unsigned long lastStepUs = 0;
+};
+
+struct ServoRuntime {
+  int pulseUs = 1500;
+  int channel = -1;
+  bool attached = false;
+};
+
+ControllerState controllerState = ControllerState::Idle;
+JointConfig joints[kJointCount];
+JointConfig draftJoints[kJointCount];
+StepperRuntime stepperRuntime[kJointCount];
+ServoRuntime servoRuntime[kJointCount];
+float currentJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
+float targetJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
+float lastSpeedDegS = 25.0f;
+float lastAccelDegS2 = 120.0f;
+bool armed = false;
+bool homed = false;
+bool configInProgress = false;
+char faultText[40] = "OK";
+char toolState[12] = "unknown";
+float toolValue = 0.0f;
+bool encoderAvailable[kJointCount] = {false, false, false, false};
+float encoderAnglesDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+String commandLine;
+uint32_t lastStatusMs = 0;
+
+float clampFloat(float value, float minValue, float maxValue) {
+  return min(max(value, minValue), maxValue);
+}
+
+bool validPinOrUnused(int pin) {
+  return pin == -1 || (pin >= 0 && pin <= 48);
+}
+
+ActuatorType parseActuator(const String& value) {
+  if (value.equalsIgnoreCase("stepper")) {
+    return ActuatorType::Stepper;
+  }
+  if (value.equalsIgnoreCase("servo")) {
+    return ActuatorType::Servo;
+  }
+  return ActuatorType::Unknown;
+}
+
+const char* actuatorName(ActuatorType actuator) {
+  switch (actuator) {
+    case ActuatorType::Stepper:
+      return "stepper";
+    case ActuatorType::Servo:
+      return "servo";
+    case ActuatorType::Unknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+const char* stateName() {
+  switch (controllerState) {
+    case ControllerState::Idle:
+      return "idle";
+    case ControllerState::Moving:
+      return "moving";
+    case ControllerState::Stopped:
+      return "stopped";
+    case ControllerState::Estop:
+      return "estop";
+    case ControllerState::Fault:
+      return "fault";
+  }
+  return "fault";
+}
+
+JointConfig defaultJoint(int index) {
+  JointConfig joint;
+  snprintf(joint.name, sizeof(joint.name), "%s", kDefaultNames[index]);
+  joint.actuator = index < 2 ? ActuatorType::Stepper : ActuatorType::Servo;
+  joint.enabled = false;
+  joint.received = false;
+  joint.zeroOffsetDeg = 0.0f;
+  joint.directionSign = 1;
+  joint.minDeg = kDefaultMin[index];
+  joint.maxDeg = kDefaultMax[index];
+  joint.homeDeg = kDefaultHome[index];
+  joint.maxSpeedDegS = index < 2 ? 45.0f : 60.0f;
+  joint.maxAccelDegS2 = index < 2 ? 120.0f : 180.0f;
+  joint.axisState = AxisState::Simulated;
+  return joint;
+}
+
+void resetDraftConfig() {
+  for (int i = 0; i < kJointCount; i++) {
+    draftJoints[i] = defaultJoint(i);
+  }
+}
+
+void clearFaultText() {
+  strlcpy(faultText, "OK", sizeof(faultText));
+}
+
+void setFault(const char* message) {
+  controllerState = ControllerState::Fault;
+  strlcpy(faultText, message, sizeof(faultText));
+}
+
+String tokenValue(const String& line, const char* key, const String& fallback) {
+  const String prefix = String(key) + "=";
+  int start = line.indexOf(prefix);
+  if (start < 0) {
+    return fallback;
+  }
+  start += prefix.length();
+  int end = line.indexOf(' ', start);
+  if (end < 0) {
+    end = line.length();
+  }
+  return line.substring(start, end);
+}
+
+int tokenInt(const String& line, const char* key, int fallback) {
+  String value = tokenValue(line, key, "");
+  if (value.length() == 0) {
+    return fallback;
+  }
+  return value.toInt();
+}
+
+float tokenFloat(const String& line, const char* key, float fallback) {
+  String value = tokenValue(line, key, "");
+  if (value.length() == 0) {
+    return fallback;
+  }
+  return value.toFloat();
+}
+
+String tokenString(const String& line, const char* key, const String& fallback) {
+  return tokenValue(line, key, fallback);
+}
+
+String validationErrorForJoint(const JointConfig& joint, int index) {
+  if (!joint.enabled) {
+    return "";
+  }
+  if (joint.actuator == ActuatorType::Stepper) {
+    if (joint.stepper.stepPin < 0 || !validPinOrUnused(joint.stepper.stepPin)) {
+      return "joint_" + String(index + 1) + "_missing_step_pin";
+    }
+    if (joint.stepper.dirPin < 0 || !validPinOrUnused(joint.stepper.dirPin)) {
+      return "joint_" + String(index + 1) + "_missing_dir_pin";
+    }
+    if (!validPinOrUnused(joint.stepper.enablePin) || !validPinOrUnused(joint.stepper.m0Pin) ||
+        !validPinOrUnused(joint.stepper.m1Pin) || !validPinOrUnused(joint.stepper.m2Pin)) {
+      return "joint_" + String(index + 1) + "_invalid_optional_pin";
+    }
+    if (joint.stepper.fullStepsPerRev <= 0) {
+      return "joint_" + String(index + 1) + "_invalid_full_steps";
+    }
+    if (joint.stepper.microsteps <= 0) {
+      return "joint_" + String(index + 1) + "_invalid_microsteps";
+    }
+    if (joint.stepper.gearRatio <= 0.0f) {
+      return "joint_" + String(index + 1) + "_invalid_gear";
+    }
+    return "";
+  }
+  if (joint.actuator == ActuatorType::Servo) {
+    if (joint.servo.pwmPin < 0 || !validPinOrUnused(joint.servo.pwmPin)) {
+      return "joint_" + String(index + 1) + "_missing_pwm_pin";
+    }
+    if (joint.servo.pulseMinUs <= 0 || joint.servo.pulseMaxUs <= joint.servo.pulseMinUs) {
+      return "joint_" + String(index + 1) + "_invalid_pulse_range";
+    }
+    if (joint.servo.pwmFrequencyHz <= 0 || joint.servo.rangeDeg <= 0.0f || joint.servo.gearRatio <= 0.0f) {
+      return "joint_" + String(index + 1) + "_invalid_servo_mapping";
+    }
+    return "";
+  }
+  return "joint_" + String(index + 1) + "_unsupported_actuator";
+}
+
+String classifyConfig(JointConfig config[kJointCount]) {
+  for (int i = 0; i < kJointCount; i++) {
+    config[i].axisState = AxisState::Simulated;
+    const String error = validationErrorForJoint(config[i], i);
+    if (error.length() > 0) {
+      config[i].axisState = AxisState::Invalid;
+      return error;
+    }
+    if (config[i].enabled) {
+      config[i].axisState = AxisState::Hardware;
+    }
+  }
+  return "";
+}
+
+String hardwareMode() {
+  int hardwareCount = 0;
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState == AxisState::Invalid) {
+      return "invalid";
+    }
+    if (joints[i].axisState == AxisState::Hardware) {
+      hardwareCount++;
+    }
+  }
+  if (hardwareCount == kJointCount) {
+    return "hardware";
+  }
+  if (hardwareCount > 0) {
+    return "mixed";
+  }
+  return "simulated";
+}
+
+String enabledBits() {
+  String bits;
+  for (int i = 0; i < kJointCount; i++) {
+    bits += joints[i].axisState == AxisState::Hardware ? "1" : "0";
+  }
+  return bits;
+}
+
+String encoderBits() {
+  String bits;
+  for (int i = 0; i < kJointCount; i++) {
+    bits += encoderAvailable[i] ? "1" : "0";
+  }
+  return bits;
+}
+
+bool configHasInvalidAxis() {
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState == AxisState::Invalid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+float stepperStepsPerDegree(int index) {
+  const StepperConfig& stepper = joints[index].stepper;
+  return (static_cast<float>(stepper.fullStepsPerRev) * static_cast<float>(stepper.microsteps) * stepper.gearRatio) /
+         360.0f;
+}
+
+long jointDegToSteps(int index, float jointDeg) {
+  const float signedDeg = (jointDeg + joints[index].zeroOffsetDeg) * static_cast<float>(joints[index].directionSign);
+  return lroundf(signedDeg * stepperStepsPerDegree(index));
+}
+
+float stepsToJointDeg(int index, long steps) {
+  const float scale = stepperStepsPerDegree(index);
+  if (scale <= 0.0f) {
+    return currentJointsDeg[index];
+  }
+  const float signedDeg = static_cast<float>(steps) / scale;
+  return signedDeg / static_cast<float>(joints[index].directionSign) - joints[index].zeroOffsetDeg;
+}
+
+int servoPulseForJoint(int index, float jointDeg) {
+  const ServoConfig& servo = joints[index].servo;
+  const float servoDeg =
+      servo.neutralDeg + static_cast<float>(joints[index].directionSign) * (jointDeg + joints[index].zeroOffsetDeg) *
+                             servo.gearRatio;
+  const float clampedDeg = clampFloat(servoDeg, 0.0f, servo.rangeDeg);
+  const float fraction = clampedDeg / servo.rangeDeg;
+  return static_cast<int>(roundf(static_cast<float>(servo.pulseMinUs) +
+                                 fraction * static_cast<float>(servo.pulseMaxUs - servo.pulseMinUs)));
+}
+
+uint32_t servoDutyForPulse(int index, int pulseUs) {
+  const uint32_t frequency = static_cast<uint32_t>(max(1, joints[index].servo.pwmFrequencyHz));
+  const float periodUs = 1000000.0f / static_cast<float>(frequency);
+  const float duty = clampFloat(static_cast<float>(pulseUs) / periodUs, 0.0f, 1.0f);
+  return static_cast<uint32_t>(roundf(duty * static_cast<float>(kServoPwmMaxDuty)));
+}
+
+void writeServoPwm(int index, bool enabled) {
+  ServoRuntime& runtime = servoRuntime[index];
+  if (!runtime.attached || runtime.channel < 0) {
+    return;
+  }
+  ledcWrite(runtime.channel, enabled ? servoDutyForPulse(index, runtime.pulseUs) : 0);
+}
+
+void writeStepperEnable(int index, bool enabled) {
+  const StepperConfig& stepper = joints[index].stepper;
+  if (stepper.enablePin < 0) {
+    return;
+  }
+  const bool activeLevel = stepper.enableActiveLow ? LOW : HIGH;
+  digitalWrite(stepper.enablePin, enabled ? activeLevel : !activeLevel);
+}
+
+void disableHardwareOutputs() {
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+      writeStepperEnable(i, false);
+    }
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo &&
+        joints[i].servo.pwmPin >= 0) {
+      writeServoPwm(i, false);
+    }
+  }
+}
+
+void applyMicrostepPins(const StepperConfig& stepper) {
+  bool m0 = false;
+  bool m1 = false;
+  bool m2 = false;
+  if (stepper.microsteps == 2) {
+    m0 = true;
+  } else if (stepper.microsteps == 4) {
+    m1 = true;
+  } else if (stepper.microsteps == 8) {
+    m0 = true;
+    m1 = true;
+  } else if (stepper.microsteps >= 16) {
+    m0 = true;
+    m1 = true;
+    m2 = true;
+  }
+  if (stepper.m0Pin >= 0) {
+    digitalWrite(stepper.m0Pin, m0 ? HIGH : LOW);
+  }
+  if (stepper.m1Pin >= 0) {
+    digitalWrite(stepper.m1Pin, m1 ? HIGH : LOW);
+  }
+  if (stepper.m2Pin >= 0) {
+    digitalWrite(stepper.m2Pin, m2 ? HIGH : LOW);
+  }
+}
+
+void configurePins() {
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState != AxisState::Hardware) {
+      continue;
+    }
+    if (joints[i].actuator == ActuatorType::Stepper) {
+      const StepperConfig& stepper = joints[i].stepper;
+      pinMode(stepper.stepPin, OUTPUT);
+      pinMode(stepper.dirPin, OUTPUT);
+      digitalWrite(stepper.stepPin, LOW);
+      digitalWrite(stepper.dirPin, LOW);
+      if (stepper.enablePin >= 0) {
+        pinMode(stepper.enablePin, OUTPUT);
+        writeStepperEnable(i, false);
+      }
+      if (stepper.m0Pin >= 0) {
+        pinMode(stepper.m0Pin, OUTPUT);
+      }
+      if (stepper.m1Pin >= 0) {
+        pinMode(stepper.m1Pin, OUTPUT);
+      }
+      if (stepper.m2Pin >= 0) {
+        pinMode(stepper.m2Pin, OUTPUT);
+      }
+      applyMicrostepPins(stepper);
+    } else if (joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].channel = kServoPwmChannelBase + i;
+      ledcSetup(servoRuntime[i].channel, joints[i].servo.pwmFrequencyHz, kServoPwmResolutionBits);
+      ledcAttachPin(joints[i].servo.pwmPin, servoRuntime[i].channel);
+      servoRuntime[i].attached = true;
+      writeServoPwm(i, false);
+    }
+  }
+}
+
+void syncRuntimeFromCurrentPose() {
+  for (int i = 0; i < kJointCount; i++) {
+    targetJointsDeg[i] = currentJointsDeg[i];
+    if (joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].currentSteps = jointDegToSteps(i, currentJointsDeg[i]);
+      stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    } else if (joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].pulseUs = servoPulseForJoint(i, currentJointsDeg[i]);
+      writeServoPwm(i, armed && joints[i].axisState == AxisState::Hardware);
+    }
+  }
+}
+
+#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
+uint16_t encoderTransfer16(int csPin, uint16_t value) {
+  SPI.beginTransaction(encoderSpiSettings);
+  digitalWrite(csPin, LOW);
+  delayMicroseconds(1);
+  const uint16_t response = SPI.transfer16(value);
+  delayMicroseconds(1);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+  delayMicroseconds(1);
+  return response;
+}
+
+bool readAs5048AngleDeg(int csPin, float& angleDeg) {
+  encoderTransfer16(csPin, kAs5048ReadAngleCommand);
+  const uint16_t response = encoderTransfer16(csPin, 0x0000);
+  const bool error = (response & kAs5048ErrorFlag) != 0;
+  if (error) {
+    encoderTransfer16(csPin, kAs5048ClearErrorCommand);
+    encoderTransfer16(csPin, 0x0000);
+    return false;
+  }
+  const uint16_t raw = response & kAs5048AngleMask;
+  angleDeg = static_cast<float>(raw) * 360.0f / 16384.0f;
+  return true;
+}
+
+void configureEncoderPins() {
+  SPI.begin(ARM_ENCODER_SCK_PIN, ARM_ENCODER_MISO_PIN, ARM_ENCODER_MOSI_PIN);
+  for (int i = 0; i < kJointCount; i++) {
+    if (kEncoderCsPins[i] >= 0) {
+      pinMode(kEncoderCsPins[i], OUTPUT);
+      digitalWrite(kEncoderCsPins[i], HIGH);
+    }
+  }
+}
+
+void updateEncoderReadback() {
+  for (int i = 0; i < kJointCount; i++) {
+    if (kEncoderCsPins[i] < 0) {
+      encoderAvailable[i] = false;
+      continue;
+    }
+    float angleDeg = 0.0f;
+    encoderAvailable[i] = readAs5048AngleDeg(kEncoderCsPins[i], angleDeg);
+    if (encoderAvailable[i]) {
+      encoderAnglesDeg[i] = angleDeg;
+    }
+  }
+}
+#else
+void configureEncoderPins() {}
+
+void updateEncoderReadback() {}
+#endif
+
+bool validateJointLimits(const float requested[kJointCount]) {
+  for (int i = 0; i < kJointCount; i++) {
+    if (requested[i] < joints[i].minDeg || requested[i] > joints[i].maxDeg) {
+      ARM_SERIAL.printf("ERR code=LIMIT message=j%d_out_of_range\r\n", i + 1);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool hasHardwareMotionPending() {
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper &&
+        stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void setTargetPose(const float requested[kJointCount]) {
+  for (int i = 0; i < kJointCount; i++) {
+    targetJointsDeg[i] = requested[i];
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].targetSteps = jointDegToSteps(i, requested[i]);
+    } else {
+      currentJointsDeg[i] = requested[i];
+      if (joints[i].actuator == ActuatorType::Servo) {
+        servoRuntime[i].pulseUs = servoPulseForJoint(i, requested[i]);
+        writeServoPwm(i, armed && joints[i].axisState == AxisState::Hardware);
+      }
+    }
+  }
+  controllerState = hasHardwareMotionPending() ? ControllerState::Moving : ControllerState::Idle;
+  clearFaultText();
+}
+
+void printHello() {
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=arm_controller protocol=2 config=1");
+}
+
+void printStatus() {
+  updateEncoderReadback();
+  const bool knownPose = homed || encoderAvailable[0] || encoderAvailable[1];
+  ARM_SERIAL.printf(
+      "STATUS state=%s homed=%d known=%d armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
+      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f tool=%s fault=%s\r\n",
+      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, armed ? 1 : 0, hardwareMode().c_str(),
+      enabledBits().c_str(), encoderBits().c_str(), encoderAnglesDeg[0], encoderAnglesDeg[1], currentJointsDeg[0],
+      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, faultText);
+}
+
+void printError(const char* code, const String& message) {
+  ARM_SERIAL.printf("ERR code=%s message=%s\r\n", code, message.c_str());
+}
+
+void handleConfig(const String& rawCommand, const String& upperCommand) {
+  if (upperCommand.startsWith("CONFIG BEGIN")) {
+    if (armed || controllerState == ControllerState::Moving) {
+      printError("CONFIG", "disarm_and_stop_before_config");
+      return;
+    }
+    const int axes = tokenInt(rawCommand, "axes", 0);
+    if (axes != kJointCount) {
+      printError("CONFIG", "axes_must_be_4");
+      return;
+    }
+    resetDraftConfig();
+    configInProgress = true;
+    return;
+  }
+
+  if (upperCommand.startsWith("CONFIG JOINT")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    const int index = tokenInt(rawCommand, "index", 0) - 1;
+    if (index < 0 || index >= kJointCount) {
+      printError("CONFIG", "invalid_joint_index");
+      return;
+    }
+    JointConfig joint = defaultJoint(index);
+    const String name = tokenString(rawCommand, "name", kDefaultNames[index]);
+    snprintf(joint.name, sizeof(joint.name), "%s", name.c_str());
+    joint.actuator = parseActuator(tokenString(rawCommand, "actuator", actuatorName(joint.actuator)));
+    joint.enabled = tokenInt(rawCommand, "enabled", 0) != 0;
+    joint.zeroOffsetDeg = tokenFloat(rawCommand, "zero", 0.0f);
+    joint.directionSign = tokenInt(rawCommand, "sign", 1) < 0 ? -1 : 1;
+    joint.minDeg = tokenFloat(rawCommand, "min", joint.minDeg);
+    joint.maxDeg = tokenFloat(rawCommand, "max", joint.maxDeg);
+    joint.homeDeg = tokenFloat(rawCommand, "home", joint.homeDeg);
+    joint.maxSpeedDegS = tokenFloat(rawCommand, "max_speed", joint.maxSpeedDegS);
+    joint.maxAccelDegS2 = tokenFloat(rawCommand, "max_accel", joint.maxAccelDegS2);
+    if (joint.actuator == ActuatorType::Stepper) {
+      joint.stepper.stepPin = tokenInt(rawCommand, "step", -1);
+      joint.stepper.dirPin = tokenInt(rawCommand, "dir", -1);
+      joint.stepper.enablePin = tokenInt(rawCommand, "enable", -1);
+      joint.stepper.enableActiveLow = tokenInt(rawCommand, "enable_low", 1) != 0;
+      joint.stepper.m0Pin = tokenInt(rawCommand, "m0", -1);
+      joint.stepper.m1Pin = tokenInt(rawCommand, "m1", -1);
+      joint.stepper.m2Pin = tokenInt(rawCommand, "m2", -1);
+      joint.stepper.fullStepsPerRev = tokenInt(rawCommand, "full_steps", 200);
+      joint.stepper.microsteps = tokenInt(rawCommand, "microsteps", 16);
+      joint.stepper.gearRatio = tokenFloat(rawCommand, "gear", 1.0f);
+    } else if (joint.actuator == ActuatorType::Servo) {
+      joint.servo.pwmPin = tokenInt(rawCommand, "pwm", -1);
+      joint.servo.pulseMinUs = tokenInt(rawCommand, "min_us", 500);
+      joint.servo.pulseMaxUs = tokenInt(rawCommand, "max_us", 2500);
+      joint.servo.pwmFrequencyHz = tokenInt(rawCommand, "freq", 50);
+      joint.servo.rangeDeg = tokenFloat(rawCommand, "servo_range", 270.0f);
+      joint.servo.neutralDeg = tokenFloat(rawCommand, "neutral", 135.0f);
+      joint.servo.gearRatio = tokenFloat(rawCommand, "gear", 1.0f);
+    }
+    joint.received = true;
+    draftJoints[index] = joint;
+    return;
+  }
+
+  if (upperCommand.startsWith("CONFIG END")) {
+    if (!configInProgress) {
+      printError("CONFIG", "begin_required");
+      return;
+    }
+    configInProgress = false;
+    for (int i = 0; i < kJointCount; i++) {
+      if (!draftJoints[i].received) {
+        printError("CONFIG", "missing_joint_" + String(i + 1));
+        return;
+      }
+      if (draftJoints[i].minDeg >= draftJoints[i].maxDeg) {
+        printError("CONFIG", "joint_" + String(i + 1) + "_invalid_limits");
+        return;
+      }
+      if (draftJoints[i].homeDeg < draftJoints[i].minDeg || draftJoints[i].homeDeg > draftJoints[i].maxDeg) {
+        printError("CONFIG", "joint_" + String(i + 1) + "_home_out_of_range");
+        return;
+      }
+    }
+    const String error = classifyConfig(draftJoints);
+    if (error.length() > 0) {
+      printError("CONFIG", error);
+      return;
+    }
+    disableHardwareOutputs();
+    for (int i = 0; i < kJointCount; i++) {
+      joints[i] = draftJoints[i];
+    }
+    configurePins();
+    syncRuntimeFromCurrentPose();
+    clearFaultText();
+    ARM_SERIAL.printf("OK command=CONFIG axes=4 hw=%s enabled=%s\r\n", hardwareMode().c_str(), enabledBits().c_str());
+    printStatus();
+    return;
+  }
+
+  printError("CONFIG", "unknown_config_command");
+}
+
+void handleArm(const String& rawCommand) {
+  const int requested = rawCommand.substring(rawCommand.indexOf(' ') + 1).toInt();
+  if (requested != 0) {
+    if (controllerState == ControllerState::Estop) {
+      printError("ESTOP", "reset_required");
+      return;
+    }
+    if (configHasInvalidAxis()) {
+      printError("CONFIG", "hardware_config_invalid");
+      return;
+    }
+    armed = true;
+    for (int i = 0; i < kJointCount; i++) {
+      if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+        writeStepperEnable(i, true);
+      } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
+        writeServoPwm(i, true);
+      }
+    }
+    clearFaultText();
+  } else {
+    armed = false;
+    for (int i = 0; i < kJointCount; i++) {
+      targetJointsDeg[i] = currentJointsDeg[i];
+      if (joints[i].actuator == ActuatorType::Stepper) {
+        stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      }
+    }
+    disableHardwareOutputs();
+    if (controllerState != ControllerState::Estop) {
+      controllerState = ControllerState::Stopped;
+      clearFaultText();
+    }
+  }
+  ARM_SERIAL.printf("OK command=ARM armed=%d\r\n", armed ? 1 : 0);
+  printStatus();
+}
+
+void handleMoveJ(const char* buffer) {
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "reset_required");
+    return;
+  }
+  if (!armed) {
+    printError("ARM", "not_armed");
+    return;
+  }
+  if (configHasInvalidAxis()) {
+    printError("CONFIG", "hardware_config_invalid");
+    return;
+  }
+
+  float requested[kJointCount] = {};
+  float speed = 0.0f;
+  float accel = 0.0f;
+  const int parsed =
+      sscanf(buffer, "%*s %f %f %f %f %f %f", &requested[0], &requested[1], &requested[2], &requested[3], &speed, &accel);
+  if (parsed != 6) {
+    printError("USAGE", "MOVEJ_requires_j1_j2_j3_j4_speed_accel");
+    return;
+  }
+  if (speed <= 0.0f || accel <= 0.0f) {
+    printError("LIMIT", "speed_and_accel_must_be_positive");
+    return;
+  }
+  if (!validateJointLimits(requested)) {
+    return;
+  }
+
+  lastSpeedDegS = speed;
+  lastAccelDegS2 = accel;
+  setTargetPose(requested);
+  ARM_SERIAL.printf("OK command=MOVEJ hw=%s\r\n", hardwareMode().c_str());
+  printStatus();
+}
+
+void handleHome() {
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "reset_required");
+    return;
+  }
+  if (!armed) {
+    printError("ARM", "not_armed");
+    return;
+  }
+  float requested[kJointCount] = {};
+  for (int i = 0; i < kJointCount; i++) {
+    requested[i] = joints[i].homeDeg;
+  }
+  setTargetPose(requested);
+  homed = true;
+  ARM_SERIAL.println("OK command=HOME");
+  printStatus();
+}
+
+void handleSetPose(const char* buffer) {
+  if (armed) {
+    printError("ARM", "setpose_requires_disarmed");
+    return;
+  }
+  if (controllerState == ControllerState::Moving) {
+    printError("STATE", "setpose_requires_stopped");
+    return;
+  }
+  float requested[kJointCount] = {};
+  const int parsed = sscanf(buffer, "%*s %f %f %f %f", &requested[0], &requested[1], &requested[2], &requested[3]);
+  if (parsed != 4) {
+    printError("USAGE", "SETPOSE_requires_j1_j2_j3_j4");
+    return;
+  }
+  if (!validateJointLimits(requested)) {
+    return;
+  }
+  for (int i = 0; i < kJointCount; i++) {
+    currentJointsDeg[i] = requested[i];
+    targetJointsDeg[i] = requested[i];
+  }
+  syncRuntimeFromCurrentPose();
+  homed = true;
+  controllerState = ControllerState::Stopped;
+  clearFaultText();
+  ARM_SERIAL.println("OK command=SETPOSE");
+  printStatus();
+}
+
+void handleStop() {
+  for (int i = 0; i < kJointCount; i++) {
+    targetJointsDeg[i] = currentJointsDeg[i];
+    if (joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    }
+  }
+  if (controllerState != ControllerState::Estop) {
+    controllerState = ControllerState::Stopped;
+    clearFaultText();
+  }
+  ARM_SERIAL.println("OK command=STOP");
+  printStatus();
+}
+
+void handleEstop() {
+  armed = false;
+  for (int i = 0; i < kJointCount; i++) {
+    targetJointsDeg[i] = currentJointsDeg[i];
+    if (joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    }
+  }
+  disableHardwareOutputs();
+  controllerState = ControllerState::Estop;
+  strlcpy(faultText, "ESTOP", sizeof(faultText));
+  ARM_SERIAL.println("OK command=ESTOP");
+  printStatus();
+}
+
+void handleTool(const String& rawCommand, const String& upperCommand) {
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "reset_required");
+    return;
+  }
+  if (!armed) {
+    printError("ARM", "not_armed");
+    return;
+  }
+  if (upperCommand.startsWith("TOOL OPEN")) {
+    strlcpy(toolState, "open", sizeof(toolState));
+    toolValue = 0.0f;
+  } else if (upperCommand.startsWith("TOOL CLOSE")) {
+    strlcpy(toolState, "closed", sizeof(toolState));
+    toolValue = 1.0f;
+  } else if (upperCommand.startsWith("TOOL SET")) {
+    toolValue = clampFloat(tokenFloat(rawCommand, "value", toolValue), 0.0f, 1.0f);
+    strlcpy(toolState, "set", sizeof(toolState));
+  } else {
+    printError("USAGE", "TOOL_requires_OPEN_CLOSE_or_SET_value");
+    return;
+  }
+  ARM_SERIAL.printf("OK command=TOOL state=%s value=%.3f\r\n", toolState, toolValue);
+  printStatus();
+}
+
+unsigned long stepIntervalUs(int index) {
+  const float speed = max(1.0f, min(lastSpeedDegS, joints[index].maxSpeedDegS));
+  const float stepRate = max(1.0f, speed * stepperStepsPerDegree(index));
+  return static_cast<unsigned long>(1000000.0f / stepRate);
+}
+
+void updateSteppers(unsigned long nowUs) {
+  if (!armed || controllerState == ControllerState::Estop || controllerState == ControllerState::Stopped) {
+    return;
+  }
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState != AxisState::Hardware || joints[i].actuator != ActuatorType::Stepper) {
+      continue;
+    }
+    StepperRuntime& runtime = stepperRuntime[i];
+    const long delta = runtime.targetSteps - runtime.currentSteps;
+    if (delta == 0) {
+      continue;
+    }
+    const unsigned long interval = stepIntervalUs(i);
+    if (nowUs - runtime.lastStepUs < interval) {
+      continue;
+    }
+    runtime.lastStepUs = nowUs;
+    digitalWrite(joints[i].stepper.dirPin, delta > 0 ? HIGH : LOW);
+    digitalWrite(joints[i].stepper.stepPin, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(joints[i].stepper.stepPin, LOW);
+    runtime.currentSteps += delta > 0 ? 1 : -1;
+    currentJointsDeg[i] = stepsToJointDeg(i, runtime.currentSteps);
+  }
+
+  if (controllerState == ControllerState::Moving && !hasHardwareMotionPending()) {
+    controllerState = ControllerState::Idle;
+    clearFaultText();
+  }
+}
+
+void updateServoPwm(unsigned long nowUs) {
+  (void)nowUs;
+}
+
+void handleCommand(String rawCommand) {
+  rawCommand.trim();
+  if (rawCommand.length() == 0) {
+    return;
+  }
+
+  String upperCommand = rawCommand;
+  upperCommand.toUpperCase();
+
+  char buffer[kMaxLineLength] = {};
+  rawCommand.toCharArray(buffer, sizeof(buffer));
+  char command[24] = {};
+  sscanf(buffer, "%23s", command);
+
+  if (strcasecmp(command, "HELLO") == 0) {
+    printHello();
+  } else if (strcasecmp(command, "STATUS") == 0) {
+    printStatus();
+  } else if (strcasecmp(command, "CONFIG") == 0) {
+    handleConfig(rawCommand, upperCommand);
+  } else if (strcasecmp(command, "ARM") == 0) {
+    handleArm(rawCommand);
+  } else if (strcasecmp(command, "SETPOSE") == 0) {
+    handleSetPose(buffer);
+  } else if (strcasecmp(command, "MOVEJ") == 0) {
+    handleMoveJ(buffer);
+  } else if (strcasecmp(command, "STOP") == 0) {
+    handleStop();
+  } else if (strcasecmp(command, "ESTOP") == 0) {
+    handleEstop();
+  } else if (strcasecmp(command, "HOME") == 0) {
+    handleHome();
+  } else if (strcasecmp(command, "TOOL") == 0) {
+    handleTool(rawCommand, upperCommand);
+  } else {
+    printError("UNKNOWN", command);
+  }
+}
+
+void readSerialCommands() {
+  while (ARM_SERIAL.available() > 0) {
+    const char incoming = static_cast<char>(ARM_SERIAL.read());
+    if (incoming == '\n' || incoming == '\r') {
+      handleCommand(commandLine);
+      commandLine = "";
+    } else if (commandLine.length() < kMaxLineLength - 1) {
+      commandLine += incoming;
+    }
+  }
+}
+
+void turnOffOnboardRgbLed() {
+#if defined(ESP32) && defined(ARM_CONTROLLER_ENABLE_ONBOARD_RGB_OFF)
+  pinMode(ESP_RGB_LED_PIN, OUTPUT);
+  digitalWrite(ESP_RGB_LED_PIN, LOW);
+  neopixelWrite(ESP_RGB_LED_PIN, 0, 0, 0);
+#endif
+}
+}  // namespace
+
+void setup() {
+  turnOffOnboardRgbLed();
+
+  for (int i = 0; i < kJointCount; i++) {
+    joints[i] = defaultJoint(i);
+    currentJointsDeg[i] = kDefaultHome[i];
+    targetJointsDeg[i] = kDefaultHome[i];
+  }
+  resetDraftConfig();
+  classifyConfig(joints);
+  syncRuntimeFromCurrentPose();
+  configureEncoderPins();
+  clearFaultText();
+
+  ARM_SERIAL.begin(115200);
+  const unsigned long startMs = millis();
+  while (!ARM_SERIAL && millis() - startMs < kSerialWaitMs) {
+    delay(10);
+  }
+
+  lastStatusMs = millis();
+  printHello();
+  printStatus();
+}
+
+void loop() {
+  readSerialCommands();
+  const unsigned long nowUs = micros();
+  updateSteppers(nowUs);
+  updateServoPwm(nowUs);
+
+  const uint32_t nowMs = millis();
+  if (nowMs - lastStatusMs >= kStatusIntervalMs) {
+    lastStatusMs = nowMs;
+    printStatus();
+  }
+  (void)lastAccelDegS2;
+}

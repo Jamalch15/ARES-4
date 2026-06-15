@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local robot/app configuration
+pc_app/config/robot.local.yaml
+
+# Build and editor artifacts
+.cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+test-results/
+playwright-report/
+
+# KiCad generated/transient files
+*.lck
+*-backups/
+*.bak
+.history/
+
+# PlatformIO generated files
+.pio/
+
+# OS files
+Thumbs.db
+Desktop.ini

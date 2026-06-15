@@ -1,0 +1,380 @@
+:root {
+  color-scheme: dark;
+  --bg: #101318;
+  --panel: #171c23;
+  --panel-2: #1d242d;
+  --border: #2e3844;
+  --text: #eef4f8;
+  --muted: #95a5b4;
+  --accent: #4aa8ff;
+  --accent-strong: #2e8ee6;
+  --green: #54d18b;
+  --danger: #ff4d57;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  width: min(1280px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 24px 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 28px;
+  line-height: 1.1;
+  font-weight: 760;
+}
+
+h2 {
+  font-size: 15px;
+  margin-bottom: 14px;
+}
+
+p,
+label,
+.field-group > span,
+.control-row label,
+.metrics span {
+  color: var(--muted);
+}
+
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.tab {
+  border: 1px solid var(--border);
+  background: #202832;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+
+.tab.selected {
+  background: var(--accent-strong);
+  border-color: #63b8ff;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #657180;
+  box-shadow: 0 0 0 4px rgba(101, 113, 128, 0.16);
+}
+
+.dot.connected {
+  background: var(--green);
+  box-shadow: 0 0 0 4px rgba(84, 209, 139, 0.18);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1.15fr 0.9fr;
+  gap: 16px;
+}
+
+.servo-grid {
+  grid-template-columns: 0.9fr 1.15fr 0.9fr;
+}
+
+.panel,
+.console-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+
+.panel {
+  padding: 18px;
+}
+
+.status-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.dial {
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+}
+
+.dial-ring {
+  position: relative;
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  border: 12px solid #28313c;
+  background:
+    radial-gradient(circle at center, var(--panel) 0 56%, transparent 57%),
+    conic-gradient(from 210deg, var(--accent), #73e0a9, #394552 70%);
+}
+
+.needle {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 82px;
+  background: var(--text);
+  border-radius: 4px;
+  transform-origin: center bottom;
+  transform: translate(-50%, -100%) rotate(0deg);
+  transition: transform 180ms ease;
+}
+
+.dial-value {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+}
+
+.dial-value strong {
+  display: block;
+  font-size: 42px;
+  line-height: 1;
+}
+
+.dial-value span {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.servo-readout {
+  min-height: 260px;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  border-radius: 6px;
+  background:
+    linear-gradient(135deg, rgba(74, 168, 255, 0.18), rgba(84, 209, 139, 0.1)),
+    var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.servo-readout strong {
+  font-size: 56px;
+  line-height: 1;
+}
+
+.servo-readout span {
+  color: var(--muted);
+  margin-top: 8px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.metrics div {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.metrics strong {
+  display: block;
+  margin-top: 5px;
+  font-size: 20px;
+}
+
+.control-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+  margin-bottom: 22px;
+}
+
+.field-group {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.segmented,
+.microsteps,
+.actions,
+.manual {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.button,
+.segment,
+.chip {
+  border: 1px solid var(--border);
+  background: #202832;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 9px 12px;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.button.primary,
+.segment.selected,
+.chip.selected {
+  background: var(--accent-strong);
+  border-color: #63b8ff;
+}
+
+.button.danger {
+  background: var(--danger);
+  border-color: #ff8b92;
+  color: #fff;
+}
+
+.button.large {
+  flex: 1 1 140px;
+  padding-block: 13px;
+  font-weight: 700;
+}
+
+.button.small {
+  padding: 6px 9px;
+  font-size: 13px;
+}
+
+.input-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.input-grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.input-grid label {
+  display: grid;
+  gap: 6px;
+}
+
+input[type="number"],
+input[type="text"] {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: #11161c;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 10px 11px;
+}
+
+.manual {
+  flex-wrap: nowrap;
+}
+
+.manual input {
+  min-width: 0;
+}
+
+.console-panel {
+  margin-top: 16px;
+  overflow: hidden;
+}
+
+.console-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+
+#consoleLog {
+  height: 220px;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  background: #0b0f14;
+  color: #c6d3df;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+@media (max-width: 980px) {
+  .topbar,
+  .connection {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .input-grid.three {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Motor Control</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="topbar">
+        <div>
+          <h1>Motor Control</h1>
+          <p>ESP32-S3 USB serial controller</p>
+        </div>
+        <div class="connection">
+          <span id="connectionDot" class="dot"></span>
+          <span id="connectionLabel">Disconnected</span>
+          <button id="connectButton" class="button primary">Connect</button>
+          <button id="disconnectButton" class="button" disabled>Disconnect</button>
+        </div>
+      </section>
+
+      <nav class="tabs" aria-label="Motor type">
+        <button class="tab selected" data-tab="stepper">Stepper</button>
+        <button class="tab" data-tab="servo">Servo</button>
+      </nav>
+
+      <section id="stepperTab" class="tab-panel active">
+        <section class="grid">
+          <section class="panel status-panel">
+            <div class="dial">
+              <div class="dial-ring">
+                <div id="directionNeedle" class="needle"></div>
+                <div class="dial-value">
+                  <strong id="rpmValue">0.0</strong>
+                  <span>rpm</span>
+                </div>
+              </div>
+            </div>
+            <div class="metrics">
+              <div>
+                <span>Mode</span>
+                <strong id="modeValue">stop</strong>
+              </div>
+              <div>
+                <span>Direction</span>
+                <strong id="dirValue">FWD</strong>
+              </div>
+              <div>
+                <span>Target</span>
+                <strong id="targetRpmValue">120</strong>
+              </div>
+              <div>
+                <span>Microstep</span>
+                <strong id="microstepValue">8</strong>
+              </div>
+              <div>
+                <span>Gear</span>
+                <strong id="gearRatioValue">1.00</strong>
+              </div>
+              <div>
+                <span>Remaining</span>
+                <strong id="remainingValue">0</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel controls-panel">
+            <div class="control-row">
+              <label for="rpmSlider">Speed</label>
+              <output id="rpmOutput">120 rpm</output>
+            </div>
+            <input id="rpmSlider" type="range" min="1" max="300" value="120" />
+
+            <div class="control-row">
+              <label for="rampSlider">Ramp</label>
+              <output id="rampOutput">1000 ms</output>
+            </div>
+            <input id="rampSlider" type="range" min="0" max="5000" step="100" value="1000" />
+
+            <div class="input-grid three">
+              <label>
+                DIR pin
+                <input id="stepperDirPinInput" type="number" value="16" min="-1" step="1" />
+              </label>
+              <label>
+                STEP pin
+                <input id="stepperStepPinInput" type="number" value="17" min="-1" step="1" />
+              </label>
+              <label>
+                EN pin
+                <input id="stepperEnablePinInput" type="number" value="-1" min="-1" step="1" />
+              </label>
+            </div>
+
+            <div class="input-grid three">
+              <label>
+                M0 pin
+                <input id="stepperM0PinInput" type="number" value="3" min="-1" step="1" />
+              </label>
+              <label>
+                M1 pin
+                <input id="stepperM1PinInput" type="number" value="8" min="-1" step="1" />
+              </label>
+              <label>
+                M2 pin
+                <input id="stepperM2PinInput" type="number" value="18" min="-1" step="1" />
+              </label>
+            </div>
+
+            <button id="applyStepperPinsButton" class="button">Apply Stepper Pins</button>
+
+            <div class="field-group">
+              <label for="gearRatioInput">Gear ratio</label>
+              <input id="gearRatioInput" type="number" value="1" min="0.01" max="500" step="0.01" />
+            </div>
+
+            <div class="field-group">
+              <span>Direction</span>
+              <div class="segmented" id="directionGroup">
+                <button class="segment selected" data-direction="FWD">Forward</button>
+                <button class="segment" data-direction="REV">Reverse</button>
+              </div>
+            </div>
+
+            <div class="field-group">
+              <span>Microstep</span>
+              <div class="microsteps" id="microstepGroup">
+                <button class="chip" data-microstep="1">1</button>
+                <button class="chip" data-microstep="2">1/2</button>
+                <button class="chip" data-microstep="4">1/4</button>
+                <button class="chip selected" data-microstep="8">1/8</button>
+                <button class="chip" data-microstep="16">1/16</button>
+                <button class="chip" data-microstep="32">1/32</button>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button id="runButton" class="button primary large">Run Continuous</button>
+              <button id="stopButton" class="button large">Stop</button>
+              <button id="estopButton" class="button danger large">E-Stop</button>
+            </div>
+          </section>
+
+          <section class="panel move-panel">
+            <h2>Fixed Stepper Move</h2>
+            <div class="input-grid">
+              <label>
+                Degrees
+                <input id="degreesInput" type="number" value="360" min="0" step="1" />
+              </label>
+              <label>
+                Rotations
+                <input id="rotationsInput" type="number" value="1" min="0" step="0.25" />
+              </label>
+            </div>
+            <div class="actions">
+              <button id="moveDegreesButton" class="button primary">Move Degrees</button>
+              <button id="moveRotationsButton" class="button primary">Move Rotations</button>
+            </div>
+
+            <h2>Manual Commands</h2>
+            <div class="manual">
+              <input id="manualCommand" type="text" value="STATUS" />
+              <button id="sendManualButton" class="button">Send</button>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <section id="servoTab" class="tab-panel">
+        <section class="grid servo-grid">
+          <section class="panel status-panel">
+            <div class="servo-readout">
+              <strong id="servoAngleValue">135.0</strong>
+              <span>degrees</span>
+            </div>
+            <div class="metrics">
+              <div>
+                <span>Attached</span>
+                <strong id="servoAttachedValue">0</strong>
+              </div>
+              <div>
+                <span>Pin</span>
+                <strong id="servoPinValue">47</strong>
+              </div>
+              <div>
+                <span>Pulse</span>
+                <strong id="servoPulseValue">1500</strong>
+              </div>
+              <div>
+                <span>Duty</span>
+                <strong id="servoDutyValue">0</strong>
+              </div>
+              <div>
+                <span>Range</span>
+                <strong id="servoRangeValue">270</strong>
+              </div>
+              <div>
+                <span>Sweep</span>
+                <strong id="servoSweepValue">off</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel controls-panel">
+            <h2>Servo Setup</h2>
+            <div class="input-grid">
+              <label>
+                PWM pin
+                <input id="servoPinInput" type="number" value="47" min="-1" step="1" />
+              </label>
+              <label>
+                Frequency Hz
+                <input id="servoFrequencyInput" type="number" value="50" min="20" max="400" step="1" />
+              </label>
+            </div>
+            <div class="input-grid">
+              <label>
+                Min pulse us
+                <input id="servoMinPulseInput" type="number" value="500" min="100" max="3000" step="10" />
+              </label>
+              <label>
+                Max pulse us
+                <input id="servoMaxPulseInput" type="number" value="2500" min="500" max="3500" step="10" />
+              </label>
+            </div>
+            <div class="input-grid">
+              <label>
+                Servo travel degrees
+                <input id="servoRangeInput" type="number" value="270" min="1" max="360" step="1" />
+              </label>
+              <label>
+                Move time ms
+                <input id="servoMoveMsInput" type="number" value="300" min="0" max="10000" step="50" />
+              </label>
+            </div>
+            <div class="actions">
+              <button id="servoAttachButton" class="button primary">Attach / Apply</button>
+              <button id="servoTestButton" class="button">Test Sweep</button>
+              <button id="servoDetachButton" class="button">Detach</button>
+            </div>
+
+            <div class="control-row">
+              <label for="servoAngleSlider">Angle</label>
+              <output id="servoAngleOutput">135 deg</output>
+            </div>
+            <input id="servoAngleSlider" type="range" min="0" max="270" value="135" />
+
+            <div class="field-group">
+              <label for="servoPulseInput">Direct pulse width us</label>
+              <div class="manual">
+                <input id="servoPulseInput" type="number" value="1500" min="100" max="3500" step="10" />
+                <button id="servoPulseButton" class="button">Send Pulse</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel move-panel">
+            <h2>Servo Sweep</h2>
+            <div class="input-grid">
+              <label>
+                Min angle
+                <input id="servoSweepMinInput" type="number" value="0" min="0" max="270" step="1" />
+              </label>
+              <label>
+                Max angle
+                <input id="servoSweepMaxInput" type="number" value="270" min="0" max="270" step="1" />
+              </label>
+            </div>
+            <label>
+              Period ms
+              <input id="servoSweepPeriodInput" type="number" value="2000" min="100" step="100" />
+            </label>
+            <div class="actions">
+              <button id="servoSweepButton" class="button primary">Start Sweep</button>
+              <button id="servoStopButton" class="button">Stop Sweep</button>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <section class="console-panel">
+        <div class="console-header">
+          <span>Serial Console</span>
+          <button id="clearConsoleButton" class="button small">Clear</button>
+        </div>
+        <pre id="consoleLog"></pre>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

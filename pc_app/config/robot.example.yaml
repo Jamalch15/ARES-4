@@ -1,0 +1,205 @@
+# Example configuration for the simulation-first 4DOF robot arm dashboard.
+# All values are placeholders until the physical arm is measured and calibrated.
+
+simulation_default: true
+
+coordinate_frame_notes: >
+  Working assumption only. Origin is the center of the base rotation axis on the
+  mounting plane. +Z points upward. The arm points along global +Y when base is
+  0 deg. X is horizontal sideways after base rotation. Shoulder angle is measured
+  from vertical +Z toward the local horizontal reach direction.
+
+links_mm:
+  # Placeholder measurements. Replace with measured center-to-center distances.
+  base_height: 160.0
+  upper_arm: 150.0
+  forearm: 150.0
+  wrist: 50.0
+  tool: 0.0
+
+joints:
+  - name: base
+    actuator: stepper
+    limits_deg:
+      min: -160.0
+      max: 160.0
+    home_deg: 0.0
+    max_speed_deg_s: 45.0
+    max_accel_deg_s2: 12.0
+    zero_offset_deg: 0.0
+    direction_sign: 1
+    hardware:
+      stepper:
+        enabled: false
+        step_pin: 3
+        dir_pin: 4
+        enable_pin: 6
+        enable_active_low: true
+        m0_pin: 3
+        m1_pin: 8
+        m2_pin: 18
+        driver_model: DRV8825
+        motor_full_steps_per_rev: 200
+        microsteps: 16
+        gear_ratio: 27
+
+  - name: shoulder
+    actuator: stepper
+    limits_deg:
+      min: -30.0
+      max: 115.0
+    home_deg: 20.0
+    max_speed_deg_s: 35.0
+    max_accel_deg_s2: 12.0
+    zero_offset_deg: 0.0
+    direction_sign: 1
+    hardware:
+      stepper:
+        enabled: true
+        step_pin: 4
+        dir_pin: 5
+        enable_pin: -1
+        enable_active_low: true
+        m0_pin: 40
+        m1_pin: 41
+        m2_pin: 42
+        driver_model: DRV8825
+        motor_full_steps_per_rev: 200
+        microsteps: 4
+        gear_ratio: 27
+
+  - name: elbow
+    actuator: servo
+    limits_deg:
+      min: -120.0
+      max: 120.0
+    home_deg: 20.0
+    max_speed_deg_s: 60.0
+    max_accel_deg_s2: 18.0
+    zero_offset_deg: 0.0
+    direction_sign: 1
+    hardware:
+      servo:
+        enabled: true
+        pwm_pin: 10
+        pulse_min_us: 500
+        pulse_max_us: 2500
+        pwm_frequency_hz: 50
+        servo_range_deg: 270
+        neutral_deg: 135
+        gear_ratio: 1
+
+  - name: wrist
+    actuator: servo
+    limits_deg:
+      min: -120.0
+      max: 120.0
+    home_deg: 0.0
+    max_speed_deg_s: 80.0
+    max_accel_deg_s2: 22.0
+    zero_offset_deg: 0.0
+    direction_sign: 1
+    hardware:
+      servo:
+        enabled: false
+        pwm_pin: 48
+        pulse_min_us: 500
+        pulse_max_us: 2500
+        pwm_frequency_hz: 50
+        servo_range_deg: 270
+        neutral_deg: 135
+        gear_ratio: 1
+
+motion:
+  update_rate_hz: 30
+  smoothing_alpha: 0.35
+  command_rate_limit_hz: 12.0
+  acceleration_deg_s2: 10.0
+  allow_sudden_jumps: false
+
+serial:
+  # COM12 is the currently detected ESP32-S3 CH343 USB serial port.
+  port: COM12
+  baud_rate: 115200
+  timeout_s: 0.2
+
+named_positions:
+  # Working demo placeholders. Save measured values into robot.local.yaml.
+  home:
+    type: joint
+    angles_deg: [0.0, 20.0, 20.0, 0.0]
+  safe:
+    type: joint
+    angles_deg: [0.0, 35.0, 15.0, 0.0]
+  pickup_test:
+    type: cartesian
+    target:
+      x_mm: 0.0
+      y_mm: 180.0
+      z_mm: 45.0
+      phi_deg: 0.0
+  dropoff_a:
+    type: cartesian
+    target:
+      x_mm: -120.0
+      y_mm: 180.0
+      z_mm: 45.0
+      phi_deg: 0.0
+  dropoff_b:
+    type: cartesian
+    target:
+      x_mm: 120.0
+      y_mm: 180.0
+      z_mm: 45.0
+      phi_deg: 0.0
+
+camera:
+  enabled: false
+  source_index: 0
+  calibration:
+    image_points: []
+    robot_points: []
+
+color_profiles:
+  red:
+    enabled: true
+    hsv_min: [0, 80, 60]
+    hsv_max: [12, 255, 255]
+    min_area_px: 250
+    drop_zone: dropoff_a
+  blue:
+    enabled: true
+    hsv_min: [95, 80, 50]
+    hsv_max: [130, 255, 255]
+    min_area_px: 250
+    drop_zone: dropoff_b
+
+drop_zones:
+  dropoff_a:
+    x_mm: -120.0
+    y_mm: 180.0
+    z_mm: 45.0
+    phi_deg: 0.0
+  dropoff_b:
+    x_mm: 120.0
+    y_mm: 180.0
+    z_mm: 45.0
+    phi_deg: 0.0
+
+task_defaults:
+  safe_position: safe
+  approach_height_mm: 80.0
+  pickup_height_mm: 25.0
+  dropoff_height_mm: 45.0
+  default_drop_zone: dropoff_a
+
+tool:
+  type: servo_gripper
+  open_value: 0.0
+  closed_value: 1.0
+
+future_transport_notes:
+  bluetooth: >
+    Later Bluetooth support should implement the same high-level transport
+    interface as serial. Robot state, safety, FK, and UI logic should not need
+    to change when the transport is swapped.

@@ -1,0 +1,1415 @@
+import { RobotView } from "/static/robot_view.js";
+
+const state = {
+  config: null,
+  robotState: null,
+  ws: null,
+  commandTimer: null,
+  pendingAngles: null,
+  draftAngles: null,
+  lastSentAngles: null,
+  view: null,
+  activeTab: "joint",
+  previewId: null,
+  latestPreview: null,
+  viewPreviewSource: null,
+  ikPreviewTimer: null,
+  ikPreviewInFlight: false,
+  ikPreviewQueued: false,
+  ikPreviewWantedSeq: 0,
+  lastIkPreviewMs: 0,
+  ikPreviewSeq: 0,
+  ikUserEdited: false,
+  liveTargetTimer: null,
+  liveTargetInFlight: false,
+  liveTargetQueued: false,
+  pendingLiveTarget: null,
+  programWaypoints: [],
+  hardwareDraftDirty: false,
+  taskPreviewId: null,
+};
+
+const linkCalibrationFields = [
+  ["base_height", "L1 base"],
+  ["upper_arm", "L2 upper"],
+  ["forearm", "L3 forearm"],
+  ["wrist", "Wrist"],
+  ["tool", "Tool"],
+];
+
+const targetDefs = [
+  ["x", "X", "x_mm", "mm", 1],
+  ["y", "Y", "y_mm", "mm", 1],
+  ["z", "Z", "z_mm", "mm", 1],
+  ["phi", "Phi", "phi_deg", "deg", 0.5],
+];
+
+const $ = (selector) => document.querySelector(selector);
+
+const elements = {
+  appLayout: $("#appLayout"),
+  appTabs: document.querySelectorAll("[data-app-tab]"),
+  appTabPanels: {
+    joint: $("#jointTab"),
+    operate: $("#operateTab"),
+    ik: $("#ikTab"),
+    program: $("#programTab"),
+    settings: $("#settingsTab"),
+  },
+  panelResizer: $("#panelResizer"),
+  collapsePanelBtn: $("#collapsePanelBtn"),
+  jointControls: $("#jointControls"),
+  connectionBadge: $("#connectionBadge"),
+  modeBadge: $("#modeBadge"),
+  motionBadge: $("#motionBadge"),
+  armedBadge: $("#armedBadge"),
+  commandRate: $("#commandRate"),
+  eeCompact: $("#eeCompact"),
+  targetHud: $("#targetHud"),
+  pathHud: $("#pathHud"),
+  statusPill: $("#statusPill"),
+  fkX: $("#fkX"),
+  fkY: $("#fkY"),
+  fkZ: $("#fkZ"),
+  fkPitch: $("#fkPitch"),
+  lastCommand: $("#lastCommand"),
+  lastError: $("#lastError"),
+  portStatus: $("#portStatus"),
+  serialPort: $("#serialPort"),
+  baudRate: $("#baudRate"),
+  resetViewBtn: $("#resetViewBtn"),
+  togglePreviewBtn: $("#togglePreviewBtn"),
+  togglePathBtn: $("#togglePathBtn"),
+  toggleFramesBtn: $("#toggleFramesBtn"),
+  connectSimBtn: $("#connectSimBtn"),
+  connectSerialBtn: $("#connectSerialBtn"),
+  disconnectBtn: $("#disconnectBtn"),
+  homeBtn: $("#homeBtn"),
+  stopBtn: $("#stopBtn"),
+  estopBtn: $("#estopBtn"),
+  clearEstopBtn: $("#clearEstopBtn"),
+  liveJogToggle: $("#liveJogToggle"),
+  liveRealToggle: $("#liveRealToggle"),
+  applyJointPreviewBtn: $("#applyJointPreviewBtn"),
+  resetJointPreviewBtn: $("#resetJointPreviewBtn"),
+  hardwareArmToggle: $("#hardwareArmToggle"),
+  globalSpeedInput: $("#globalSpeedInput"),
+  globalAccelInput: $("#globalAccelInput"),
+  waypointRateInput: $("#waypointRateInput"),
+  cartesianStepInput: $("#cartesianStepInput"),
+  plannerTypeSelect: $("#plannerTypeSelect"),
+  jerkPercentInput: $("#jerkPercentInput"),
+  blendPercentInput: $("#blendPercentInput"),
+  perJointTuning: $("#perJointTuning"),
+  linkCalibration: $("#linkCalibration"),
+  jointCalibration: $("#jointCalibration"),
+  hardwareIo: $("#hardwareIo"),
+  hardwareStatus: $("#hardwareStatus"),
+  syncHardwareBtn: $("#syncHardwareBtn"),
+  saveCalibrationBtn: $("#saveCalibrationBtn"),
+  calibrationStatus: $("#calibrationStatus"),
+  ikTargetControls: $("#ikTargetControls"),
+  sliderRangeControls: $("#sliderRangeControls"),
+  ikModeSelect: $("#ikModeSelect"),
+  ikBranchSelect: $("#ikBranchSelect"),
+  previewIkBtn: $("#previewIkBtn"),
+  executeIkBtn: $("#executeIkBtn"),
+  ikStopBtn: $("#ikStopBtn"),
+  ikEstopBtn: $("#ikEstopBtn"),
+  ikCandidateList: $("#ikCandidateList"),
+  ikPathSummary: $("#ikPathSummary"),
+  previewStatus: $("#previewStatus"),
+  programWaypointType: $("#programWaypointType"),
+  programMoveMode: $("#programMoveMode"),
+  addCurrentJointWaypointBtn: $("#addCurrentJointWaypointBtn"),
+  addIkWaypointBtn: $("#addIkWaypointBtn"),
+  clearProgramBtn: $("#clearProgramBtn"),
+  previewProgramBtn: $("#previewProgramBtn"),
+  executeProgramBtn: $("#executeProgramBtn"),
+  programList: $("#programList"),
+  programStatus: $("#programStatus"),
+  namedPositionsList: $("#namedPositionsList"),
+  refreshEventsBtn: $("#refreshEventsBtn"),
+  eventLog: $("#eventLog"),
+  toolStatus: $("#toolStatus"),
+  toolOpenBtn: $("#toolOpenBtn"),
+  toolCloseBtn: $("#toolCloseBtn"),
+  toolHalfBtn: $("#toolHalfBtn"),
+  taskModeSelect: $("#taskModeSelect"),
+  dropZoneSelect: $("#dropZoneSelect"),
+  sortColorSelect: $("#sortColorSelect"),
+  previewTaskBtn: $("#previewTaskBtn"),
+  executeTaskBtn: $("#executeTaskBtn"),
+  taskStatus: $("#taskStatus"),
+  taskSummary: $("#taskSummary"),
+  detectVisionBtn: $("#detectVisionBtn"),
+  visionProfileList: $("#visionProfileList"),
+  visionSummary: $("#visionSummary"),
+};
+
+function format(value, decimals = 1) {
+  return Number(value || 0).toFixed(decimals);
+}
+
+function readNumber(input, fallback = 0) {
+  const value = Number(input?.value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+async function postJson(url, body = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  if (!payload.ok && payload.error) showLocalError(payload.error);
+  return payload;
+}
+
+function showLocalError(message) {
+  if (elements.lastError) elements.lastError.textContent = message || "-";
+  if (elements.statusPill && message) elements.statusPill.textContent = message;
+  if (elements.previewStatus && message) elements.previewStatus.textContent = message;
+}
+
+function isMoveEnabled() {
+  if (!state.robotState) return false;
+  return (
+    (state.robotState.connected || state.robotState.simulation) &&
+    state.robotState.motion_state !== "estop" &&
+    state.robotState.motion_state !== "fault"
+  );
+}
+
+function linkDefaults() {
+  const links = state.config?.links_mm || {};
+  return {
+    l1: links.base_height_mm || 0,
+    l2: links.upper_arm_mm || 0,
+    l3: links.forearm_mm || 0,
+    l4: (links.wrist_mm || 0) + (links.tool_mm || 0),
+  };
+}
+
+function buildJointControls() {
+  elements.jointControls.innerHTML = "";
+  state.config.joints.forEach((joint, index) => {
+    const row = document.createElement("div");
+    row.className = "joint-row";
+    row.innerHTML = `
+      <div>
+        <div class="joint-name">${joint.name}</div>
+        <div class="joint-meta">${format(joint.min_deg)}..${format(joint.max_deg)} deg</div>
+      </div>
+      <div>
+        <input class="joint-slider" type="range" min="${joint.min_deg}" max="${joint.max_deg}" step="0.1" data-index="${index}" />
+        <div class="joint-values">
+          <span>Preview <strong id="target-${index}">0.0 deg</strong></span>
+          <span>Reported <strong id="reported-${index}">0.0 deg</strong></span>
+        </div>
+      </div>
+      <input class="angle-input" type="number" min="${joint.min_deg}" max="${joint.max_deg}" step="0.1" data-index="${index}" aria-label="${joint.name} angle" />
+    `;
+    elements.jointControls.appendChild(row);
+  });
+}
+
+function buildPerJointTuning() {
+  elements.perJointTuning.innerHTML = "";
+  state.config.joints.forEach((joint, index) => {
+    const row = document.createElement("div");
+    row.className = "tuning-row";
+    row.innerHTML = `
+      <strong>${joint.name}</strong>
+      <label>Max speed <input class="joint-speed-limit" data-index="${index}" type="number" min="0.1" step="1" value="${format(joint.max_speed_deg_s, 1)}" /></label>
+      <label>Max accel <input class="joint-accel-limit" data-index="${index}" type="number" min="0.1" step="5" value="${format(joint.max_accel_deg_s2, 1)}" /></label>
+    `;
+    elements.perJointTuning.appendChild(row);
+  });
+}
+
+function buildCalibrationEditors() {
+  const links = state.config.links_mm;
+  const values = {
+    base_height: links.base_height_mm,
+    upper_arm: links.upper_arm_mm,
+    forearm: links.forearm_mm,
+    wrist: links.wrist_mm,
+    tool: links.tool_mm,
+  };
+  elements.linkCalibration.innerHTML = "";
+  linkCalibrationFields.forEach(([key, label]) => {
+    const field = document.createElement("label");
+    field.innerHTML = `${label}<input data-link-key="${key}" type="number" min="0" step="0.1" value="${format(values[key], 1)}" />`;
+    elements.linkCalibration.appendChild(field);
+  });
+
+  elements.jointCalibration.innerHTML = "";
+  state.config.joints.forEach((joint, index) => {
+    const row = document.createElement("div");
+    row.className = "calibration-row";
+    row.innerHTML = `
+      <strong>${joint.name}</strong>
+      <label>Min <input data-joint-index="${index}" data-calib-limit="min" type="number" step="0.1" value="${format(joint.min_deg, 1)}" /></label>
+      <label>Max <input data-joint-index="${index}" data-calib-limit="max" type="number" step="0.1" value="${format(joint.max_deg, 1)}" /></label>
+      <label>Home <input data-joint-index="${index}" data-calib-field="home_deg" type="number" step="0.1" value="${format(joint.home_deg, 1)}" /></label>
+      <label>Zero <input data-joint-index="${index}" data-calib-field="zero_offset_deg" type="number" step="0.1" value="${format(joint.zero_offset_deg, 1)}" /></label>
+      <label>Dir
+        <select data-joint-index="${index}" data-calib-field="direction_sign">
+          <option value="1" ${joint.direction_sign === 1 ? "selected" : ""}>+1</option>
+          <option value="-1" ${joint.direction_sign === -1 ? "selected" : ""}>-1</option>
+        </select>
+      </label>
+    `;
+    elements.jointCalibration.appendChild(row);
+  });
+}
+
+function buildHardwareIoEditors() {
+  elements.hardwareIo.innerHTML = "";
+  state.config.joints.forEach((joint, index) => {
+    const row = document.createElement("div");
+    row.className = "hardware-row";
+    row.dataset.hardwareIndex = String(index);
+    const axisState = state.robotState?.hardware_axis_states?.[index] || "simulated";
+    if (joint.actuator === "servo") {
+      const servo = joint.hardware?.servo || {};
+      row.innerHTML = `
+        <div class="hardware-title">
+          <strong>${joint.name} servo</strong>
+          <span class="badge">${axisState}</span>
+        </div>
+        <label class="toggle-label compact-toggle">
+          <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="enabled" type="checkbox" ${servo.enabled ? "checked" : ""} />
+          <span>Enabled</span>
+        </label>
+        <div class="hardware-grid">
+          <label>PWM GPIO <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="pwm_pin" type="number" step="1" value="${servo.pwm_pin ?? -1}" /></label>
+          <label>Min us <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="pulse_min_us" type="number" min="100" step="10" value="${servo.pulse_min_us ?? 500}" /></label>
+          <label>Max us <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="pulse_max_us" type="number" min="100" step="10" value="${servo.pulse_max_us ?? 2500}" /></label>
+          <label>Frequency <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="pwm_frequency_hz" type="number" min="1" step="1" value="${servo.pwm_frequency_hz ?? 50}" /></label>
+          <label>Range deg <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="servo_range_deg" type="number" min="1" step="1" value="${servo.servo_range_deg ?? 270}" /></label>
+          <label>Neutral deg <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="neutral_deg" type="number" step="0.1" value="${servo.neutral_deg ?? 135}" /></label>
+          <label>Gear ratio <input data-hw-index="${index}" data-hw-kind="servo" data-hw-field="gear_ratio" type="number" min="0.0001" step="0.001" value="${servo.gear_ratio ?? 1}" /></label>
+        </div>
+      `;
+    } else {
+      const stepper = joint.hardware?.stepper || {};
+      row.innerHTML = `
+        <div class="hardware-title">
+          <strong>${joint.name} stepper</strong>
+          <span class="badge">${axisState}</span>
+        </div>
+        <div class="button-row">
+          <label class="toggle-label compact-toggle">
+            <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="enabled" type="checkbox" ${stepper.enabled ? "checked" : ""} />
+            <span>Enabled</span>
+          </label>
+          <label class="toggle-label compact-toggle">
+            <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="enable_active_low" type="checkbox" ${stepper.enable_active_low !== false ? "checked" : ""} />
+            <span>Enable active low</span>
+          </label>
+        </div>
+        <div class="hardware-grid">
+          <label>STEP GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="step_pin" type="number" step="1" value="${stepper.step_pin ?? -1}" /></label>
+          <label>DIR GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="dir_pin" type="number" step="1" value="${stepper.dir_pin ?? -1}" /></label>
+          <label>ENABLE GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="enable_pin" type="number" step="1" value="${stepper.enable_pin ?? -1}" /></label>
+          <label>M0 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m0_pin" type="number" step="1" value="${stepper.m0_pin ?? -1}" /></label>
+          <label>M1 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m1_pin" type="number" step="1" value="${stepper.m1_pin ?? -1}" /></label>
+          <label>M2 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m2_pin" type="number" step="1" value="${stepper.m2_pin ?? -1}" /></label>
+          <label>Driver <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="driver_model" type="text" value="${stepper.driver_model || "TBD"}" /></label>
+          <label>Full steps/rev <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="motor_full_steps_per_rev" type="number" min="1" step="1" value="${stepper.motor_full_steps_per_rev ?? 200}" /></label>
+          <label>Microsteps <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="microsteps" type="number" min="1" step="1" value="${stepper.microsteps ?? 16}" /></label>
+          <label>Gear ratio <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="gear_ratio" type="number" min="0.0001" step="0.001" value="${stepper.gear_ratio ?? 1}" /></label>
+        </div>
+      `;
+    }
+    elements.hardwareIo.appendChild(row);
+  });
+}
+
+function renderHardwareStatus(robotState = state.robotState) {
+  if (!elements.hardwareStatus || !robotState) return;
+  const axisText = (robotState.hardware_axis_states || []).map((value, index) => `J${index + 1}:${value}`).join(" ");
+  elements.hardwareStatus.innerHTML = `
+    <div class="log-line"><span>Coverage</span><code>${robotState.hardware_mode || "simulated"} (${robotState.hardware_enabled_axes || "0000"})</code></div>
+    <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
+    <div class="log-line"><span>Axes</span><code>${axisText || "-"}</code></div>
+    <div class="log-line"><span>Message</span><code>${robotState.config_sync_message || "-"}</code></div>
+  `;
+  if (state.hardwareDraftDirty) {
+    renderHardwareDraftBadges();
+    return;
+  }
+  elements.hardwareIo.querySelectorAll("[data-hardware-index]").forEach((row) => {
+    const index = Number(row.dataset.hardwareIndex);
+    const badge = row.querySelector(".hardware-title .badge");
+    if (badge) badge.textContent = robotState.hardware_axis_states?.[index] || "simulated";
+  });
+}
+
+function renderOperatorPanels() {
+  if (!state.config || !elements.namedPositionsList) return;
+  const positions = state.config.named_positions || {};
+  elements.namedPositionsList.innerHTML = "";
+  Object.entries(positions).forEach(([name, position]) => {
+    const item = document.createElement("div");
+    item.className = "program-item";
+    const kind = position.type || "joint";
+    const target = position.target || {};
+    const label =
+      kind === "joint"
+        ? (position.angles_deg || []).map((value) => format(value, 1)).join(", ")
+        : `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, phi ${format(target.phi_deg)}`;
+    item.innerHTML = `
+      <div class="program-title"><span>${name}</span><span>${kind}</span></div>
+      <code>${label}</code>
+      <div class="button-row">
+        <button type="button" class="ghost" data-named-preview="${name}">Preview</button>
+        <button type="button" data-named-apply="${name}">Move</button>
+      </div>
+    `;
+    elements.namedPositionsList.appendChild(item);
+  });
+
+  elements.dropZoneSelect.innerHTML = "";
+  Object.keys(state.config.drop_zones || {}).forEach((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    elements.dropZoneSelect.appendChild(option);
+  });
+
+  elements.sortColorSelect.innerHTML = "";
+  elements.visionProfileList.innerHTML = "";
+  Object.entries(state.config.color_profiles || {}).forEach(([name, profile]) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    elements.sortColorSelect.appendChild(option);
+    const line = document.createElement("div");
+    line.className = "log-line";
+    line.innerHTML = `<span>${name}</span><code>${profile.enabled === false ? "off" : "on"} -> ${profile.drop_zone || "-"}</code>`;
+    elements.visionProfileList.appendChild(line);
+  });
+}
+
+async function refreshEvents() {
+  if (!elements.eventLog) return;
+  const response = await fetch("/api/events?limit=80");
+  const payload = await response.json();
+  elements.eventLog.innerHTML = "";
+  (payload.events || []).reverse().forEach((event) => {
+    const line = document.createElement("div");
+    line.className = "log-line";
+    const ts = new Date((event.ts || 0) * 1000).toLocaleTimeString();
+    line.innerHTML = `<span>${ts} ${event.source}</span><code>${event.message}</code>`;
+    elements.eventLog.appendChild(line);
+  });
+}
+
+function namedPositionWaypoint(name) {
+  const position = state.config?.named_positions?.[name];
+  if (!position) return null;
+  if ((position.type || "joint") === "joint") {
+    return { type: "joint", mode: "joint", angles_deg: (position.angles_deg || []).map(Number) };
+  }
+  return { type: "cartesian", mode: "joint", target: position.target || position };
+}
+
+async function previewNamedPosition(name) {
+  const waypoint = namedPositionWaypoint(name);
+  if (!waypoint) return;
+  const payload = await postJson("/api/path/preview", {
+    mode: "program",
+    branch: elements.ikBranchSelect.value,
+    settings: pathSettings(),
+    waypoints: [waypoint],
+  });
+  if (payload.ok) renderPreview(payload.preview);
+  else renderPreviewFailure(payload);
+}
+
+async function moveNamedPosition(name) {
+  await previewNamedPosition(name);
+  if (state.previewId) await executePreview();
+}
+
+async function sendTool(action, value = null) {
+  const payload = await postJson("/api/tool", { action, value });
+  if (payload.state) renderState(payload.state);
+  await refreshEvents();
+}
+
+function renderTaskSummary(sequence, preview) {
+  const steps = sequence?.steps || [];
+  const trajectory = preview?.trajectory || {};
+  elements.taskSummary.innerHTML = `
+    <div class="log-line"><span>Steps</span><code>${steps.length}</code></div>
+    <div class="log-line"><span>Moves</span><code>${sequence?.waypoints?.length || 0}</code></div>
+    <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
+    <div class="log-line"><span>Drop zone</span><code>${sequence?.drop_zone || "-"}</code></div>
+  `;
+}
+
+async function previewTask() {
+  elements.taskStatus.textContent = "Previewing...";
+  const task = elements.taskModeSelect.value;
+  const objectTarget = ikTargetPayload();
+  const request =
+    task === "sorting"
+      ? {
+          task,
+          detection: { color: elements.sortColorSelect.value, robot: objectTarget },
+          settings: pathSettings(),
+          branch: elements.ikBranchSelect.value,
+        }
+      : {
+          task,
+          object_target: objectTarget,
+          drop_zone: elements.dropZoneSelect.value,
+          settings: pathSettings(),
+          branch: elements.ikBranchSelect.value,
+        };
+  const payload = await postJson("/api/task/preview", request);
+  if (payload.ok) {
+    state.taskPreviewId = payload.preview_id;
+    renderPreview(payload.preview);
+    renderTaskSummary(payload.sequence, payload.preview);
+    elements.executeTaskBtn.disabled = false;
+    elements.taskStatus.textContent = "Preview ready";
+  } else {
+    renderPreviewFailure(payload);
+    elements.taskStatus.textContent = payload.error || "Task preview failed";
+  }
+  await refreshEvents();
+}
+
+async function executeTask() {
+  if (!state.taskPreviewId) return;
+  const payload = await postJson("/api/task/execute", { preview_id: state.taskPreviewId });
+  elements.taskStatus.textContent = payload.ok ? "Task running" : payload.error || "Task failed";
+  await refreshEvents();
+}
+
+async function detectVision() {
+  elements.visionSummary.innerHTML = `<div class="log-line"><span>Status</span><code>Detecting...</code></div>`;
+  const payload = await postJson("/api/vision/detect", {
+    profile_names: elements.sortColorSelect.value ? [elements.sortColorSelect.value] : null,
+  });
+  elements.visionSummary.innerHTML = "";
+  if (!payload.ok) {
+    elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
+    return;
+  }
+  (payload.detections || []).forEach((detection) => {
+    const line = document.createElement("div");
+    line.className = "log-line";
+    const center = detection.center_px ? `px ${format(detection.center_px.x, 0)}, ${format(detection.center_px.y, 0)}` : detection.reason || "-";
+    const robot = detection.robot ? ` robot ${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}` : "";
+    line.innerHTML = `<span>${detection.color}</span><code>${detection.ok ? center + robot : detection.reason}</code>`;
+    elements.visionSummary.appendChild(line);
+  });
+  await refreshEvents();
+}
+
+function hardwareDraftState(index, actuator) {
+  const patch = readHardwarePatch(index, actuator)[actuator] || {};
+  if (!patch.enabled) return "draft simulated";
+  if (actuator === "stepper") {
+    const valid =
+      patch.step_pin >= 0 &&
+      patch.dir_pin >= 0 &&
+      patch.motor_full_steps_per_rev > 0 &&
+      patch.microsteps > 0 &&
+      patch.gear_ratio > 0;
+    return valid ? "draft hardware" : "draft invalid";
+  }
+  const valid =
+    patch.pwm_pin >= 0 &&
+    patch.pulse_min_us > 0 &&
+    patch.pulse_max_us > patch.pulse_min_us &&
+    patch.pwm_frequency_hz > 0 &&
+    patch.servo_range_deg > 0 &&
+    patch.gear_ratio > 0;
+  return valid ? "draft hardware" : "draft invalid";
+}
+
+function renderHardwareDraftBadges() {
+  if (!elements.hardwareIo || !state.config) return;
+  elements.hardwareIo.querySelectorAll("[data-hardware-index]").forEach((row) => {
+    const index = Number(row.dataset.hardwareIndex);
+    const joint = state.config.joints[index];
+    if (!joint) return;
+    const badge = row.querySelector(".hardware-title .badge");
+    row.classList.toggle("draft-dirty", state.hardwareDraftDirty);
+    if (badge) badge.textContent = hardwareDraftState(index, joint.actuator);
+  });
+}
+
+function markHardwareDraftDirty() {
+  state.hardwareDraftDirty = true;
+  renderHardwareDraftBadges();
+  if (elements.calibrationStatus) {
+    elements.calibrationStatus.textContent = "Hardware IO has unsaved draft changes. Press Save or Sync ESP.";
+  }
+}
+
+function buildIkTargetControls() {
+  elements.ikTargetControls.innerHTML = "";
+  targetDefs.forEach(([key, label, , unit, step]) => {
+    const row = document.createElement("div");
+    row.className = "target-row";
+    row.innerHTML = `
+      <strong>${label}</strong>
+      <input id="ik-${key}-slider" data-target-key="${key}" type="range" step="${step}" />
+      <input id="ik-${key}-input" data-target-key="${key}" type="number" step="${step}" aria-label="${label} target" title="${unit}" />
+    `;
+    elements.ikTargetControls.appendChild(row);
+  });
+}
+
+function buildSliderRanges() {
+  const links = linkDefaults();
+  const reach = links.l2 + links.l3 + links.l4;
+  const ranges = {
+    x: [-reach, reach],
+    y: [-reach, reach],
+    z: [Math.max(0, links.l1 - reach), links.l1 + reach],
+    phi: [-180, 180],
+  };
+  elements.sliderRangeControls.innerHTML = "";
+  targetDefs.forEach(([key, label]) => {
+    const field = document.createElement("label");
+    field.innerHTML = `${label} min/max
+      <div class="range-row">
+        <input data-range-key="${key}" data-range-side="min" type="number" step="1" value="${format(ranges[key][0], 0)}" />
+        <input data-range-key="${key}" data-range-side="max" type="number" step="1" value="${format(ranges[key][1], 0)}" />
+      </div>`;
+    elements.sliderRangeControls.appendChild(field);
+  });
+  applySliderRanges();
+}
+
+function applySliderRanges() {
+  targetDefs.forEach(([key]) => {
+    const slider = $(`#ik-${key}-slider`);
+    const number = $(`#ik-${key}-input`);
+    const min = readNumber($(`[data-range-key="${key}"][data-range-side="min"]`), -100);
+    const max = readNumber($(`[data-range-key="${key}"][data-range-side="max"]`), 100);
+    if (!slider || !number) return;
+    slider.min = String(min);
+    slider.max = String(max);
+    number.min = String(min);
+    number.max = String(max);
+    const next = clamp(readNumber(number, 0), min, max);
+    slider.value = String(next);
+    number.value = format(next, key === "phi" ? 1 : 0);
+  });
+}
+
+function setIkTargetValue(key, value, userEdited = true) {
+  const slider = $(`#ik-${key}-slider`);
+  const input = $(`#ik-${key}-input`);
+  if (!slider || !input) return;
+  const decimals = key === "phi" ? 1 : 0;
+  const next = clamp(Number(value), Number(slider.min), Number(slider.max));
+  slider.value = String(next);
+  input.value = format(next, decimals);
+  if (userEdited) state.ikUserEdited = true;
+}
+
+function setIkTargetFromFk(fk) {
+  if (state.ikUserEdited || !fk) return;
+  const values = {
+    x: fk.x_mm || 0,
+    y: fk.y_mm || 0,
+    z: fk.z_mm || 0,
+    phi: fk.tool_phi_deg ?? fk.tool_pitch_deg ?? 0,
+  };
+  Object.entries(values).forEach(([key, value]) => setIkTargetValue(key, value, false));
+}
+
+function ikTargetPayload() {
+  return Object.fromEntries(
+    targetDefs.map(([key, , apiKey]) => {
+      const input = $(`#ik-${key}-input`);
+      return [apiKey, readNumber(input, 0)];
+    }),
+  );
+}
+
+function pathSettings() {
+  return {
+    global_speed_deg_s: readNumber(elements.globalSpeedInput, 25),
+    global_accel_deg_s2: readNumber(elements.globalAccelInput, 120),
+    waypoint_rate_hz: readNumber(elements.waypointRateInput, 12),
+    cartesian_step_mm: readNumber(elements.cartesianStepInput, 10),
+    planner_type: elements.plannerTypeSelect.value,
+    jerk_percent: readNumber(elements.jerkPercentInput, 25),
+    blend_percent: readNumber(elements.blendPercentInput, 0),
+    per_joint_speed_deg_s: [...document.querySelectorAll(".joint-speed-limit")].map((input) => readNumber(input, 1)),
+    per_joint_accel_deg_s2: [...document.querySelectorAll(".joint-accel-limit")].map((input) => readNumber(input, 1)),
+  };
+}
+
+function syncJointInputs(targets, reported) {
+  targets.forEach((angle, index) => {
+    const slider = elements.jointControls.querySelector(`.joint-slider[data-index="${index}"]`);
+    const input = elements.jointControls.querySelector(`.angle-input[data-index="${index}"]`);
+    const targetLabel = $(`#target-${index}`);
+    const reportedLabel = $(`#reported-${index}`);
+    if (!slider || !input || !targetLabel || !reportedLabel) return;
+    if (document.activeElement !== slider) slider.value = angle;
+    if (document.activeElement !== input) input.value = format(angle, 1);
+    targetLabel.textContent = `${format(angle, 1)} deg`;
+    reportedLabel.textContent = `${format(reported[index], 1)} deg`;
+  });
+}
+
+function queueTarget(angles) {
+  state.pendingAngles = angles.slice();
+  const hz = state.config.motion.command_rate_limit_hz || 12;
+  const delayMs = Math.max(25, 1000 / hz);
+  if (state.commandTimer) return;
+  state.commandTimer = window.setTimeout(sendPendingTarget, delayMs);
+}
+
+function sendPendingTarget() {
+  if (state.pendingAngles) {
+    state.lastSentAngles = state.pendingAngles.slice();
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ command: "set_all_joint_targets", angles_deg: state.pendingAngles }));
+    } else {
+      postJson("/api/joints", { angles_deg: state.pendingAngles });
+    }
+  }
+  state.commandTimer = null;
+  if (state.pendingAngles && !anglesAlmostEqual(state.pendingAngles, state.lastSentAngles)) queueTarget(state.pendingAngles);
+}
+
+function anglesAlmostEqual(a, b, tolerance = 0.01) {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((value, index) => Math.abs(value - b[index]) <= tolerance);
+}
+
+function setBadge(el, text, type) {
+  el.textContent = text;
+  el.className = `badge ${type || ""}`.trim();
+}
+
+function liveRealEnabled() {
+  return Boolean(elements.liveRealToggle.checked && state.robotState?.live_motion_enabled);
+}
+
+function updateDisabledState() {
+  const enabled = isMoveEnabled();
+  elements.jointControls.querySelectorAll("input").forEach((input) => {
+    input.disabled = !enabled;
+  });
+  elements.applyJointPreviewBtn.disabled = !enabled || !state.draftAngles;
+  elements.resetJointPreviewBtn.disabled = !state.draftAngles;
+  elements.homeBtn.disabled = !enabled;
+  elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
+  elements.clearEstopBtn.disabled = !state.robotState?.simulation;
+  elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
+  elements.executeIkBtn.disabled = !state.previewId || !enabled;
+  elements.executeProgramBtn.disabled = !state.previewId || !enabled || state.latestPreview?.mode !== "program";
+  if (elements.previewTaskBtn) elements.previewTaskBtn.disabled = !state.config;
+  if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = !state.taskPreviewId || !enabled;
+}
+
+function renderState(robotState) {
+  state.robotState = robotState;
+  setBadge(elements.connectionBadge, robotState.connected ? "Connected" : "Disconnected", robotState.connected ? "badge-ok" : "badge-danger");
+  setBadge(elements.modeBadge, robotState.simulation ? "Simulation" : "Hardware", robotState.simulation ? "badge-warn" : "badge-ok");
+  setBadge(
+    elements.motionBadge,
+    robotState.motion_state,
+    robotState.motion_state === "estop" || robotState.motion_state === "fault" ? "badge-danger" : "",
+  );
+  setBadge(elements.armedBadge, robotState.hardware_armed ? "Armed" : "Disarmed", robotState.hardware_armed ? "badge-danger" : "");
+  if (elements.toolStatus) elements.toolStatus.textContent = robotState.tool_state || "unknown";
+
+  if (!robotState.live_motion_enabled) elements.liveRealToggle.checked = false;
+  const targets = state.draftAngles || state.pendingAngles || robotState.target_angles_deg;
+  syncJointInputs(targets, robotState.reported_angles_deg);
+  state.view.setAngles(robotState.reported_angles_deg);
+  if (state.activeTab === "joint" && state.draftAngles && !elements.liveJogToggle.checked) {
+    state.viewPreviewSource = "joint";
+    state.view.setPreviewAngles(state.draftAngles);
+  } else if (state.viewPreviewSource === "joint") {
+    clearViewPreview();
+  }
+
+  const fk = robotState.fk || {};
+  elements.fkX.textContent = `${format(fk.x_mm)} mm`;
+  elements.fkY.textContent = `${format(fk.y_mm)} mm`;
+  elements.fkZ.textContent = `${format(fk.z_mm)} mm`;
+  elements.fkPitch.textContent = `${format(fk.tool_phi_deg ?? fk.tool_pitch_deg)} deg`;
+  elements.eeCompact.textContent = `x ${format(fk.x_mm)}, y ${format(fk.y_mm)}, z ${format(fk.z_mm)} mm`;
+  elements.lastCommand.textContent = robotState.last_command || "-";
+  elements.lastError.textContent = robotState.last_error || "-";
+  elements.portStatus.textContent = robotState.serial_port || (robotState.simulation ? "simulation" : "-");
+  elements.hardwareArmToggle.checked = Boolean(robotState.hardware_armed);
+  renderHardwareStatus(robotState);
+  const hardwareSuffix = robotState.simulation ? "" : ` - ${robotState.hardware_mode}/${robotState.config_sync_status}`;
+  elements.statusPill.textContent = robotState.last_error || `${robotState.motion_state}${robotState.live_motion_enabled ? " - live real" : ""}${hardwareSuffix}`;
+  setIkTargetFromFk(fk);
+  updateDisabledState();
+}
+
+function renderPreview(preview) {
+  state.previewId = preview.id;
+  state.latestPreview = preview;
+  state.viewPreviewSource = preview.mode === "program" ? "program" : "ik";
+  const ik = preview.ik || {};
+  const trajectory = preview.trajectory || {};
+  const candidates = ik.candidates || [];
+  elements.previewStatus.textContent = `Preview ready: ${preview.mode}`;
+  elements.programStatus.textContent = preview.mode === "program" ? `Ready - ${trajectory.waypoint_count || 0} pts` : elements.programStatus.textContent;
+  elements.ikCandidateList.innerHTML = "";
+
+  if (!candidates.length) {
+    const empty = document.createElement("div");
+    empty.className = "candidate";
+    empty.textContent = preview.mode === "program" ? "Program preview ready." : (ik.notes || ["No IK candidates"]).join("; ");
+    elements.ikCandidateList.appendChild(empty);
+  }
+
+  candidates.forEach((candidate) => {
+    const item = document.createElement("div");
+    item.className = `candidate ${candidate.valid ? "" : "invalid"} ${candidate.branch === ik.selected_branch ? "selected" : ""}`;
+    item.innerHTML = `
+      <div class="candidate-title">
+        <span>${candidate.branch.replace("_", " ")}</span>
+        <span>${candidate.valid ? "valid" : "rejected"}</span>
+      </div>
+      <div class="angle-list">
+        ${candidate.angles_deg.map((angle, index) => `<div><span>J${index + 1}</span><strong>${format(angle, 2)} deg</strong></div>`).join("")}
+      </div>
+      <div class="small">FK error ${format(candidate.position_error_mm, 3)} mm, phi ${format(candidate.phi_error_deg, 3)} deg</div>
+      <div class="small">${candidate.reasons?.join("; ") || ""}</div>
+    `;
+    elements.ikCandidateList.appendChild(item);
+  });
+
+  const segments = trajectory.segments || [];
+  const segmentText = segments.length ? segments.map((segment) => `${segment.type}/${segment.mode}:${segment.waypoint_count}`).join(", ") : "-";
+  elements.ikPathSummary.innerHTML = `
+    <h3>Path</h3>
+    <div class="log-line"><span>Mode</span><code>${trajectory.mode || preview.mode || "-"}</code></div>
+    <div class="log-line"><span>Profile</span><code>${trajectory.profile || "-"}</code></div>
+    <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
+    <div class="log-line"><span>Waypoints</span><code>${trajectory.waypoint_count || 0}</code></div>
+    <div class="log-line"><span>Branch</span><code>${ik.selected_branch || "-"}</code></div>
+    <div class="log-line"><span>Segments</span><code>${segmentText}</code></div>
+  `;
+
+  const lastWaypoint = trajectory.waypoints?.[trajectory.waypoints.length - 1];
+  if (ik.selected?.angles_deg) {
+    state.view.setPreviewAngles(ik.selected.angles_deg);
+  } else if (lastWaypoint) {
+    state.view.setPreviewAngles(lastWaypoint);
+  }
+
+  const target = preview.target?.x_mm !== undefined ? preview.target : trajectory.cartesian_waypoints?.[trajectory.cartesian_waypoints.length - 1];
+  state.view.setTargetPoint(target || null);
+  state.view.setPathWaypoints(trajectory.waypoints || []);
+  elements.targetHud.textContent = target ? `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}` : "none";
+  elements.pathHud.textContent = `${trajectory.waypoint_count || 0} pts`;
+  updateDisabledState();
+}
+
+function renderPreviewFailure(payload) {
+  state.previewId = null;
+  state.latestPreview = null;
+  clearViewPreview();
+  elements.executeIkBtn.disabled = true;
+  elements.executeProgramBtn.disabled = true;
+  elements.previewStatus.textContent = payload.error || "Preview failed";
+  elements.ikCandidateList.innerHTML = "";
+  const ik = payload.ik || {};
+  (ik.candidates || []).forEach((candidate) => {
+    const item = document.createElement("div");
+    item.className = `candidate ${candidate.valid ? "" : "invalid"}`;
+    item.textContent = `${candidate.branch}: ${candidate.reasons?.join("; ") || "not selected"}`;
+    elements.ikCandidateList.appendChild(item);
+  });
+  elements.ikPathSummary.innerHTML = `<h3>Path</h3><div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
+}
+
+async function previewIkPath() {
+  window.clearTimeout(state.ikPreviewTimer);
+  state.ikPreviewTimer = null;
+  if (state.ikPreviewInFlight) {
+    state.ikPreviewQueued = true;
+    return;
+  }
+
+  state.ikPreviewInFlight = true;
+  state.ikPreviewQueued = false;
+  state.lastIkPreviewMs = performance.now();
+  const requestSeq = state.ikPreviewWantedSeq;
+  state.ikPreviewSeq = requestSeq;
+  elements.previewStatus.textContent = "Previewing...";
+  elements.executeIkBtn.disabled = true;
+
+  try {
+    const payload = await postJson("/api/path/preview", {
+      target: ikTargetPayload(),
+      mode: elements.ikModeSelect.value,
+      branch: elements.ikBranchSelect.value,
+      settings: pathSettings(),
+    });
+    if (requestSeq === state.ikPreviewWantedSeq) {
+      if (payload.ok) renderPreview(payload.preview);
+      else renderPreviewFailure(payload);
+    }
+  } finally {
+    state.ikPreviewInFlight = false;
+    if (state.ikPreviewQueued) scheduleIkPreview(0);
+  }
+}
+
+function scheduleIkPreview(delayMs = 35) {
+  if (!state.config || !state.robotState) return;
+  state.ikPreviewWantedSeq += 1;
+  if (state.ikPreviewInFlight) {
+    state.ikPreviewQueued = true;
+    return;
+  }
+  window.clearTimeout(state.ikPreviewTimer);
+  const elapsedMs = performance.now() - state.lastIkPreviewMs;
+  const waitMs = Math.max(0, delayMs - elapsedMs);
+  state.ikPreviewTimer = window.setTimeout(() => previewIkPath(), waitMs);
+}
+
+function scheduleLiveTarget(payload, delayMs = 90) {
+  if (!liveRealEnabled()) return;
+  state.pendingLiveTarget = payload;
+  if (state.liveTargetInFlight) {
+    state.liveTargetQueued = true;
+    return;
+  }
+  window.clearTimeout(state.liveTargetTimer);
+  state.liveTargetTimer = window.setTimeout(sendLiveTarget, delayMs);
+}
+
+async function sendLiveTarget() {
+  if (!state.pendingLiveTarget || !liveRealEnabled()) return;
+  const payload = state.pendingLiveTarget;
+  state.pendingLiveTarget = null;
+  state.liveTargetInFlight = true;
+  state.liveTargetQueued = false;
+  try {
+    await postJson("/api/live-target", { ...payload, settings: pathSettings() });
+  } finally {
+    state.liveTargetInFlight = false;
+    if (state.liveTargetQueued && state.pendingLiveTarget) scheduleLiveTarget(state.pendingLiveTarget, 0);
+  }
+}
+
+async function executePreview() {
+  if (!state.previewId) return;
+  await postJson("/api/path/execute", { preview_id: state.previewId });
+}
+
+function renderProgramList() {
+  elements.programList.innerHTML = "";
+  elements.programStatus.textContent = `${state.programWaypoints.length} waypoint${state.programWaypoints.length === 1 ? "" : "s"}`;
+  if (!state.programWaypoints.length) {
+    const empty = document.createElement("div");
+    empty.className = "program-item";
+    empty.textContent = "No waypoints yet.";
+    elements.programList.appendChild(empty);
+    return;
+  }
+  state.programWaypoints.forEach((waypoint, index) => {
+    const item = document.createElement("div");
+    item.className = "program-item";
+    const label =
+      waypoint.type === "joint"
+        ? waypoint.angles_deg.map((value) => format(value, 1)).join(", ")
+        : `x ${format(waypoint.target.x_mm)}, y ${format(waypoint.target.y_mm)}, z ${format(waypoint.target.z_mm)}, phi ${format(waypoint.target.phi_deg)}`;
+    item.innerHTML = `
+      <div class="program-title">
+        <span>${index + 1}. ${waypoint.type} / ${waypoint.mode}</span>
+        <span>${waypoint.type === "joint" ? "deg" : "mm"}</span>
+      </div>
+      <code>${label}</code>
+      <div class="button-row">
+        <button type="button" class="ghost" data-program-action="up" data-program-index="${index}">Up</button>
+        <button type="button" class="ghost" data-program-action="down" data-program-index="${index}">Down</button>
+        <button type="button" class="danger" data-program-action="delete" data-program-index="${index}">Delete</button>
+      </div>
+    `;
+    elements.programList.appendChild(item);
+  });
+}
+
+function addCurrentJointWaypoint() {
+  const angles = (state.draftAngles || state.robotState?.target_angles_deg || state.robotState?.reported_angles_deg || []).map(Number);
+  if (angles.length !== state.config.joints.length) return;
+  state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: angles });
+  renderProgramList();
+}
+
+function addIkWaypoint() {
+  const type = elements.programWaypointType.value;
+  const mode = elements.programMoveMode.value;
+  if (type === "joint") {
+    const selected = state.latestPreview?.ik?.selected?.angles_deg;
+    const fallback = state.robotState?.target_angles_deg;
+    state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: (selected || fallback).map(Number) });
+  } else {
+    state.programWaypoints.push({
+      type: "cartesian",
+      mode,
+      target: ikTargetPayload(),
+      branch: elements.ikBranchSelect.value,
+    });
+  }
+  renderProgramList();
+}
+
+async function previewProgram() {
+  if (!state.programWaypoints.length) {
+    elements.programStatus.textContent = "Add waypoints first";
+    return;
+  }
+  elements.programStatus.textContent = "Previewing...";
+  const payload = await postJson("/api/path/preview", {
+    mode: "program",
+    branch: elements.ikBranchSelect.value,
+    settings: pathSettings(),
+    waypoints: state.programWaypoints,
+  });
+  if (payload.ok) renderPreview(payload.preview);
+  else {
+    renderPreviewFailure(payload);
+    elements.programStatus.textContent = payload.error || "Program preview failed";
+  }
+}
+
+function readHardwarePatch(index, actuator) {
+  const patch = {};
+  document.querySelectorAll(`[data-hw-index="${index}"][data-hw-kind="${actuator}"][data-hw-field]`).forEach((input) => {
+    const field = input.dataset.hwField;
+    if (input.type === "checkbox") {
+      patch[field] = input.checked;
+    } else if (field === "driver_model") {
+      patch[field] = input.value || "TBD";
+    } else {
+      patch[field] = readNumber(input, 0);
+    }
+  });
+  return { [actuator]: patch };
+}
+
+function readCalibrationPayload() {
+  const links = Object.fromEntries(
+    [...elements.linkCalibration.querySelectorAll("[data-link-key]")].map((input) => [
+      input.dataset.linkKey,
+      readNumber(input, 0),
+    ]),
+  );
+  const joints = state.config.joints.map((joint, index) => {
+    const minInput = $(`[data-joint-index="${index}"][data-calib-limit="min"]`);
+    const maxInput = $(`[data-joint-index="${index}"][data-calib-limit="max"]`);
+    const patch = {
+      limits_deg: {
+        min: readNumber(minInput, joint.min_deg),
+        max: readNumber(maxInput, joint.max_deg),
+      },
+    };
+    document.querySelectorAll(`[data-joint-index="${index}"][data-calib-field]`).forEach((input) => {
+      const field = input.dataset.calibField;
+      patch[field] = field === "direction_sign" ? Number(input.value) : readNumber(input, joint[field]);
+    });
+    patch.hardware = joint.actuator === "servo" ? readHardwarePatch(index, "servo") : readHardwarePatch(index, "stepper");
+    patch.max_speed_deg_s = readNumber($(`.joint-speed-limit[data-index="${index}"]`), joint.max_speed_deg_s);
+    patch.max_accel_deg_s2 = readNumber($(`.joint-accel-limit[data-index="${index}"]`), joint.max_accel_deg_s2);
+    return patch;
+  });
+  return {
+    links_mm: links,
+    joints,
+    motion: {
+      command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
+      acceleration_deg_s2: readNumber(elements.globalAccelInput, state.config.motion.acceleration_deg_s2),
+    },
+  };
+}
+
+async function saveCalibration(options = {}) {
+  const showStatus = options.showStatus !== false;
+  if (showStatus) elements.calibrationStatus.textContent = "Saving calibration...";
+  const payload = await postJson("/api/config/calibration", readCalibrationPayload());
+  if (payload.ok) {
+    state.hardwareDraftDirty = false;
+    applyConfig(payload.config);
+    if (payload.state) renderState(payload.state);
+    if (options.clearPreview !== false) clearViewPreview();
+    if (showStatus) {
+      elements.calibrationStatus.textContent = payload.state?.config_sync_status === "synced"
+        ? "Calibration saved and synced to ESP."
+        : "Calibration saved to robot.local.yaml.";
+    }
+  } else {
+    elements.calibrationStatus.textContent = payload.error || "Calibration save failed.";
+  }
+  return payload;
+}
+
+function applyConfig(config) {
+  state.config = config;
+  elements.serialPort.value = state.config.serial.port;
+  elements.baudRate.value = state.config.serial.baud_rate;
+  elements.commandRate.textContent = `${format(state.config.motion.command_rate_limit_hz, 0)} Hz command limit`;
+  elements.globalSpeedInput.value = format(Math.min(...state.config.joints.map((joint) => joint.max_speed_deg_s)), 1);
+  elements.globalAccelInput.value = format(state.config.motion.acceleration_deg_s2, 1);
+  elements.waypointRateInput.value = format(state.config.motion.command_rate_limit_hz, 0);
+  elements.cartesianStepInput.value = "10";
+  elements.plannerTypeSelect.value = "s_curve";
+  elements.jerkPercentInput.value = "25";
+  elements.blendPercentInput.value = "0";
+  buildJointControls();
+  buildPerJointTuning();
+  buildCalibrationEditors();
+  buildHardwareIoEditors();
+  if (state.robotState) renderHardwareStatus(state.robotState);
+  renderOperatorPanels();
+  buildIkTargetControls();
+  buildSliderRanges();
+  renderProgramList();
+  state.view.setConfig(state.config);
+}
+
+function clearViewPreview() {
+  state.previewId = null;
+  state.latestPreview = null;
+  state.viewPreviewSource = null;
+  if (state.view) state.view.clearPreview();
+  elements.targetHud.textContent = "none";
+  elements.pathHud.textContent = "0 pts";
+  updateDisabledState();
+}
+
+async function loadConfig() {
+  const response = await fetch("/api/config");
+  applyConfig(await response.json());
+}
+
+function connectWebSocket() {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  state.ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+  state.ws.addEventListener("message", (event) => {
+    const payload = JSON.parse(event.data);
+    if (payload.type === "config") applyConfig(payload.config);
+    if (payload.type === "state") {
+      if (state.pendingAngles && anglesAlmostEqual(payload.state.target_angles_deg, state.pendingAngles)) {
+        state.pendingAngles = null;
+        if (elements.liveJogToggle.checked) state.draftAngles = null;
+      }
+      renderState(payload.state);
+    }
+  });
+  state.ws.addEventListener("close", () => {
+    window.setTimeout(connectWebSocket, 800);
+  });
+}
+
+function bindFader(element, onDelta) {
+  let dragging = false;
+  let offset = 0;
+  let pointerId = null;
+  let raf = null;
+  let lastTime = null;
+  const speed = Number(element.dataset.faderSpeed || 1);
+
+  const updateOffset = (clientX) => {
+    const rect = element.getBoundingClientRect();
+    const maxOffset = Math.max(8, rect.width / 2 - 10);
+    offset = clamp((clientX - (rect.left + rect.width / 2)) / maxOffset, -1, 1);
+    element.style.setProperty("--fader-offset", `${offset * maxOffset}px`);
+  };
+  const reset = () => {
+    offset = 0;
+    element.style.setProperty("--fader-offset", "0px");
+  };
+  const stop = () => {
+    dragging = false;
+    element.classList.remove("dragging");
+    reset();
+    if (raf) cancelAnimationFrame(raf);
+    raf = null;
+    lastTime = null;
+  };
+  const loop = (time) => {
+    if (!dragging) return;
+    if (lastTime === null) lastTime = time;
+    const dt = Math.min(0.05, (time - lastTime) / 1000);
+    lastTime = time;
+    if (Math.abs(offset) > 0.001) onDelta(speed * offset * Math.abs(offset) * dt);
+    raf = requestAnimationFrame(loop);
+  };
+
+  element.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    dragging = true;
+    pointerId = event.pointerId;
+    element.classList.add("dragging");
+    element.setPointerCapture(pointerId);
+    updateOffset(event.clientX);
+    raf = requestAnimationFrame(loop);
+  });
+  element.addEventListener("pointermove", (event) => {
+    if (dragging) updateOffset(event.clientX);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach((name) => {
+    element.addEventListener(name, () => {
+      if (pointerId !== null) {
+        try {
+          element.releasePointerCapture(pointerId);
+        } catch {
+          // Pointer capture may already be released by the browser.
+        }
+      }
+      pointerId = null;
+      stop();
+    });
+  });
+}
+
+function bindFaders() {
+  document.querySelectorAll(".target-fader").forEach((fader) => {
+    bindFader(fader, (delta) => {
+      const key = fader.dataset.faderKey;
+      const input = $(`#ik-${key}-input`);
+      if (!input) return;
+      setIkTargetValue(key, readNumber(input, 0) + delta);
+      scheduleIkPreview();
+      scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
+    });
+  });
+}
+
+function bindPanelChrome() {
+  let resizing = false;
+  let startX = 0;
+  let startWidth = 0;
+  elements.panelResizer.addEventListener("pointerdown", (event) => {
+    resizing = true;
+    startX = event.clientX;
+    startWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--left-panel-width"));
+    elements.panelResizer.setPointerCapture(event.pointerId);
+  });
+  elements.panelResizer.addEventListener("pointermove", (event) => {
+    if (!resizing) return;
+    const width = clamp(startWidth + event.clientX - startX, 420, Math.max(420, window.innerWidth - 340));
+    document.documentElement.style.setProperty("--left-panel-width", `${width}px`);
+    state.view.resize();
+  });
+  elements.panelResizer.addEventListener("pointerup", (event) => {
+    resizing = false;
+    elements.panelResizer.releasePointerCapture(event.pointerId);
+  });
+  elements.collapsePanelBtn.addEventListener("click", () => {
+    elements.appLayout.classList.toggle("collapsed");
+    window.setTimeout(() => state.view.resize(), 300);
+  });
+  document.querySelectorAll("[data-collapse-widget]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const widget = $(`#${button.dataset.collapseWidget}`);
+      widget.classList.toggle("collapsed");
+    });
+  });
+}
+
+function bindActions() {
+  elements.appTabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const target = tab.dataset.appTab;
+      state.activeTab = target;
+      elements.appTabs.forEach((candidate) => candidate.classList.toggle("active", candidate === tab));
+      Object.entries(elements.appTabPanels).forEach(([key, panel]) => panel.classList.toggle("active", key === target));
+      if (target !== "joint" && state.viewPreviewSource === "joint") {
+        clearViewPreview();
+      }
+      if (target === "joint" && state.draftAngles) {
+        state.viewPreviewSource = "joint";
+        state.view.setPreviewAngles(state.draftAngles);
+      }
+      if (target === "ik") {
+        scheduleIkPreview(0);
+      }
+      if (target === "operate") {
+        refreshEvents();
+      }
+      state.view.resize();
+    });
+  });
+
+  elements.jointControls.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!input.matches("[data-index]") || !state.robotState) return;
+    const index = Number(input.dataset.index);
+    const value = Number(input.value);
+    const next = (state.draftAngles || state.pendingAngles || state.robotState.target_angles_deg).slice();
+    next[index] = value;
+    state.draftAngles = next;
+    syncJointInputs(next, state.robotState.reported_angles_deg);
+    state.viewPreviewSource = "joint";
+    state.view.setPreviewAngles(next);
+    if (liveRealEnabled()) scheduleLiveTarget({ angles_deg: next });
+    else if (elements.liveJogToggle.checked && isMoveEnabled()) queueTarget(next);
+  });
+
+  elements.applyJointPreviewBtn.addEventListener("click", async () => {
+    const angles = state.draftAngles || state.robotState?.target_angles_deg;
+    if (!angles) return;
+    const payload = await postJson("/api/joints", { angles_deg: angles });
+    if (payload.ok) {
+      state.pendingAngles = angles.slice();
+      state.draftAngles = null;
+      clearViewPreview();
+    }
+  });
+  elements.resetJointPreviewBtn.addEventListener("click", () => {
+    state.draftAngles = null;
+    if (state.viewPreviewSource === "joint") clearViewPreview();
+    if (state.robotState) renderState(state.robotState);
+  });
+  elements.liveJogToggle.addEventListener("change", () => {
+    if (!elements.liveJogToggle.checked) state.pendingAngles = null;
+  });
+
+  elements.resetViewBtn.addEventListener("click", () => state.view.resetCamera());
+  elements.togglePreviewBtn.addEventListener("click", () => {
+    elements.togglePreviewBtn.classList.toggle("active");
+    state.view.setPreviewVisible(elements.togglePreviewBtn.classList.contains("active"));
+  });
+  elements.togglePathBtn.addEventListener("click", () => {
+    elements.togglePathBtn.classList.toggle("active");
+    state.view.setPathVisible(elements.togglePathBtn.classList.contains("active"));
+  });
+  elements.toggleFramesBtn.addEventListener("click", () => {
+    elements.toggleFramesBtn.classList.toggle("active");
+    state.view.setFramesVisible(elements.toggleFramesBtn.classList.contains("active"));
+  });
+
+  elements.connectSimBtn.addEventListener("click", () => postJson("/api/connect", { simulation: true }));
+  elements.connectSerialBtn.addEventListener("click", () =>
+    postJson("/api/connect", {
+      simulation: false,
+      port: elements.serialPort.value,
+      baud_rate: Number(elements.baudRate.value),
+    }),
+  );
+  elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
+  elements.homeBtn.addEventListener("click", () => postJson("/api/home"));
+  elements.stopBtn.addEventListener("click", () => postJson("/api/stop"));
+  elements.estopBtn.addEventListener("click", () => postJson("/api/estop"));
+  elements.clearEstopBtn.addEventListener("click", () => postJson("/api/clear-estop"));
+  elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
+  elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
+  elements.hardwareIo.addEventListener("change", markHardwareDraftDirty);
+  elements.syncHardwareBtn.addEventListener("click", async () => {
+    elements.calibrationStatus.textContent = "Saving Hardware IO draft...";
+    const savePayload = await saveCalibration({ showStatus: false, clearPreview: false });
+    if (!savePayload.ok) return;
+    elements.calibrationStatus.textContent = "Syncing saved hardware config...";
+    const payload = await postJson("/api/hardware/sync");
+    if (payload.state) renderState(payload.state);
+    elements.calibrationStatus.textContent = payload.ok
+      ? "Hardware IO saved and synced to ESP."
+      : payload.message || payload.error || "Hardware sync failed.";
+  });
+  elements.liveRealToggle.addEventListener("change", async () => {
+    const payload = await postJson("/api/live-motion", { enabled: elements.liveRealToggle.checked });
+    elements.liveRealToggle.checked = Boolean(payload.ok && payload.state?.live_motion_enabled);
+  });
+  elements.namedPositionsList.addEventListener("click", (event) => {
+    const previewButton = event.target.closest("[data-named-preview]");
+    const applyButton = event.target.closest("[data-named-apply]");
+    if (previewButton) previewNamedPosition(previewButton.dataset.namedPreview);
+    if (applyButton) moveNamedPosition(applyButton.dataset.namedApply);
+  });
+  elements.toolOpenBtn.addEventListener("click", () => sendTool("open"));
+  elements.toolCloseBtn.addEventListener("click", () => sendTool("close"));
+  elements.toolHalfBtn.addEventListener("click", () => sendTool("set", 0.5));
+  elements.previewTaskBtn.addEventListener("click", previewTask);
+  elements.executeTaskBtn.addEventListener("click", executeTask);
+  elements.detectVisionBtn.addEventListener("click", detectVision);
+  elements.refreshEventsBtn.addEventListener("click", refreshEvents);
+
+  elements.sliderRangeControls.addEventListener("input", () => {
+    state.ikUserEdited = true;
+    applySliderRanges();
+    scheduleIkPreview();
+    scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
+  });
+  elements.ikTargetControls.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!input.matches("[data-target-key]")) return;
+    state.ikUserEdited = true;
+    const key = input.dataset.targetKey;
+    const pair = input.type === "range" ? $(`#ik-${key}-input`) : $(`#ik-${key}-slider`);
+    if (pair) pair.value = input.value;
+    scheduleIkPreview();
+    scheduleLiveTarget({ target: ikTargetPayload(), mode: elements.ikModeSelect.value, branch: elements.ikBranchSelect.value });
+  });
+  elements.ikModeSelect.addEventListener("change", () => scheduleIkPreview());
+  elements.ikBranchSelect.addEventListener("change", () => scheduleIkPreview());
+  elements.previewIkBtn.addEventListener("click", () => {
+    state.ikPreviewWantedSeq += 1;
+    previewIkPath();
+  });
+  elements.executeIkBtn.addEventListener("click", () => executePreview());
+  elements.ikStopBtn.addEventListener("click", () => postJson("/api/stop"));
+  elements.ikEstopBtn.addEventListener("click", () => postJson("/api/estop"));
+
+  elements.addCurrentJointWaypointBtn.addEventListener("click", addCurrentJointWaypoint);
+  elements.addIkWaypointBtn.addEventListener("click", addIkWaypoint);
+  elements.clearProgramBtn.addEventListener("click", () => {
+    state.programWaypoints = [];
+    renderProgramList();
+  });
+  elements.previewProgramBtn.addEventListener("click", previewProgram);
+  elements.executeProgramBtn.addEventListener("click", executePreview);
+  elements.programList.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-program-action]");
+    if (!button) return;
+    const index = Number(button.dataset.programIndex);
+    const action = button.dataset.programAction;
+    if (action === "delete") state.programWaypoints.splice(index, 1);
+    if (action === "up" && index > 0) {
+      [state.programWaypoints[index - 1], state.programWaypoints[index]] = [state.programWaypoints[index], state.programWaypoints[index - 1]];
+    }
+    if (action === "down" && index < state.programWaypoints.length - 1) {
+      [state.programWaypoints[index + 1], state.programWaypoints[index]] = [state.programWaypoints[index], state.programWaypoints[index + 1]];
+    }
+    renderProgramList();
+  });
+
+  elements.saveCalibrationBtn.addEventListener("click", () => saveCalibration());
+  bindFaders();
+  bindPanelChrome();
+}
+
+async function init() {
+  state.view = new RobotView($("#robotViewport"));
+  await loadConfig();
+  bindActions();
+  await postJson("/api/live-motion", { enabled: false });
+  connectWebSocket();
+}
+
+init();

@@ -1,0 +1,74 @@
+import cv2
+import numpy as np
+
+from app.config import load_config
+from app.demo_settings import color_profiles, named_positions, validate_named_position
+from app.tasks import build_pick_and_place_sequence, build_sorting_sequence
+from app.vision import apply_planar_transform, detect_configured_colors, planar_transform_from_points
+
+
+def test_named_positions_are_valid_or_report_reasons():
+    config = load_config()
+    positions = named_positions(config)
+
+    assert "safe" in positions
+    assert isinstance(validate_named_position(config, "home", positions["home"]), list)
+
+
+def test_pick_and_place_sequence_contains_tool_actions():
+    config = load_config()
+    sequence = build_pick_and_place_sequence(
+        config,
+        {"x_mm": 0.0, "y_mm": 180.0, "z_mm": 30.0, "phi_deg": 0.0},
+        "dropoff_a",
+    )
+
+    assert sequence["ok"]
+    assert [step["kind"] for step in sequence["steps"]].count("tool") == 3
+    assert len(sequence["waypoints"]) >= 5
+
+
+def test_sorting_sequence_uses_color_drop_zone():
+    config = load_config()
+    profiles = color_profiles(config)
+    sequence = build_sorting_sequence(
+        config,
+        {"color": "red", "robot": {"x_mm": 0.0, "y_mm": 180.0, "z_mm": 30.0, "phi_deg": 0.0}},
+        profiles,
+    )
+
+    assert sequence["ok"]
+    assert sequence["task"] == "sorting"
+    assert sequence["drop_zone"] == profiles["red"]["drop_zone"]
+
+
+def test_planar_transform_maps_synthetic_points():
+    transform = planar_transform_from_points(
+        [[0, 0], [100, 0], [100, 100], [0, 100]],
+        [[-50, -50], [50, -50], [50, 50], [-50, 50]],
+    )
+
+    mapped = apply_planar_transform(transform, [50, 50])
+
+    assert mapped["x_mm"] == 0.0
+    assert mapped["y_mm"] == 0.0
+
+
+def test_color_blob_detector_finds_synthetic_red_object():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    cv2.circle(image, (80, 60), 18, (0, 0, 255), -1)
+    profiles = {
+        "red": {
+            "enabled": True,
+            "hsv_min": [0, 80, 60],
+            "hsv_max": [12, 255, 255],
+            "min_area_px": 50,
+            "drop_zone": "dropoff_a",
+        }
+    }
+
+    detections = detect_configured_colors(image, profiles)
+
+    assert detections[0]["ok"]
+    assert detections[0]["color"] == "red"
+    assert abs(detections[0]["center_px"]["x"] - 80) < 1
