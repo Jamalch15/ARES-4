@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-function armPose(anglesDeg, links) {
+function armPose(anglesDeg, links, geometryPreset = {}) {
   const rows = Array.isArray(links.dh_rows) && links.dh_rows.length
     ? links.dh_rows
     : [
@@ -20,6 +20,7 @@ function armPose(anglesDeg, links) {
   const frames = [robotPointFromDh(transform)];
   const frameTransforms = [transform];
   const segments = [];
+  const dimensions = geometryPreset.dimensions_mm || {};
   rows.forEach((row, fallbackIndex) => {
     const normalizedIndex = dhJointIndex(row, fallbackIndex);
     const theta =
@@ -31,7 +32,11 @@ function armPose(anglesDeg, links) {
     const afterTheta = multiply4(transform, rotationZ(theta));
     const afterD = multiply4(afterTheta, translation4(0, 0, dMm));
     const afterA = multiply4(afterD, translation4(aMm, 0, 0));
-    addDhSegment(segments, fallbackIndex, "d", transform, afterD, dMm);
+    if (fallbackIndex === 0 && hasMeasuredBaseSupport(dimensions)) {
+      addMeasuredBaseSupportSegments(segments, fallbackIndex, transform, afterTheta, dimensions);
+    } else {
+      addDhSegment(segments, fallbackIndex, "d", transform, afterD, dMm);
+    }
     addDhSegment(segments, fallbackIndex, "a", afterD, afterA, aMm);
     transform = multiply4(afterA, rotationX(Number(row.alpha_deg || 0)));
     frames.push(robotPointFromDh(transform));
@@ -120,14 +125,30 @@ function dhSegmentLabel(rowIndex, kind) {
   return labels[rowIndex]?.[kind] || `${kind}${rowIndex + 1}`;
 }
 
-function addDhSegment(segments, rowIndex, kind, startTransform, endTransform, signedLengthMm) {
+function hasMeasuredBaseSupport(dimensions) {
+  return ["L_1", "L_2", "L_3"].every((name) => Number(dimensions[name] || 0) > 0);
+}
+
+function addMeasuredBaseSupportSegments(segments, rowIndex, startTransform, afterTheta, dimensions) {
+  const l1 = Number(dimensions.L_1 || 0);
+  const l2 = Number(dimensions.L_2 || 0);
+  const l3 = Number(dimensions.L_3 || 0);
+  const afterL1 = multiply4(afterTheta, translation4(0, 0, l1));
+  const afterL2 = multiply4(afterL1, translation4(0, l2, 0));
+  const afterL3 = multiply4(afterTheta, translation4(0, 0, l1 + l3));
+  addDhSegment(segments, rowIndex, "support", startTransform, afterL1, l1, "L1");
+  addDhSegment(segments, rowIndex, "support", afterL1, afterL3, l3, "L3");
+  addDhSegment(segments, rowIndex, "bracket", afterL1, afterL2, l2, "L2");
+}
+
+function addDhSegment(segments, rowIndex, kind, startTransform, endTransform, signedLengthMm, label = null) {
   const start = robotPointFromDh(startTransform);
   const end = robotPointFromDh(endTransform);
   if (Math.abs(Number(signedLengthMm || 0)) <= 0.0001 || samePoint(start, end)) return;
   segments.push({
     kind,
     rowIndex,
-    label: dhSegmentLabel(rowIndex, kind),
+    label: label || dhSegmentLabel(rowIndex, kind),
     signedLengthMm,
     lengthMm: Math.abs(Number(signedLengthMm)),
     start,
@@ -227,6 +248,12 @@ function segmentMidpoint(segment) {
 }
 
 function segmentMaterial(segment, materials) {
+  if (segment.kind === "support") {
+    return materials.support || materials.base || materials.dhOffset;
+  }
+  if (segment.kind === "bracket") {
+    return materials.dhOffset || materials.linkAlt;
+  }
   if (segment.kind === "d") {
     return segment.rowIndex === 0 ? materials.base || materials.dhOffset : materials.dhOffset || materials.linkAlt;
   }
@@ -234,6 +261,12 @@ function segmentMaterial(segment, materials) {
 }
 
 function segmentRadius(segment, radiusScale) {
+  if (segment.kind === "support") {
+    return (segment.label === "L1" ? 16 : 10) * radiusScale;
+  }
+  if (segment.kind === "bracket") {
+    return 5 * radiusScale;
+  }
   if (segment.kind === "d") {
     return (segment.rowIndex === 0 ? 16 : 5) * radiusScale;
   }
@@ -319,9 +352,14 @@ function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
 
   if (options.showDhHelpers) {
     segments.forEach((segment) => {
-      const label = makeTextSprite(segment.label, segment.kind === "d" ? "#f2b45b" : "#5ee6c5");
+      const label = makeTextSprite(segment.label, segment.kind === "a" ? "#5ee6c5" : "#f2b45b");
       label.position.copy(segmentMidpoint(segment));
       label.position.y += (segment.kind === "d" ? 14 : 19) * radiusScale;
+      if (segment.kind === "support" || segment.kind === "bracket") {
+        label.position.x += 16 * radiusScale;
+        label.position.z += 8 * radiusScale;
+        label.scale.multiplyScalar(1.22);
+      }
       group.add(label);
     });
     (pose.frameTransforms || []).forEach((transform, frameIndex) => {
@@ -376,10 +414,19 @@ function sameAngles(a, b) {
   );
 }
 
+function activeGeometryPreset(config) {
+  const geometry = config?.geometry || {};
+  const presets = geometry.presets || {};
+  const activeName = geometry.active_preset || Object.keys(presets)[0];
+  return activeName && presets[activeName] ? presets[activeName] : {};
+}
+
 export class RobotView {
   constructor(container) {
     this.container = container;
+    this.config = {};
     this.links = {};
+    this.geometryPreset = {};
     this.angles = [0, 0, 0, 0];
     this.previewVisible = true;
     this.pathVisible = true;
@@ -443,6 +490,7 @@ export class RobotView {
 
     this.materials = {
       base: new THREE.MeshStandardMaterial({ color: 0x0d1318, roughness: 0.55 }),
+      support: new THREE.MeshStandardMaterial({ color: 0x334257, roughness: 0.55 }),
       link: new THREE.MeshStandardMaterial({ color: 0x0f6f69, roughness: 0.48 }),
       linkAlt: new THREE.MeshStandardMaterial({ color: 0xb98225, roughness: 0.5 }),
       dhOffset: new THREE.MeshStandardMaterial({ color: 0xf2b45b, roughness: 0.52 }),
@@ -455,6 +503,13 @@ export class RobotView {
         roughness: 0.5,
         transparent: true,
         opacity: 0.32,
+        depthWrite: false,
+      }),
+      support: new THREE.MeshStandardMaterial({
+        color: 0x8fa4bf,
+        roughness: 0.5,
+        transparent: true,
+        opacity: 0.36,
         depthWrite: false,
       }),
       link: new THREE.MeshStandardMaterial({
@@ -514,7 +569,9 @@ export class RobotView {
   }
 
   setConfig(config) {
-    this.links = config.links_mm || {};
+    this.config = config || {};
+    this.links = this.config.links_mm || {};
+    this.geometryPreset = activeGeometryPreset(this.config);
     this.lastConfigSignature = JSON.stringify(this.links);
     this.lastRenderedAngles = null;
     this.previewAngles = null;
@@ -542,7 +599,7 @@ export class RobotView {
     clearGroup(this.previewGroup);
     this.previewAngles = normalizedAngles;
     this.container.dataset.previewAngles = normalizedAngles.map((angle) => angle.toFixed(3)).join(",");
-    const pose = armPose(normalizedAngles, this.links);
+    const pose = armPose(normalizedAngles, this.links, this.geometryPreset);
     this.previewGroup.add(makeArmObjects(pose, this.previewMaterials, 0.82));
     this.previewGroup.visible = this.previewVisible;
     this.render();
@@ -584,7 +641,7 @@ export class RobotView {
 
     this.container.dataset.pathWaypointCount = String(waypoints.length);
     const pathPoints = waypoints.map((angles) => {
-      return robotToScene(armPose(angles.map(Number), this.links).tcp);
+      return robotToScene(armPose(angles.map(Number), this.links, this.geometryPreset).tcp);
     });
     const geometry = new THREE.BufferGeometry().setFromPoints(pathPoints);
     const line = new THREE.Line(geometry, this.pathMaterial);
@@ -681,7 +738,7 @@ export class RobotView {
   renderRobot() {
     clearGroup(this.armGroup);
     this.lastRenderedAngles = this.angles.slice();
-    const pose = armPose(this.angles, this.links);
+    const pose = armPose(this.angles, this.links, this.geometryPreset);
 
     const base = new THREE.Mesh(
       new THREE.CylinderGeometry(54, 66, 28, 32),
