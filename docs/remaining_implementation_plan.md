@@ -1,198 +1,413 @@
-# Remaining Implementation Plan
+# Remaining Implementation Plan By Workpiece
 
-This document replaces the earlier broad UI/control roadmap with a more honest remaining-work plan based on:
+This document replaces the earlier scattered roadmap with a subsystem-based plan. The goal is to make it easy to request implementation in useful chunks, for example:
 
-- The original UI/control improvement prompt.
-- The previous roadmap and the partial implementation already in the repo.
-- The new notes in `comments.md`.
-- A quick review of the current PC app, firmware protocol, config, and docs.
+```text
+Implement TOOL-01 and TOOL-02.
+```
 
-The current idea is to implement this in small packages, not as one large rewrite. Each package has a code so later requests can be specific, for example: `Implement UI-11` or `Implement ENC-10`.
+```text
+Implement KIN-01 through KIN-03 only.
+```
+
+The project is still in an early stage. Treat the structure below as the current working plan, not a fixed final architecture.
 
 ## Current Reality
 
-Some roadmap items now exist only as rough plumbing or placeholders. They should not be treated as complete.
+Some earlier roadmap items have been partially implemented, but several are still placeholder-level.
 
-Currently present:
+Currently present at a rough level:
 
-- The main tabs are renamed to `Control`, `Tasks`, `Kinematics`, `Program`, and `Settings`.
+- Main tabs have been renamed to `Control`, `Tasks`, `Kinematics`, `Program`, and `Settings`.
 - The old permanent COM text box has been replaced with a serial modal.
-- The Control tab has a tool selector for gripper vs magnet.
-- The backend has a `tools` config section and generic `TOOL` commands.
-- The backend has a Standard DH data model and a Jacobian IK implementation.
-- The 3D view now has DH-based rendering and object marker plumbing.
+- The Control tab has a gripper/magnet tool selector.
+- The backend has generic `TOOL` commands and a `tools` config section.
+- The backend has a Standard DH data model and Jacobian IK plumbing.
+- The 3D view has DH-based rendering and object marker plumbing.
 - The backend has basic color/blob vision helpers and task sequence builders.
-- The firmware protocol parses/prints some newer status fields.
-- The backend parses encoder readback fields and has staged encoder state.
+- Firmware/backend protocol parsing includes some newer status fields.
+- Encoder readback fields exist in software, but are not a real hardware workflow yet.
 
-Still lacking or not production-ready:
+Still missing or not production-ready:
 
-- Tool UI and tool settings are not complete enough for real hardware setup.
-- Tool dimensions do not properly drive the active TCP model yet.
-- Camera preview is still in the side panel instead of a movable popup.
-- DH editing is not a real professional table/editor.
-- Encoder and end-effector pin settings are not editable in the UI.
-- The Settings UI incorrectly suggests elbow/wrist encoders as active concepts, even though those joints are servos.
-- AS5048A config is not truly driven from the PC app; firmware still uses compile-time SPI/CS defaults.
-- Calibration is still mostly a config dump, not a guided workflow.
-- Task and vision flows are placeholders, not a real operator workflow.
-- Motion planning and speed/acceleration tuning need serious review before real robot demos.
+- Control preview/live jog behavior needs to be proven stable.
+- Tool controls are still shallow and should show only the selected tool controls.
+- Tool dimensions do not fully drive the active TCP model.
+- Tool and encoder pins cannot be properly edited from Settings.
+- Camera preview should move out of the side panel into a movable popup.
+- DH editing needs to become a proper table, not generic input blocks.
+- The current kinematics implementation should be reconciled with the MATLAB prototype.
+- The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
+- Calibration is not yet a guided workflow.
+- Settings should show encoders only for base and shoulder. Elbow and wrist are servos for now.
+- AS5048A encoder configuration is not truly PC-app driven yet.
+- Vision and task workflows are placeholders, not operator-ready workflows.
+- Diagnostics and tests need to be organized around real failure modes.
+
+## MATLAB Prototype Summary
+
+Prototype reviewed: `jacobian_ik_robotarm_analytic_seed.m`.
+
+The MATLAB file implements a useful working prototype for robot geometry, DH forward kinematics, analytic IK seeding, Jacobian movement, visualization, and motion diagnostics.
+
+### Physical Model In The Prototype
+
+Working assumption: these are current measured/prototype values, not final calibration values.
+
+```text
+L_1 = 93.45 mm
+L_2 = 23.20 mm, currently not used in the DH table
+L_3 = 64.50 mm
+L_4 = 42.69 mm
+L_5 = 160.15 mm
+L_6 = 41.39 mm
+L_7 = 142.55 mm
+L_8 = 49.20 mm
+L_9 = 15.00 mm
+
+s4 = -1
+s6 = -1
+s8 =  1
+```
+
+Joint limits in the prototype:
+
+```text
+theta1: -180 to 180 deg
+theta2:  -90 to 160 deg
+theta3: -160 to 160 deg
+theta4: -180 to 180 deg
+```
+
+Starting pose:
+
+```text
+[0, 0, -70, -20] deg
+```
+
+Movement tuning in the prototype:
+
+```text
+end-effector speed: 25 mm/s
+dt: 0.02 s
+max move time: 60 s
+position tolerance: 1.0 mm
+phi tolerance: 2 deg
+Jacobian damping lambda: 0.1
+phi convergence gain: 1.5
+prefer elbow down: true
+```
+
+### DH And FK Implemented In The Prototype
+
+The prototype uses Standard DH. The active DH table is:
+
+```text
+joint  theta   alpha   a     d
+1      th1     pi/2    0     L1 + L3
+2      th2     0       L5    s4 * L4
+3      th3     0       L7    s6 * L6
+4      th4     0       L9    s8 * L8
+```
+
+It computes:
+
+- Full transform chain.
+- Joint points.
+- End-effector position.
+- Pitch-like tool angle `phi = theta2 + theta3 + theta4`.
+- Linear Jacobian from DH frame axes using cross products.
+- Full Jacobian including angular rows.
+- Segment data for visualizing DH `d` and `a` offsets separately.
+
+### Analytic Seed IK Implemented In The Prototype
+
+The prototype does not rely on Jacobian IK from a random seed. It first computes an analytic seed using the robot geometry.
+
+Main ideas:
+
+- Combine lateral offsets into `B = s4*L4 + s6*L6 + s8*L8`.
+- Solve base angle from the XY target while accounting for the lateral offset.
+- Solve the shoulder/elbow planar 2-link part using law of cosines.
+- Compute wrist angle from `theta4 = phiTarget - theta2 - theta3`.
+- Try multiple candidate branches.
+- Reject candidates outside joint limits.
+- Score candidates using:
+  - FK position error,
+  - phi error,
+  - elbow-down preference,
+  - continuity from the current pose.
+
+This is important. It gives the numerical Jacobian solver a realistic starting point and reduces weird solutions near joint limits.
+
+### Jacobian Movement Implemented In The Prototype
+
+The movement function simulates Cartesian end-effector velocity control.
+
+At each time step it:
+
+- Computes current FK and Jacobian.
+- Computes position error and phi error.
+- Commands a linear end-effector velocity toward the target.
+- Commands phi convergence with a bounded phi rate.
+- Builds a task Jacobian:
+
+```text
+J_task = [Jv; J_phi]
+J_phi = [0, 1, 1, 1]
+```
+
+- Solves damped least squares:
+
+```text
+thetaDot = J_task' * inv(J_task * J_task' + lambda^2 * I) * xDotTask
+```
+
+- Adds a weak attraction toward the analytic seed.
+- Wraps and clamps joint angles to limits.
+- Stops when position and phi tolerances are reached.
+
+Important limitation: the function name includes `NoMotorLimit`. It does not properly enforce real motor velocity, acceleration, step timing, or synchronized arrival constraints. It is good as a preview/simulation model, but it should not be treated as real execution control until those constraints are added.
+
+### Visualization And Diagnostics Implemented In The Prototype
+
+The prototype includes:
+
+- 3D animation of the arm path.
+- Separate drawing of DH `d` and `a` segments.
+- End-effector path trace.
+- Target marker.
+- Phi direction arrow.
+- Plots for desired vs actual end-effector speed.
+- Joint velocity plots.
+- Position error and phi error plots.
+- Warnings when final joints are near limits.
+
+## What From The MATLAB Prototype Belongs In This Roadmap
+
+These ideas should be added to the implementation plan:
+
+- Use the measured `L_1..L_9` and sign-offset model as a geometry preset or calibration starting point.
+- Make Standard DH the source of truth, with the MATLAB DH table as the first known-good physical model.
+- Add an analytic seed step before numerical Jacobian IK.
+- Use DH frame axes to compute the Jacobian, not ad hoc or inconsistent derivatives.
+- Preserve the `phi = theta2 + theta3 + theta4` task orientation model for the first pass.
+- Add elbow-down and continuity preferences to IK solution scoring.
+- Add Cartesian velocity preview using damped least squares.
+- Add movement diagnostics: estimated duration, EE speed, joint velocities, position error, phi error, and limit warnings.
+- Add DH segment visualization to the 3D view so measured geometry is understandable.
+- Add tests that compare Python FK/IK behavior against known MATLAB prototype targets.
+
+These ideas should not be ported directly:
+
+- The MATLAB command-window loop.
+- MATLAB figures as the app UI model.
+- The no-motor-limit movement loop as real robot execution.
+- Any assumption that the prototype dimensions are final calibration.
+- Any full closed-loop control behavior.
 
 ## Recommended Implementation Order
 
-1. `UI-10`: Fix tool panel visibility and command state polish.
-2. `UI-11`: Move camera preview into a movable popup.
-3. `UI-12`: Fix HUD/fader placement and collapse arrows.
-4. `KIN-10`: Replace DH parameter inputs with a real table editor.
-5. `SET-10`: Add end-effector dimensions and IO editor.
-6. `ENC-10`: Add base/shoulder encoder settings UI only.
-7. `TOOL-11`: Make active tool TCP affect FK, IK, preview, and task poses.
-8. `KIN-11`: Harden DH FK/Jacobian IK and diagnostics.
-9. `CAL-10`: Add manual arm calibration workflow.
-10. `FW-10`: Implement real gripper/magnet IO in firmware.
-11. `ENC-11`: Make AS5048A readback config-driven.
-12. `ENC-12`: Use encoder readback for known pose and homing.
-13. `VISION-10`: Build the live camera/detection workflow properly.
-14. `VISION-11`: Add camera-to-robot calibration UI.
-15. `TASK-10`: Rebuild task execution UX around preview-first workflows.
-16. `TASK-11`: Implement configurable batch color sorting.
-17. `CTRL-10`: Improve motion profiles, progress tracking, and tuning.
-18. `CAL-11`: Add calibration validation and measured-point checks.
-19. `ENC-13`: Add encoder verification and fault detection.
-20. `ENC-14`: Add bounded settle correction.
-21. `ENC-15`: Defer full closed-loop stepper control until the earlier encoder stages work on hardware.
+This order keeps useful operator fixes first, then builds the kinematics and movement foundation before adding heavier vision/task behavior.
 
-## Immediate UI Corrections
+1. `SHELL-01` through `SHELL-04`: fix the operator shell, preview stability, camera popup, HUD/fader, and serial modal polish.
+2. `TOOL-01` through `TOOL-04`: finish end-effector selection, settings, active TCP, and firmware IO behavior.
+3. `KIN-01` through `KIN-06`: reconcile the app with the MATLAB DH/IK model.
+4. `MOVE-01` through `MOVE-05`: build movement preview, constraints, progress, abort, and diagnostics.
+5. `CAL-01` through `CAL-04`: add guided arm/tool calibration and validation.
+6. `ENC-01` through `ENC-05`: implement AS5048A readback, known pose, verification, and bounded correction.
+7. `VISION-01` through `VISION-04`: build the camera popup, detections, profiles, and camera-to-robot calibration.
+8. `TASK-01` through `TASK-04`: rebuild task workflows around preview-first operation.
+9. `VIEW-01` through `VIEW-03`: polish 3D visualization, object markers, and DH segment overlays.
+10. `DIAG-01`, `TEST-01`, `TEST-02`, and `TEST-03`: harden diagnostics and regression tests.
 
-### UI-10: Tool Panel Visibility And State
+## Workpiece: Operator Shell And Control UI
 
-Problem:
+### SHELL-01: Control Preview And Live Jog Stability
 
-- The selected tool should be the only tool with visible controls.
-- The current tool UI is shallow and can still feel like a demo placeholder.
+Status: needs verification and likely refinement.
 
 Work:
 
-- Make gripper controls visible only for `gripper`.
-- Make magnet controls visible only for `magnet`.
-- Show clear tool state: selected tool, command state, last command result.
-- Disable irrelevant buttons when disconnected, not armed, or unsupported by the selected tool.
-- Keep the slider only for tools that support proportional values.
+- Keep preview visible after pressing Apply.
+- Clear preview only when target is reached, Reset is pressed, or a newer target replaces it.
+- Separate frontend state into:
+  - draft target,
+  - commanded target,
+  - reported pose,
+  - target reached.
+- Stop websocket pose updates from recreating or clearing the preview during live jog.
+- Stabilize Apply and Reset buttons so state changes do not shift layout.
 
 Acceptance:
 
-- Selecting `Gripper` shows only open, close, and slider/set controls.
-- Selecting `Magnet` shows only on/off controls.
-- No hidden or irrelevant gripper buttons remain in the magnet workflow.
-- UI state updates immediately and stays synced after backend responses.
+- Apply does not immediately remove the preview.
+- Live jog preview does not twitch.
+- Apply/Reset buttons do not visually twitch.
 
-### UI-11: Movable Camera Popup
+### SHELL-02: Camera Popup Instead Of Side-Panel Preview
 
-Problem:
-
-- The camera preview is too large for the side panel and makes the Tasks tab cramped.
+Status: missing.
 
 Work:
 
-- Remove the large inline camera preview from the side panel.
-- Add a `View Camera` button in Tasks.
+- Remove the large inline camera preview from the Tasks side panel.
+- Add a `View Camera` button.
 - Open a movable, resizable camera popup over the viewport.
-- Keep camera annotations in the popup.
-- Allow closing/minimizing the popup without losing detections.
+- Keep annotations in the popup.
+- Let detections continue when the popup is closed or minimized.
 
 Acceptance:
 
-- Tasks side panel stays compact.
+- Tasks panel stays compact.
 - Camera can be opened, moved, resized, and closed.
-- Detection list and task preview still work when the popup is closed.
+- Detection state remains usable without the popup open.
 
-### UI-12: HUD And Fader Chrome Polish
+### SHELL-03: HUD And Fader Chrome Polish
 
-Problem:
-
-- HUD/fader placement is awkward.
-- Collapse arrows still do not communicate the correct direction well enough.
+Status: missing.
 
 Work:
 
-- Reposition HUD and fader widgets so they do not fight the rail, left panel, or viewport content.
-- Replace text arrow glyphs with clear icon buttons.
-- Make collapsed state visually obvious.
-- Test desktop and smaller viewport sizes.
+- Reposition HUD and fader widgets so they do not fight the rail, left panel, or viewport.
+- Fix collapse arrow direction.
+- Prefer clear icon buttons instead of ambiguous text arrows.
+- Verify desktop and smaller viewport layouts.
 
 Acceptance:
 
-- HUD/fader widgets do not overlap important controls.
-- Closed/open arrows point in the correct direction.
-- The collapsed controls are still usable and visually clear.
+- HUD/fader controls do not overlap important controls.
+- Closed/open arrows point correctly.
+- Collapsed controls remain usable.
 
-## Settings And IO
+### SHELL-04: Serial Modal Polish
 
-### SET-10: End-Effector Dimensions And IO Editor
+Status: partial.
 
-Problem:
+Work:
 
-- Tool settings exist in config but cannot be properly edited in the UI.
-- End-effector pins are not configurable from Settings.
-- Gripper and magnet need different physical dimensions and IO.
+- Keep the serial picker as a modal, not a permanent large widget.
+- Show available COM ports with descriptions.
+- Keep baud rate secondary but configurable.
+- Save last selected port to local config.
+- Handle unavailable/stale ports clearly.
+
+Acceptance:
+
+- User can connect without typing COM names manually.
+- Stale/disconnected ports fail clearly.
+
+## Workpiece: End Effector And Tooling
+
+### TOOL-01: Selected Tool Controls Only
+
+Status: partial.
+
+Work:
+
+- Show gripper controls only when active tool is `gripper`.
+- Show magnet controls only when active tool is `magnet`.
+- Gripper controls:
+  - open,
+  - close,
+  - proportional slider `0.0..1.0`.
+- Magnet controls:
+  - on,
+  - off.
+- Disable irrelevant commands when disconnected, unsupported, or unsafe.
+
+Acceptance:
+
+- Selecting `Gripper` shows only gripper controls.
+- Selecting `Magnet` shows only magnet controls.
+- Tool UI state follows backend state.
+
+### TOOL-02: End-Effector Settings And IO Editor
+
+Status: missing.
 
 Work:
 
 - Add editable tool presets in Settings:
   - tool type,
-  - display label,
+  - display name,
   - TCP offset x/y/z,
   - gripper PWM pin,
   - gripper pulse min/max,
   - gripper open/closed values,
   - magnet GPIO pin,
   - magnet active polarity.
-- Save all values to `robot.local.yaml`.
-- Validate pins and ranges before saving.
+- Save values to `robot.local.yaml`.
+- Validate pins, ranges, and units before saving.
 
 Acceptance:
 
-- User can edit gripper dimensions and servo IO.
-- User can edit magnet dimensions and GPIO IO.
-- Invalid pins/ranges are shown clearly and do not silently save.
+- Gripper dimensions and servo IO can be edited from the UI.
+- Magnet dimensions and GPIO IO can be edited from the UI.
+- Invalid values do not silently save.
 
-### ENC-10: Base/Shoulder Encoder Settings UI
+### TOOL-03: Active Tool TCP Integration
 
-Problem:
-
-- Settings currently presents encoder data in a summary, not an editable setup.
-- Elbow and wrist should not be shown as encoder axes for now because they are normal servos.
+Status: partial or missing.
 
 Work:
 
-- Add editable encoder settings for base and shoulder only:
-  - enabled,
-  - CS pin,
-  - zero offset,
-  - direction sign,
-  - readback tolerance,
-  - fault tolerance.
-- Remove elbow/wrist encoder rows from the normal settings UI.
-- Keep internal config flexible enough to add more encoder axes later.
+- Apply the active tool TCP offset in FK.
+- Use active tool TCP in IK.
+- Use active tool TCP in pickup/dropoff task targets.
+- Update the 3D view so gripper/magnet length changes the visible TCP.
+- Mark calibration stale when active tool geometry changes.
 
 Acceptance:
 
-- UI only shows base and shoulder AS5048A setup.
-- User can save encoder CS pins and calibration values.
-- Elbow/wrist are clearly treated as servos, not encoder axes.
+- Switching tool type changes the TCP used by FK/IK.
+- Task targets use the selected tool geometry.
+- Backend and 3D view report the same TCP position.
 
-## Kinematics And Calibration
+### TOOL-04: Real Firmware Tool IO
 
-### KIN-10: Professional DH Table Editor
-
-Problem:
-
-- DH parameters are currently rendered as generic input blocks, not a real table.
-- Units and meaning are not clear enough.
+Status: protocol exists, real IO likely incomplete.
 
 Work:
 
-- Replace the current DH editor with a proper table.
+- Implement `TOOL OPEN`, `TOOL CLOSE`, and `TOOL SET value=...` for the gripper.
+- Implement `TOOL ON` and `TOOL OFF` for the magnet.
+- Drive a 180 degree microservo from configured PWM and pulse range.
+- Drive electromagnet output from configured GPIO and polarity.
+- Set safe tool output on boot, stop, fault, and disconnect.
+
+Acceptance:
+
+- Gripper commands move the configured servo output.
+- Magnet commands switch the configured output.
+- Tool outputs fail safe on stop/fault/reset.
+
+## Workpiece: Robot Geometry, DH, FK, And IK
+
+### KIN-01: Import MATLAB Physical Geometry As A Preset
+
+Status: missing.
+
+Work:
+
+- Add a named geometry preset based on the MATLAB prototype.
+- Store values as measured link dimensions, not hardcoded solver constants.
+- Include `L_1..L_9` and sign values `s4`, `s6`, `s8`.
+- Keep `L_2` recorded even though it is not currently used in the DH table.
+- Label all units as `mm` and `deg`.
+
+Acceptance:
+
+- The app can load the MATLAB prototype geometry as a starting model.
+- The user can see and edit measured dimensions before applying them.
+
+### KIN-02: Professional DH Table Editor
+
+Status: partial, needs real UI.
+
+Work:
+
+- Replace generic DH inputs with a table editor.
 - Columns:
   - joint,
   - theta offset deg,
@@ -204,180 +419,366 @@ Work:
   - zero offset deg,
   - direction sign.
 - Add row-level validation.
-- Add a visible save/apply control for the DH table.
-- Show FK result from the current DH table before saving.
-
-Acceptance:
-
-- DH editor looks and behaves like a table.
-- Bad numeric values are rejected visibly.
-- Saving updates `robot.local.yaml`.
-- FK preview updates predictably.
-
-### KIN-11: Harden DH FK And Jacobian IK
-
-Problem:
-
-- The current solver is useful as a first pass, but not trustworthy enough for real demo use.
-- Solver tolerances and diagnostics are not integrated cleanly with the configured kinematics settings.
-
-Work:
-
-- Use kinematics config tolerances and damping everywhere.
-- Add clear IK diagnostics:
-  - success/failure,
-  - position error,
-  - orientation error,
-  - iteration count,
-  - limit warnings,
-  - singularity warnings.
-- Improve seed selection.
-- Add workspace and reachability prechecks.
-- Add tests for representative robot poses and unreachable targets.
-
-Acceptance:
-
-- Reachable targets converge reliably in tests.
-- Unreachable targets fail clearly.
-- UI shows why a target failed instead of only saying "IK failed".
-
-### CAL-10: Manual Arm Calibration Workflow
-
-Problem:
-
-- Calibration is currently scattered across Settings fields.
-- There is no guided workflow for zeroing, measuring, and validating the robot.
-
-Work:
-
-- Add a Calibration view or guided Settings section.
-- Steps:
-  - enter measured link dimensions,
-  - enter active tool dimensions,
-  - set joint zero offsets,
-  - set direction signs,
-  - set joint limits,
-  - save home pose,
-  - save safe pose,
-  - store movement tolerance.
+- Show FK preview before saving.
 - Save to `robot.local.yaml`.
 
 Acceptance:
 
-- A user can calibrate the arm without editing YAML manually.
-- The app clearly separates measured values from example defaults.
-- Calibration status is visible.
+- DH values are edited in a proper table.
+- Bad numeric values are rejected visibly.
+- FK preview updates predictably.
 
-### CAL-11: Calibration Validation
+### KIN-03: DH Forward Kinematics Aligned With MATLAB
 
-Problem:
-
-- There is no workflow for checking whether calibration is actually good.
+Status: partial, needs verification.
 
 Work:
 
-- Add validation tools:
-  - FK at home pose,
-  - named target reachability,
-  - joint limit checks,
-  - measured point comparison,
-  - encoder-vs-commanded comparison when encoders exist.
-- Add warnings when tool dimensions change but validation has not been rerun.
+- Make Standard DH the source of truth.
+- Verify the app uses the same transform order as the MATLAB prototype.
+- Support the MATLAB-style table:
+
+```text
+d1 = L1 + L3
+d2 = s4 * L4
+d3 = s6 * L6
+d4 = s8 * L8
+a2 = L5
+a3 = L7
+a4 = L9
+alpha1 = 90 deg
+alpha2..4 = 0 deg
+```
+
+- Apply active tool TCP after the final joint transform.
+- Add FK tests against known MATLAB-style poses.
+
+Acceptance:
+
+- Python FK matches the MATLAB model for selected test poses.
+- The 3D view and backend agree on joint frames and TCP position.
+
+### KIN-04: Analytic Seed Before Jacobian IK
+
+Status: missing or incomplete.
+
+Work:
+
+- Port the MATLAB analytic seed concept into backend kinematics.
+- Use lateral offset `B = d2 + d3 + d4`.
+- Solve base angle while accounting for offset.
+- Solve shoulder/elbow with 2-link planar IK.
+- Compute wrist angle from target phi.
+- Generate candidate branches.
+- Reject candidates outside joint limits.
+- Score with:
+  - FK position error,
+  - phi error,
+  - elbow-down preference,
+  - continuity from current pose.
+
+Acceptance:
+
+- Numerical IK starts from a realistic seed.
+- Common targets converge more reliably.
+- Solver chooses less surprising joint configurations.
+
+### KIN-05: DH-Based Jacobian IK Diagnostics
+
+Status: partial.
+
+Work:
+
+- Compute linear Jacobian from DH frame axes using cross products.
+- Use damped least squares.
+- Keep the first-pass orientation task as `phi = theta2 + theta3 + theta4`.
+- Report:
+  - success/failure,
+  - final position error,
+  - final phi/orientation error,
+  - iteration count,
+  - limit warnings,
+  - singularity or near-singularity warnings,
+  - selected seed source.
+
+Acceptance:
+
+- Reachable targets converge in tests.
+- Unreachable targets fail clearly.
+- The UI explains why IK failed.
+
+### KIN-06: Workspace And Reachability Checks
+
+Status: missing.
+
+Work:
+
+- Add a fast reachability precheck before expensive IK.
+- Check joint limits, workspace bounds, and target approach height.
+- Show whether target failure is due to reach, joint limits, or invalid orientation.
+
+Acceptance:
+
+- Invalid targets fail before execution.
+- Operator sees a useful reason, not just `IK failed`.
+
+## Workpiece: Movement, Trajectory, And Execution
+
+### MOVE-01: Motion State And Preview Reliability
+
+Status: partial.
+
+Work:
+
+- Keep draft, commanded, reported, and reached states separate.
+- Ensure preview/path/object markers are independent layers.
+- Clear preview only from explicit state transitions.
+- Keep Home and Stop available in the main view.
+
+Acceptance:
+
+- Preview behavior is stable across Apply, Reset, live jog, websocket updates, and task execution.
+
+### MOVE-02: MATLAB-Style Cartesian Velocity Preview
+
+Status: missing.
+
+Work:
+
+- Add a preview-only movement simulation based on the MATLAB loop:
+  - fixed end-effector speed,
+  - fixed `dt`,
+  - damped least squares,
+  - phi convergence,
+  - analytic seed attraction,
+  - joint wrapping and clamping.
+- Show estimated path, duration, speed, and final error.
+- Keep this marked as preview/simulation until motor limits are added.
+
+Acceptance:
+
+- User can preview a smooth Cartesian move before execution.
+- Preview reports estimated duration and final error.
+- Preview does not pretend to be a guaranteed hardware execution path.
+
+### MOVE-03: Real Joint Limits, Velocity Limits, And Acceleration Limits
+
+Status: missing.
+
+Work:
+
+- Add per-joint velocity and acceleration limits.
+- Add stepper/servo command-rate constraints.
+- Add synchronized joint arrival for joint-space moves.
+- Add bounded Cartesian preview that respects motor limits.
+- Make units explicit.
+
+Acceptance:
+
+- Generated moves respect configured joint limits and speed limits.
+- Estimated duration is credible for real hardware.
+
+### MOVE-04: Execution Progress And Abort Behavior
+
+Status: partial.
+
+Work:
+
+- Show active move, waypoint, or task step.
+- Show progress through generated path.
+- Make Stop behavior consistent across:
+  - direct joint movement,
+  - live jog,
+  - path execution,
+  - tasks,
+  - serial motion.
+- Keep internal emergency/fault handling, but do not expose a large E-stop UI unless needed.
+
+Acceptance:
+
+- User can tell what the robot is currently doing.
+- Stop reliably aborts motion/task/live jog.
+
+### MOVE-05: Motion Diagnostics
+
+Status: missing.
+
+Work:
+
+- Add diagnostics inspired by MATLAB plots:
+  - desired vs actual EE speed,
+  - joint velocity history,
+  - position error,
+  - phi error,
+  - near-limit warnings,
+  - estimated vs actual move duration.
+- Keep this in Diagnostics, not normal operator UI.
+
+Acceptance:
+
+- Movement behavior can be debugged after a bad move without cluttering normal operation.
+
+## Workpiece: Arm And Tool Calibration
+
+### CAL-01: Manual Arm Geometry Calibration
+
+Status: missing.
+
+Work:
+
+- Add a guided workflow for:
+  - measured link dimensions,
+  - DH rows,
+  - joint zero offsets,
+  - direction signs,
+  - joint limits,
+  - home pose,
+  - safe pose,
+  - movement tolerance.
+- Save to `robot.local.yaml`.
+- Treat MATLAB dimensions as an editable starting preset.
+
+Acceptance:
+
+- User can calibrate without editing YAML manually.
+- App clearly separates example defaults, measured local values, and active values.
+
+### CAL-02: Tool Calibration
+
+Status: missing.
+
+Work:
+
+- Calibrate gripper TCP dimensions.
+- Calibrate magnet TCP dimensions.
+- Track which tool was active during calibration.
+- Warn when tool dimensions change after calibration.
+
+Acceptance:
+
+- Tool geometry is not mixed accidentally between gripper and magnet.
+- Calibration status is visible per tool.
+
+### CAL-03: Calibration Validation
+
+Status: missing.
+
+Work:
+
+- Validate FK at home pose.
+- Validate named target reachability.
+- Compare measured points against FK.
+- Show likely causes when validation fails:
+  - wrong tool length,
+  - wrong zero offset,
+  - wrong direction sign,
+  - bad DH dimension.
 
 Acceptance:
 
 - User can run a calibration validation pass.
-- Failures point to likely causes such as tool length, zero offset, or direction sign.
+- Failures point to plausible causes.
 
-## Tool And Firmware
+### CAL-04: Named Positions
 
-### TOOL-11: Active Tool TCP Integration
-
-Problem:
-
-- Tool presets exist, but active tool dimensions do not properly drive the robot model.
+Status: partial or missing.
 
 Work:
 
-- Apply active tool TCP offset in FK.
-- Use active tool TCP in IK.
-- Use active tool TCP in task pickup/dropoff targets.
-- Update 3D view so gripper/magnet length changes the visible tool point.
+- Add editable named positions:
+  - home,
+  - safe,
+  - pickup test,
+  - dropoff A,
+  - dropoff B,
+  - user-defined saved positions.
+- Validate named positions against joint limits and IK reachability.
+- Store in `robot.local.yaml`.
 
 Acceptance:
 
-- Switching from gripper to magnet changes the TCP used by FK/IK.
-- Task targets use the correct tool dimensions.
-- The view and backend agree on the TCP position.
+- Named positions are usable in manual control and tasks.
+- Invalid saved poses are rejected or clearly marked.
 
-### FW-10: Real Tool IO Firmware Support
+## Workpiece: Encoders And Known Pose
 
-Problem:
+### ENC-01: Base/Shoulder Encoder Settings UI
 
-- `TOOL OPEN/CLOSE/SET/ON/OFF` exists at protocol level, but the firmware does not yet drive real gripper or magnet IO from config.
+Status: missing.
 
 Work:
 
-- Add firmware config for tool IO.
-- Drive 180 degree microservo gripper from configured PWM pin and pulse range.
-- Drive electromagnet from configured GPIO and polarity.
-- Add safe defaults on boot, disconnect, stop, and fault.
+- Show only base and shoulder encoder setup in normal Settings.
+- Do not show elbow/wrist encoders as active concepts for now.
+- Add editable values:
+  - enabled,
+  - CS pin,
+  - zero offset,
+  - direction sign,
+  - readback tolerance,
+  - fault tolerance.
 
 Acceptance:
 
-- Gripper commands move the configured servo output.
-- Magnet commands switch the configured output.
-- Tool output fails safe on stop/fault/reset.
+- Settings matches the actual hardware plan.
+- User can save base/shoulder encoder settings.
 
-## Encoder Track
+### ENC-02: Config-Driven AS5048A Readback
 
-### ENC-11: Config-Driven AS5048A Readback
-
-Problem:
-
-- Firmware has AS5048A readback plumbing, but SPI pins and CS pins are not truly controlled from the PC configuration.
+Status: partial.
 
 Work:
 
-- Decide whether SPI SCK/MISO/MOSI are compile-time or runtime config.
+- Decide which SPI pins are compile-time versus runtime config.
 - Make base/shoulder CS pins configurable.
-- Apply zero offset and direction sign to reported encoder angles.
-- Report raw and calibrated values where useful.
+- Read AS5048A values over SPI.
+- Report raw and calibrated values.
+- Apply zero offset and direction sign.
+- Report valid/error state.
+
+Protocol fields:
+
+```text
+enc=1100
+e1=<deg>
+e2=<deg>
+```
 
 Acceptance:
 
-- UI-configured base/shoulder CS pins are used by firmware.
-- UI shows raw/calibrated encoder readback.
-- Missing/bad encoders are visible and not trusted silently.
+- UI shows live base/shoulder encoder angles.
+- Bad/missing encoder is visible and not trusted silently.
 
-### ENC-12: Encoder Known Pose And Homing
+### ENC-03: Encoder Known Pose And Homing
 
-Problem:
-
-- Encoder readback is not yet a proper known-pose or homing workflow.
+Status: missing.
 
 Work:
 
 - Add `Use Encoder Pose` or `Set Home From Encoders`.
-- Mark pose source as `encoder` or `mixed`.
-- Allow known pose from valid base/shoulder encoders and manual/servo pose for the rest.
-- Store encoder offsets in local config.
+- Mark pose source as:
+  - manual,
+  - setpose,
+  - encoder,
+  - mixed.
+- Use encoders to establish known pose for base/shoulder.
+- Store offsets in local config.
 
 Acceptance:
 
-- Robot can establish known pose without manual `SETPOSE` for encoder-backed axes.
+- Robot can enter known-pose state from valid encoder readback.
 - UI clearly shows pose source.
 
-### ENC-13: Encoder Verification And Fault Detection
+### ENC-04: Encoder Verification And Fault Detection
 
-Problem:
-
-- Encoder errors are computed roughly, but there is no polished verification workflow.
+Status: missing.
 
 Work:
 
-- After each move, compare commanded vs encoder angle for base/shoulder.
-- Add warning and fault thresholds.
+- After motion, compare commanded angle vs encoder angle.
+- Warn above tolerance.
+- Fault above hard threshold.
+- Stop trusting pose after large mismatch.
 - Add diagnostics:
   - target,
   - encoder,
@@ -388,211 +789,323 @@ Work:
 Acceptance:
 
 - Step loss or mismatch is detected.
-- The app stops trusting pose after large mismatch.
+- Robot does not continue pretending pose is accurate after large mismatch.
 
-### ENC-14: Stepper Settle Correction
+### ENC-05: Bounded Stepper Settle Correction
 
-Problem:
-
-- No bounded correction exists after motion.
+Status: deferred until readback and verification work on hardware.
 
 Work:
 
 - After move completion, compare encoder angle to target.
-- If error exceeds settle tolerance, issue a small correction move.
+- Issue small correction move if error exceeds settle tolerance.
 - Limit correction attempts.
 - Fault after repeated failure.
 
 Acceptance:
 
 - Small final errors can be corrected.
-- Large disagreement becomes a fault, not an endless correction loop.
+- Large disagreement becomes a fault, not endless correction.
 
-### ENC-15: Experimental Full Closed-Loop Stepper Control
+### ENC-06: Experimental Full Closed-Loop Stepper Control
 
-Status:
+Status: explicitly deferred.
 
-- Deferred.
+Do not start this until `ENC-01` through `ENC-05` work on real hardware.
 
-Reason:
+Future work:
 
-- Full closed-loop stepper control needs filtering, wraparound handling, backlash handling, PID or equivalent control, max correction rates, and stall detection.
+- Real-time correction during motion.
+- Wraparound handling.
+- Backlash handling.
+- Filtering.
+- PID or equivalent control.
+- Max correction rate.
+- Stall detection.
+- Explicit experimental config flag.
 
-Acceptance before starting:
+## Workpiece: Vision And Camera
 
-- `ENC-11` through `ENC-14` work on real hardware.
-- Base/shoulder encoders are mechanically stable and calibrated.
+### VISION-01: Live Annotated Camera Popup
 
-## Vision And Tasks
-
-### VISION-10: Live Camera And Detection Workflow
-
-Problem:
-
-- Current vision is a request/response placeholder. It is not a good operator workflow.
+Status: missing.
 
 Work:
 
-- Add camera popup from `UI-11`.
-- Add refresh/live modes.
-- Show annotations, color labels, pixel coordinates, and robot coordinates.
-- Keep detection list in Tasks.
-- Add clear empty/error states.
+- Use the movable popup from `SHELL-02`.
+- Show live USB camera feed.
+- Overlay detected blobs.
+- Show:
+  - color label,
+  - image coordinate,
+  - calibrated robot coordinate when available.
+- Add refresh/live mode.
 
 Acceptance:
 
-- User can see detections clearly without crowding the side panel.
-- Detection list and popup annotations match.
+- Camera view is useful without crowding the side panel.
+- Annotation and detection list match.
 
-### VISION-11: Camera-To-Robot Calibration UI
+### VISION-02: Color Profile Editor
 
-Problem:
-
-- The backend has a 4-point transform helper, but there is no UI workflow.
+Status: partial or missing.
 
 Work:
 
-- Let the user click or enter four image points.
-- Let the user enter corresponding robot XY points.
-- Save calibration to `robot.local.yaml`.
+- Add editable color profiles.
+- Use HSV thresholds for first pass.
+- Save profiles to `robot.local.yaml`.
+- Support enabling/disabling colors per task.
+- Add minimum blob area and filtering settings.
+
+Acceptance:
+
+- Sorting colors are configurable from UI.
+- Detection is not hardcoded.
+
+### VISION-03: Camera-To-Robot Calibration
+
+Status: backend helper exists, UI missing.
+
+Work:
+
+- Add 4-point planar calibration workflow.
+- User clicks or enters 4 image points.
+- User enters corresponding robot XY points.
+- Save transform to `robot.local.yaml`.
 - Show transformed robot coordinates for detections.
 
 Acceptance:
 
-- Four-point calibration can be completed from the UI.
-- Detections include robot coordinates after calibration.
+- Detections can be mapped to robot-frame coordinates.
+- Calibration can be completed from the UI.
 
-### TASK-10: Task Workflow Rebuild
+### VISION-04: Detection State Contract
 
-Problem:
+Status: missing.
 
-- Tasks are placeholders and do not yet feel like real operator flows.
+Work:
+
+- Define a clean detection object format:
+  - id,
+  - label,
+  - confidence or quality score,
+  - image x/y,
+  - robot x/y/z when calibrated,
+  - area,
+  - timestamp.
+- Keep vision output independent from task logic.
+
+Acceptance:
+
+- Task code consumes detections without depending on OpenCV internals.
+
+## Workpiece: Task Workflow
+
+### TASK-01: Dedicated Task Panel
+
+Status: placeholder-level.
 
 Work:
 
 - Rebuild Tasks around:
   - task selector,
   - task-specific settings,
-  - detection/object selection,
+  - camera button,
+  - detection list,
   - preview,
   - confirmation,
   - execute,
   - compact status/progress.
-- Keep task logic separate from vision, IK, motion, and firmware.
+- Keep task logic separate from vision, IK, motion execution, and firmware transport.
+
+Acceptance:
+
+- Operator can choose a task and understand what will happen before execution.
+
+### TASK-02: Pick-And-Place Template
+
+Status: partial.
+
+Work:
+
+- Generate reusable sequence:
+  - safe pose,
+  - move above object,
+  - descend,
+  - close/enable tool,
+  - lift,
+  - move above drop zone,
+  - descend,
+  - open/disable tool,
+  - lift,
+  - return safe.
+- Validate approach height, tool type, and target reachability.
 
 Acceptance:
 
 - Pick-and-place can be previewed and executed from a clear workflow.
-- User can see exactly what object and drop zone will be used.
+- Invalid targets fail at preview time.
 
-### TASK-11: Configurable Batch Color Sorting
+### TASK-03: Batch Color Sorting
 
-Problem:
-
-- Batch color sorting exists only as simple sequence generation.
+Status: placeholder-level.
 
 Work:
 
-- Detect all visible objects.
+- Detect all visible colored objects.
 - Group by selected color profiles.
-- Map each color to configured drop zone.
-- Generate sequence.
+- Map each color to a configured drop zone.
+- Generate full pick-and-place sequence.
 - Show object list and preview path.
 - Require confirmation before execution.
 
 Acceptance:
 
 - User can choose which colors to sort.
-- Sorting is not hardcoded.
-- Preview shows full sequence before motion.
+- Sorting is configurable, not hardcoded.
+- Full batch sequence is visible before motion.
 
-### VIEW-10: Object Markers In 3D View
+### TASK-04: Task Abort And Recovery
 
-Problem:
-
-- Object marker plumbing exists, but it depends on calibration and is not yet part of a robust operator workflow.
+Status: missing.
 
 Work:
 
-- Display calibrated detections in the 3D view.
-- Keep object markers independent from arm preview/path clearing.
-- Use clear colors and labels.
-- Add visibility toggle.
+- Define what happens when a task stops mid-sequence.
+- Preserve enough state to tell the user:
+  - current step,
+  - last completed step,
+  - whether tool is holding an object,
+  - safe recovery options.
+
+Acceptance:
+
+- Stopping a task does not leave the UI confused about robot/tool state.
+
+## Workpiece: 3D View And Spatial Feedback
+
+### VIEW-01: DH Segment Visualization
+
+Status: missing or partial.
+
+Work:
+
+- Use MATLAB-style segment data to show DH `d` and `a` offsets.
+- Add optional labels in diagnostics/calibration mode.
+- Keep normal operator view less cluttered.
+
+Acceptance:
+
+- Calibration/debug mode makes the robot geometry understandable.
+- Operator mode remains clean.
+
+### VIEW-02: Object Markers In Robot Frame
+
+Status: plumbing exists, workflow incomplete.
+
+Work:
+
+- Display calibrated detections in the 3D robot view.
+- Use colored markers and labels.
+- Keep object markers independent from preview/path clearing.
+- Add a visibility toggle.
 
 Acceptance:
 
 - Detected objects appear in correct robot-frame locations after camera calibration.
-- Preview/path clearing does not remove object markers.
+- Preview clearing does not remove object markers.
 
-## Motion And Control
+### VIEW-03: Path And Target Layers
 
-### CTRL-10: Motion Profiles And Tuning
-
-Problem:
-
-- Movement, speed, and acceleration need a deeper review before demo use.
+Status: partial.
 
 Work:
 
-- Review current rate limiting and trajectory generation.
-- Make synchronized joint arrival explicit.
-- Improve speed/acceleration defaults.
-- Add clear units and per-joint constraints.
-- Add profile preview with estimated duration.
+- Separate layers for:
+  - current arm,
+  - draft preview,
+  - commanded target,
+  - task path,
+  - object detections,
+  - calibration markers.
 
 Acceptance:
 
-- Motion preview duration is credible.
-- Joints arrive together for joint-space moves.
-- Speed/acceleration settings are understandable and bounded.
+- Updating one visual layer does not accidentally erase unrelated information.
 
-### CTRL-11: Execution Progress And Abort Behavior
+## Workpiece: Firmware And Protocol
 
-Problem:
+### FW-01: TB6600-Oriented Hardware Config
 
-- The UI does not yet provide enough confidence during execution.
+Status: partial.
 
 Work:
 
-- Show active waypoint/step.
-- Show progress through path/task.
-- Make stop behavior consistent across path, task, live jog, and serial motion.
-- Ensure preview state clears only when intended.
+- Remove software microstep pin fields from the UI.
+- Keep microstep value in config for steps-per-degree math.
+- Default driver model to `TB6600`.
+- Allow config sync while armed only when:
+  - controller is idle,
+  - no path is running,
+  - live jog is off,
+  - no task is executing.
+- Firmware must reject config sync during motion.
 
 Acceptance:
 
-- User can tell what the robot is currently doing.
-- Stop reliably aborts task/path/live motion.
+- Settings match TB6600 physical DIP switch reality.
+- Syncing config while armed is possible when idle, but blocked during motion.
 
-### CTRL-12: Workspace And Safety Limits
+### FW-02: Protocol Status Extensions
 
-Problem:
-
-- Joint limits exist, but workspace limits and task-level safety are weak.
+Status: partial.
 
 Work:
 
-- Add configurable workspace bounds.
-- Validate task-generated pickup/dropoff targets.
-- Check approach heights and safe pose reachability.
-- Block tasks that violate limits before execution.
+- Keep old firmware compatibility.
+- Support optional status fields:
+
+```text
+known=0|1
+pose_source=<manual|setpose|encoder|mixed|unknown>
+enc=1100
+e1=<deg>
+e2=<deg>
+tool=<open|closed|moving|on|off|unknown>
+```
 
 Acceptance:
 
-- Invalid task targets fail at preview time.
-- Safety errors explain what needs to be changed.
+- Old status lines still parse.
+- New status lines expose known pose, encoder state, and tool state.
 
-## Diagnostics And Tests
+### FW-03: Safe Stop And Fault Semantics
 
-### DIAG-10: Diagnostics Drawer Completion
-
-Problem:
-
-- Diagnostics exists but is still a dump rather than a useful debugging tool.
+Status: partial.
 
 Work:
 
-- Organize diagnostics into sections:
+- Keep internal emergency/fault handling.
+- Use one normal visible Stop button in the UI unless later testing proves a visible E-stop is needed.
+- Define firmware responses for stop, fault, clear fault, and reset.
+- Ensure tool outputs go safe on stop/fault.
+
+Acceptance:
+
+- Stop behavior is understandable and consistent.
+- Safety internals remain available even if the UI is simpler.
+
+## Workpiece: Diagnostics And Tests
+
+### DIAG-01: Hidden Diagnostics Drawer
+
+Status: partial.
+
+Work:
+
+- Keep event logs out of normal Tasks UI.
+- Organize diagnostics into:
   - serial,
   - motion,
   - IK,
@@ -600,21 +1113,38 @@ Work:
   - config sync,
   - tool,
   - vision.
-- Add clear buttons and export/copy option if useful.
+- Add copy/export if useful.
 
 Acceptance:
 
-- Debugging info is available without cluttering normal operation.
+- Debug information is available without cluttering normal operation.
 
-### TEST-10: UI Regression Tests
+### TEST-01: Backend Unit Tests
 
-Problem:
-
-- Browser behavior is mostly manually smoke-tested.
+Status: partial.
 
 Work:
 
-- Add automated UI smoke/regression tests for:
+- Test config precedence and saving to `robot.local.yaml`.
+- Test tool config validation.
+- Test DH config load/save.
+- Test FK against MATLAB-style known poses.
+- Test analytic seed candidate behavior.
+- Test Jacobian IK success/failure.
+- Test encoder parsing.
+- Test armed idle-only config sync.
+
+Acceptance:
+
+- Core math/config/protocol behavior is covered by repeatable tests.
+
+### TEST-02: UI Regression Tests
+
+Status: missing.
+
+Work:
+
+- Test:
   - preview persistence,
   - live jog stability,
   - tool switching,
@@ -625,66 +1155,76 @@ Work:
 
 Acceptance:
 
-- UI regressions are caught by repeatable tests.
+- Common UI regressions are caught automatically.
 
-### TEST-11: Hardware/Firmware Protocol Tests
+### TEST-03: Firmware Build And Protocol Tests
 
-Problem:
-
-- Firmware builds, but protocol behavior is not fully regression-tested.
+Status: partial.
 
 Work:
 
-- Add protocol tests for:
+- Build protocol stub and controller firmware.
+- Test:
   - `TOOL ON/OFF`,
-  - config while armed but idle,
+  - `TOOL OPEN/CLOSE/SET`,
   - encoder status fields,
-  - pose source fields,
-  - bad config rejection.
+  - config while armed but idle,
+  - config rejection during motion,
+  - safe tool state on stop/fault.
 
 Acceptance:
 
-- Protocol changes can be made without breaking the dashboard.
+- Firmware/protocol changes do not silently break the dashboard.
 
-## Open Questions Before Hardware Work
+## Open Questions Before Hardware-Heavy Work
 
-These should be answered before implementing the hardware-heavy packages:
+These should be answered before implementing hardware-heavy packages.
 
-- What are the exact gripper servo pin, pulse min/max, open value, and close value?
+- Are the MATLAB `L_1..L_9` values the newest measurements?
+- What is `L_2` physically, and should it enter the final DH/table model?
+- Are `s4 = -1`, `s6 = -1`, and `s8 = 1` final for the current build?
+- Does the app coordinate frame match the MATLAB coordinate frame?
+- Are the MATLAB joint limits final and mechanically safe?
+- Should elbow-down be the default for all demo tasks?
+- What are the gripper servo pin, pulse min/max, open value, and close value?
 - What are the electromagnet transistor GPIO pin and active polarity?
-- What voltage/current does the magnet need, and what is the safe default output state?
-- Are AS5048A encoders mounted at the joint output for base and shoulder?
-- What SPI pins are actually wired for AS5048A?
+- What is the safe default magnet output state?
+- What are the real gripper and magnet TCP offsets?
+- Are AS5048A encoders mounted at the base and shoulder joint outputs?
+- What SPI pins and CS pins are actually wired?
 - Are encoder zero positions mechanically repeatable?
-- What are the real measured gripper and magnet TCP offsets?
-- What camera source index, resolution, and physical mounting height will be used?
-- What are the demo drop zones and object colors?
-- What speed and acceleration values are safe for the printed/mechanical arm?
+- What camera source index, resolution, and mount height will be used?
+- What are the first demo object colors and drop zones?
+- What speed and acceleration values are safe for the physical arm?
 
-## Suggested Next Requests
+## Suggested Next Implementation Requests
 
-Good next implementation requests:
+Good focused requests:
 
 ```text
-Implement UI-10 and UI-12 only.
+Implement SHELL-01 through SHELL-03 only.
 ```
 
 ```text
-Implement KIN-10 only. Do not change IK math.
+Implement TOOL-01 and TOOL-02 only. Do not change firmware yet.
 ```
 
 ```text
-Implement SET-10 and ENC-10, but only the UI/config layer. Do not change firmware yet.
+Implement KIN-01 through KIN-03 and add tests against the MATLAB geometry.
 ```
 
 ```text
-Implement FW-10 for the protocol stub and arm controller, with tests/build verification.
+Implement KIN-04 and KIN-05 using the MATLAB analytic seed and Jacobian ideas.
 ```
-
-Avoid requests like:
 
 ```text
-Implement everything in the remaining plan.
+Implement MOVE-02 as preview-only. Do not use it for hardware execution yet.
 ```
 
-The current project will move faster if each package is implemented, tested, and reviewed separately.
+Avoid broad requests like:
+
+```text
+Implement the whole remaining plan.
+```
+
+The project will move faster if each workpiece is implemented, tested, and reviewed separately.
