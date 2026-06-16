@@ -1,27 +1,35 @@
 from __future__ import annotations
 
-from math import atan2, cos, degrees, hypot, isfinite, pi, radians, sin, sqrt
+from math import atan2, cos, degrees, hypot, isfinite, radians, sin
 from typing import Any
 
-from .config import JointConfig, LinkConfig
+import numpy as np
+
+from .config import DHRowConfig, JointConfig, LinkConfig
 
 
 COORDINATE_FRAME = """
-Working assumption for the simple IK/FK model:
-- Origin is the center of the base rotation axis on the robot mounting plane.
-- +Z points upward.
-- At base/theta1 = 0 deg, the arm's planar working direction points along global +Y.
-- +X is horizontal sideways after base rotation.
-- theta2 is measured from vertical +Z toward the planar horizontal reach direction.
-- theta3 and theta4 are relative pitch angles in the same side plane.
-- phi is the tool angle measured from the local horizontal reach axis.
-- Internally, trigonometry uses radians; UI/API values use millimeters and degrees.
-This is the first simplified planar + base-rotation model, not a finalized calibration.
+Standard DH kinematics with the project robot frame mapped from the DH frame:
+- The DH table uses theta, d, a, alpha in the standard convention.
+- Joint values are UI/API degrees and are added to each row's theta_offset_deg.
+- Robot coordinates are mapped as robot x = DH y, robot y = -DH x, robot z = DH z.
+- At base/theta1 = 0 deg, positive planar reach points along global +Y.
+- +Z points upward from the mounting plane.
+- tool_phi_deg remains the task-space pitch angle used by the UI and planner.
 """.strip()
 
 
-def _tool_length_mm(links: LinkConfig) -> float:
-    return links.wrist_mm + links.tool_mm
+def _default_rows(links: LinkConfig) -> list[DHRowConfig]:
+    return [
+        DHRowConfig(0, 0.0, links.base_height_mm, 0.0, 90.0),
+        DHRowConfig(1, 90.0, 0.0, links.upper_arm_mm, 0.0),
+        DHRowConfig(2, 0.0, 0.0, links.forearm_mm, 0.0),
+        DHRowConfig(3, 0.0, 0.0, links.wrist_mm + links.tool_mm, 0.0),
+    ]
+
+
+def _rows(links: LinkConfig) -> list[DHRowConfig]:
+    return links.dh_rows if links.dh_rows else _default_rows(links)
 
 
 def _normalize_deg(angle: float) -> float:
@@ -35,6 +43,69 @@ def angle_distance_deg(a: float, b: float) -> float:
     return abs(_normalize_deg(a - b))
 
 
+def _signed_angle_error_deg(target: float, actual: float) -> float:
+    return _normalize_deg(target - actual)
+
+
+def _dh_matrix(theta_deg: float, d_mm: float, a_mm: float, alpha_deg: float) -> np.ndarray:
+    theta = radians(theta_deg)
+    alpha = radians(alpha_deg)
+    ct = cos(theta)
+    st = sin(theta)
+    ca = cos(alpha)
+    sa = sin(alpha)
+    return np.array(
+        [
+            [ct, -st * ca, st * sa, a_mm * ct],
+            [st, ct * ca, -ct * sa, a_mm * st],
+            [0.0, sa, ca, d_mm],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def _robot_point_from_dh(vector: np.ndarray) -> dict[str, float]:
+    return {"x_mm": float(vector[1]), "y_mm": float(-vector[0]), "z_mm": float(vector[2])}
+
+
+def dh_transforms(joint_angles_deg: list[float], links: LinkConfig) -> list[np.ndarray]:
+    if len(joint_angles_deg) != 4:
+        raise ValueError("DH kinematics expects four joint angles")
+    transforms: list[np.ndarray] = []
+    transform = np.identity(4)
+    transforms.append(transform.copy())
+    for row in _rows(links):
+        joint_angle = float(joint_angles_deg[row.joint_index])
+        transform = transform @ _dh_matrix(
+            joint_angle * row.direction_sign + row.zero_offset_deg + row.theta_offset_deg,
+            row.d_mm,
+            row.a_mm,
+            row.alpha_deg,
+        )
+        transforms.append(transform.copy())
+    return transforms
+
+
+def joint_frame_points(joint_angles_deg: list[float], links: LinkConfig) -> list[dict[str, float]]:
+    return [_robot_point_from_dh(transform[:3, 3]) for transform in dh_transforms(joint_angles_deg, links)]
+
+
+def _tool_phi_from_angles(joint_angles_deg: list[float]) -> float:
+    return _normalize_deg(90.0 - sum(joint_angles_deg[1:]))
+
+
+def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict[str, Any]:
+    frames = dh_transforms(joint_angles_deg, links)
+    tcp = _robot_point_from_dh(frames[-1][:3, 3])
+    phi_deg = _tool_phi_from_angles(joint_angles_deg)
+    tcp["radial_mm"] = hypot(tcp["x_mm"], tcp["y_mm"])
+    tcp["tool_phi_deg"] = phi_deg
+    tcp["tool_pitch_deg"] = phi_deg
+    tcp["dh_frames"] = joint_frame_points(joint_angles_deg, links)
+    return tcp
+
+
 def _joint_limit_reasons(joints: list[JointConfig], angles_deg: list[float]) -> list[str]:
     reasons: list[str] = []
     for joint, angle in zip(joints, angles_deg, strict=True):
@@ -45,40 +116,123 @@ def _joint_limit_reasons(joints: list[JointConfig], angles_deg: list[float]) -> 
     return reasons
 
 
-def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict[str, Any]:
-    if len(joint_angles_deg) != 4:
-        raise ValueError("forward_kinematics expects four joint angles")
-
-    base, shoulder, elbow, wrist = [radians(angle) for angle in joint_angles_deg]
-    wrist_total_mm = _tool_length_mm(links)
-
-    shoulder_pitch = shoulder
-    elbow_pitch = shoulder + elbow
-    wrist_pitch = shoulder + elbow + wrist
-
-    radial_mm = (
-        links.upper_arm_mm * sin(shoulder_pitch)
-        + links.forearm_mm * sin(elbow_pitch)
-        + wrist_total_mm * sin(wrist_pitch)
+def _task_error(target: dict[str, float], angles_deg: list[float], links: LinkConfig) -> np.ndarray:
+    fk = forward_kinematics(angles_deg, links)
+    return np.array(
+        [
+            float(target["x_mm"]) - fk["x_mm"],
+            float(target["y_mm"]) - fk["y_mm"],
+            float(target["z_mm"]) - fk["z_mm"],
+            _signed_angle_error_deg(float(target["phi_deg"]), fk["tool_phi_deg"]),
+        ],
+        dtype=float,
     )
-    z_mm = (
-        links.base_height_mm
-        + links.upper_arm_mm * cos(shoulder_pitch)
-        + links.forearm_mm * cos(elbow_pitch)
-        + wrist_total_mm * cos(wrist_pitch)
-    )
-    x_mm = -radial_mm * sin(base)
-    y_mm = radial_mm * cos(base)
-    phi_deg = _normalize_deg(90.0 - sum(joint_angles_deg[1:]))
 
+
+def _numeric_jacobian(target: dict[str, float], angles_deg: list[float], links: LinkConfig) -> np.ndarray:
+    del target
+    base_fk = forward_kinematics(angles_deg, links)
+    base_vector = np.array(
+        [base_fk["x_mm"], base_fk["y_mm"], base_fk["z_mm"], base_fk["tool_phi_deg"]],
+        dtype=float,
+    )
+    jacobian = np.zeros((4, len(angles_deg)), dtype=float)
+    eps = 0.05
+    for index in range(len(angles_deg)):
+        shifted = angles_deg.copy()
+        shifted[index] += eps
+        shifted_fk = forward_kinematics(shifted, links)
+        shifted_vector = np.array(
+            [
+                shifted_fk["x_mm"],
+                shifted_fk["y_mm"],
+                shifted_fk["z_mm"],
+                shifted_fk["tool_phi_deg"],
+            ],
+            dtype=float,
+        )
+        diff = shifted_vector - base_vector
+        diff[3] = _normalize_deg(shifted_fk["tool_phi_deg"] - base_fk["tool_phi_deg"])
+        jacobian[:, index] = diff / eps
+    return jacobian
+
+
+def _clamp_to_limits(angles_deg: list[float], joints: list[JointConfig]) -> list[float]:
+    return [max(joint.min_deg, min(joint.max_deg, angle)) for angle, joint in zip(angles_deg, joints, strict=True)]
+
+
+def _solve_from_seed(
+    target: dict[str, float],
+    links: LinkConfig,
+    joints: list[JointConfig],
+    seed_deg: list[float],
+    label: str,
+    max_iterations: int = 160,
+    damping: float = 0.18,
+    position_tolerance_mm: float = 1.0,
+    orientation_tolerance_deg: float = 1.0,
+) -> dict[str, Any]:
+    angles = _clamp_to_limits([float(value) for value in seed_deg], joints)
+    notes: list[str] = []
+    iterations = 0
+    singular = False
+
+    for iterations in range(1, max_iterations + 1):
+        error = _task_error(target, angles, links)
+        position_error = float(np.linalg.norm(error[:3]))
+        orientation_error = abs(float(error[3]))
+        if position_error <= position_tolerance_mm and orientation_error <= orientation_tolerance_deg:
+            break
+
+        jacobian = _numeric_jacobian(target, angles, links)
+        condition = np.linalg.cond(jacobian @ jacobian.T + np.identity(4) * 1e-9)
+        singular = singular or bool(condition > 1e8)
+        lhs = jacobian @ jacobian.T + (damping**2) * np.identity(4)
+        try:
+            delta = jacobian.T @ np.linalg.solve(lhs, error)
+        except np.linalg.LinAlgError:
+            notes.append("jacobian solve failed")
+            break
+        delta = np.clip(delta, -8.0, 8.0)
+        next_angles = _clamp_to_limits([angle + float(step) for angle, step in zip(angles, delta, strict=True)], joints)
+        if all(abs(a - b) < 1e-6 for a, b in zip(next_angles, angles, strict=True)):
+            notes.append("solver stalled at a joint limit")
+            break
+        angles = next_angles
+
+    fk = forward_kinematics(angles, links)
+    position_error = hypot(hypot(fk["x_mm"] - target["x_mm"], fk["y_mm"] - target["y_mm"]), fk["z_mm"] - target["z_mm"])
+    phi_error = angle_distance_deg(fk["tool_phi_deg"], target["phi_deg"])
+    reasons = _joint_limit_reasons(joints, angles)
+    if position_error > position_tolerance_mm or phi_error > orientation_tolerance_deg:
+        reasons.append(
+            f"IK did not converge: position error {position_error:.2f} mm, phi error {phi_error:.2f} deg"
+        )
+    if singular:
+        notes.append("near-singular Jacobian encountered")
     return {
-        "x_mm": x_mm,
-        "y_mm": y_mm,
-        "z_mm": z_mm,
-        "radial_mm": radial_mm,
-        "tool_phi_deg": phi_deg,
-        "tool_pitch_deg": phi_deg,
+        "branch": label,
+        "angles_deg": angles,
+        "valid": not reasons,
+        "reasons": reasons,
+        "fk": fk,
+        "position_error_mm": position_error,
+        "phi_error_deg": phi_error,
+        "iterations": iterations,
+        "singularity_warning": singular,
+        "notes": notes,
     }
+
+
+def _seed_candidates(target: dict[str, float], joints: list[JointConfig], current: list[float]) -> list[tuple[str, list[float]]]:
+    base_guess = degrees(atan2(-target["x_mm"], target["y_mm"])) if hypot(target["x_mm"], target["y_mm"]) > 1e-6 else current[0]
+    home = [joint.home_deg for joint in joints]
+    return [
+        ("current_seed", current),
+        ("elbow_up", [base_guess, min(60.0, joints[1].max_deg), 35.0, -20.0]),
+        ("elbow_down", [base_guess, 30.0, -55.0, 55.0]),
+        ("home_seed", home),
+    ]
 
 
 def inverse_kinematics(
@@ -89,118 +243,59 @@ def inverse_kinematics(
     branch: str = "auto",
     tolerance: float = 1e-6,
 ) -> dict[str, Any]:
+    del tolerance
     if len(joints) != 4:
         raise ValueError("inverse_kinematics expects four joint configs")
 
-    x_mm = float(target.get("x_mm", 0.0))
-    y_mm = float(target.get("y_mm", 0.0))
-    z_mm = float(target.get("z_mm", 0.0))
-    phi_deg = float(target.get("phi_deg", target.get("tool_phi_deg", 0.0)))
-    phi = radians(phi_deg)
-    current = current_joints_deg or [joint.home_deg for joint in joints]
-    notes: list[str] = []
-
-    if not all(isfinite(value) for value in [x_mm, y_mm, z_mm, phi_deg]):
+    pose = {
+        "x_mm": float(target.get("x_mm", 0.0)),
+        "y_mm": float(target.get("y_mm", 0.0)),
+        "z_mm": float(target.get("z_mm", 0.0)),
+        "phi_deg": float(target.get("phi_deg", target.get("tool_phi_deg", 0.0))),
+    }
+    if not all(isfinite(value) for value in pose.values()):
         return {
             "ok": False,
-            "target": {"x_mm": x_mm, "y_mm": y_mm, "z_mm": z_mm, "phi_deg": phi_deg},
+            "target": pose,
             "candidates": [],
             "selected": None,
             "selected_branch": None,
             "notes": ["target contains a non-finite value"],
         }
 
-    l2 = links.upper_arm_mm
-    l3 = links.forearm_mm
-    l4 = _tool_length_mm(links)
-    if l2 <= 0 or l3 <= 0:
-        return {
-            "ok": False,
-            "target": {"x_mm": x_mm, "y_mm": y_mm, "z_mm": z_mm, "phi_deg": phi_deg},
-            "candidates": [],
-            "selected": None,
-            "selected_branch": None,
-            "notes": ["upper_arm and forearm lengths must be positive"],
-        }
-
-    radial_mm = hypot(x_mm, y_mm)
-    if radial_mm < tolerance:
-        theta1 = radians(current[0])
-        notes.append("base angle is ambiguous at r=0; using current base angle")
-    else:
-        theta1 = atan2(-x_mm, y_mm)
-
-    h_mm = z_mm - links.base_height_mm
-    wrist_r_mm = radial_mm - l4 * cos(phi)
-    wrist_h_mm = h_mm - l4 * sin(phi)
-    d = (wrist_r_mm**2 + wrist_h_mm**2 - l2**2 - l3**2) / (2.0 * l2 * l3)
-
-    if d > 1.0 + tolerance or d < -1.0 - tolerance:
-        return {
-            "ok": False,
-            "target": {"x_mm": x_mm, "y_mm": y_mm, "z_mm": z_mm, "phi_deg": phi_deg},
-            "wrist_target": {"r_mm": wrist_r_mm, "h_mm": wrist_h_mm, "d": d},
-            "candidates": [],
-            "selected": None,
-            "selected_branch": None,
-            "notes": notes + [f"target is unreachable in simplified model, D={d:.4f}"],
-        }
-
-    d = max(-1.0, min(1.0, d))
-    root = sqrt(max(0.0, 1.0 - d**2))
-    branch_specs = [("elbow_up", root), ("elbow_down", -root)]
-    candidates: list[dict[str, Any]] = []
-
-    for branch_name, root_sign in branch_specs:
-        theta3 = atan2(root_sign, d)
-        theta2 = atan2(wrist_r_mm, wrist_h_mm) - atan2(l3 * sin(theta3), l2 + l3 * cos(theta3))
-        theta4 = (pi / 2.0) - phi - theta2 - theta3
-        angles = [
-            _normalize_deg(degrees(theta1)),
-            degrees(theta2),
-            degrees(theta3),
-            degrees(theta4),
-        ]
-        reasons = _joint_limit_reasons(joints, angles)
-        fk = forward_kinematics(angles, links)
-        position_error = hypot(
-            hypot(fk["x_mm"] - x_mm, fk["y_mm"] - y_mm),
-            fk["z_mm"] - z_mm,
-        )
-        phi_error = angle_distance_deg(fk["tool_phi_deg"], phi_deg)
-        distance = sum(angle_distance_deg(angle, current[index]) for index, angle in enumerate(angles))
-        candidates.append(
-            {
-                "branch": branch_name,
-                "angles_deg": angles,
-                "valid": not reasons,
-                "reasons": reasons,
-                "fk": fk,
-                "position_error_mm": position_error,
-                "phi_error_deg": phi_error,
-                "distance_from_current_deg": distance,
-            }
-        )
-
+    current = current_joints_deg or [joint.home_deg for joint in joints]
+    seeds = _seed_candidates(pose, joints, [float(value) for value in current])
+    requested_branch = branch if branch in {"elbow_up", "elbow_down", "current_seed", "home_seed"} else "auto"
+    candidates = [
+        _solve_from_seed(pose, links, joints, seed, label)
+        for label, seed in seeds
+    ]
     valid_candidates = [candidate for candidate in candidates if candidate["valid"]]
     selected: dict[str, Any] | None = None
-    requested_branch = branch if branch in {"elbow_up", "elbow_down"} else "auto"
+    notes: list[str] = []
+
     if requested_branch != "auto":
-        selected = next(
-            (candidate for candidate in valid_candidates if candidate["branch"] == requested_branch),
-            None,
-        )
+        selected = next((candidate for candidate in valid_candidates if candidate["branch"] == requested_branch), None)
         if selected is None:
             notes.append(f"requested branch {requested_branch} is not valid")
     if selected is None and valid_candidates:
-        selected = min(valid_candidates, key=lambda candidate: candidate["distance_from_current_deg"])
+        selected = min(
+            valid_candidates,
+            key=lambda candidate: (
+                candidate["position_error_mm"],
+                candidate["phi_error_deg"],
+                sum(angle_distance_deg(angle, current[index]) for index, angle in enumerate(candidate["angles_deg"])),
+            ),
+        )
+
+    if selected is None:
+        notes.insert(0, "target is unreachable or did not converge in DH/Jacobian solver")
 
     return {
         "ok": selected is not None,
-        "target": {"x_mm": x_mm, "y_mm": y_mm, "z_mm": z_mm, "phi_deg": phi_deg},
-        "wrist_target": {"r_mm": wrist_r_mm, "h_mm": wrist_h_mm, "d": d},
+        "target": pose,
         "candidates": candidates,
         "selected": selected,
         "selected_branch": selected["branch"] if selected else None,
-        "notes": notes if notes else ([] if selected else ["no valid IK branch after joint-limit filtering"]),
+        "notes": notes,
     }

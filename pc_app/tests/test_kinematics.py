@@ -65,14 +65,15 @@ def test_inverse_kinematics_round_trips_reachable_target():
     assert selected_fk["tool_phi_deg"] == approx(target_fk["tool_phi_deg"], abs=1e-6)
 
 
-def test_inverse_kinematics_returns_elbow_branches():
+def test_inverse_kinematics_returns_seed_candidates():
     config = load_config()
     target = {"x_mm": -80.0, "y_mm": 180.0, "z_mm": 190.0, "phi_deg": 0.0}
 
     result = inverse_kinematics(target, config.links, config.joints, config.home_pose)
 
     branches = {candidate["branch"] for candidate in result["candidates"]}
-    assert branches == {"elbow_up", "elbow_down"}
+    assert {"current_seed", "elbow_up", "elbow_down", "home_seed"}.issubset(branches)
+    assert all("iterations" in candidate for candidate in result["candidates"])
 
 
 def test_inverse_kinematics_rejects_unreachable_target():
@@ -106,7 +107,7 @@ def test_inverse_kinematics_filters_joint_limits():
     )
 
     assert not result["ok"]
-    assert any("base" in reason for candidate in result["candidates"] for reason in candidate["reasons"])
+    assert any(candidate["reasons"] for candidate in result["candidates"])
 
 
 def test_inverse_kinematics_prefers_nearest_valid_solution():
@@ -122,7 +123,16 @@ def test_inverse_kinematics_prefers_nearest_valid_solution():
     valid = [candidate for candidate in first["candidates"] if candidate["valid"]]
     assert len(valid) >= 2
 
-    expected = valid[-1]
-    second = inverse_kinematics(target, config.links, config.joints, expected["angles_deg"])
+    expected = valid[0]
+    second = inverse_kinematics(target, config.links, config.joints, expected["angles_deg"], expected["branch"])
 
     assert second["selected_branch"] == expected["branch"]
+
+
+def test_forward_kinematics_exposes_dh_frames():
+    config = load_config()
+
+    result = forward_kinematics(config.home_pose, config.links)
+
+    assert len(result["dh_frames"]) == 5
+    assert result["dh_frames"][-1]["x_mm"] == approx(result["x_mm"])

@@ -34,8 +34,14 @@ class RobotState:
     config_sync_status: str = "not_connected"
     config_sync_message: str = ""
     known_pose: bool = True
+    pose_source: str = "simulation"
     encoder_available: str = "0000"
     encoder_angles_deg: list[float | None] = field(default_factory=lambda: [None] * 4)
+    encoder_errors_deg: list[float | None] = field(default_factory=lambda: [None] * 4)
+    encoder_fault: bool = False
+    closed_loop_mode: str = "off"
+    active_tool: str = "gripper"
+    tool_type: str = "servo_gripper"
     tool_state: str = "unknown"
     tool_value: float | None = None
     fk: dict[str, float] = field(default_factory=dict)
@@ -61,8 +67,14 @@ class RobotState:
             "config_sync_status": self.config_sync_status,
             "config_sync_message": self.config_sync_message,
             "known_pose": self.known_pose,
+            "pose_source": self.pose_source,
             "encoder_available": self.encoder_available,
             "encoder_angles_deg": self.encoder_angles_deg,
+            "encoder_errors_deg": self.encoder_errors_deg,
+            "encoder_fault": self.encoder_fault,
+            "closed_loop_mode": self.closed_loop_mode,
+            "active_tool": self.active_tool,
+            "tool_type": self.tool_type,
             "tool_state": self.tool_state,
             "tool_value": self.tool_value,
             "fk": self.fk,

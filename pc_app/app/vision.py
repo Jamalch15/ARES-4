@@ -33,6 +33,15 @@ def decode_image_b64(image_b64: str) -> np.ndarray:
     return image
 
 
+def encode_image_b64(image_bgr: np.ndarray, ext: str = ".jpg") -> str:
+    ok, encoded = cv2.imencode(ext, image_bgr)
+    if not ok:
+        raise ValueError("could not encode image")
+    mime = "image/png" if ext.lower() == ".png" else "image/jpeg"
+    payload = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return f"data:{mime};base64,{payload}"
+
+
 def detect_color_blob(image_bgr: np.ndarray, profile: dict[str, Any]) -> dict[str, Any]:
     hsv_min = np.array(profile.get("hsv_min", [0, 0, 0]), dtype=np.uint8)
     hsv_max = np.array(profile.get("hsv_max", [179, 255, 255]), dtype=np.uint8)
@@ -87,3 +96,46 @@ def detect_configured_colors(
         detections.append(result)
     return detections
 
+
+def annotated_detection_frame(
+    image_bgr: np.ndarray,
+    detections: list[dict[str, Any]],
+) -> np.ndarray:
+    annotated = image_bgr.copy()
+    palette = {
+        "red": (30, 30, 230),
+        "blue": (230, 90, 30),
+        "green": (70, 200, 70),
+        "yellow": (0, 220, 230),
+    }
+    for detection in detections:
+        if not detection.get("ok"):
+            continue
+        color_name = str(detection.get("color", "object"))
+        color = palette.get(color_name, (230, 230, 230))
+        bbox = detection.get("bbox_px") or {}
+        center = detection.get("center_px") or {}
+        x = int(bbox.get("x", center.get("x", 0)))
+        y = int(bbox.get("y", center.get("y", 0)))
+        w = int(bbox.get("w", 0))
+        h = int(bbox.get("h", 0))
+        cx = int(center.get("x", x + w / 2))
+        cy = int(center.get("y", y + h / 2))
+        if w > 0 and h > 0:
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+        cv2.circle(annotated, (cx, cy), 4, color, -1)
+        robot = detection.get("robot") or {}
+        label = f"{color_name} px({cx},{cy})"
+        if robot:
+            label += f" r({robot.get('x_mm', 0):.0f},{robot.get('y_mm', 0):.0f})"
+        cv2.putText(
+            annotated,
+            label,
+            (max(0, x), max(16, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return annotated

@@ -2,32 +2,72 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 function jointPositions(anglesDeg, links) {
-  const deg = Math.PI / 180;
-  const base = anglesDeg[0] * deg;
-  const shoulder = anglesDeg[1] * deg;
-  const elbow = shoulder + anglesDeg[2] * deg;
-  const wrist = elbow + anglesDeg[3] * deg;
-  const lengths = [
-    links.upper_arm_mm || 0,
-    links.forearm_mm || 0,
-    (links.wrist_mm || 0) + (links.tool_mm || 0),
-  ];
-  const pitches = [shoulder, elbow, wrist];
-  const points = [{ x: 0, y: 0, z: links.base_height_mm || 0 }];
-  let radial = 0;
-  let z = links.base_height_mm || 0;
-
-  for (let i = 0; i < lengths.length; i += 1) {
-    radial += lengths[i] * Math.sin(pitches[i]);
-    z += lengths[i] * Math.cos(pitches[i]);
-    points.push({
-      x: -radial * Math.sin(base),
-      y: radial * Math.cos(base),
-      z,
-    });
-  }
-
+  const rows = Array.isArray(links.dh_rows) && links.dh_rows.length
+    ? links.dh_rows
+    : [
+        { joint_index: 0, theta_offset_deg: 0, d_mm: links.base_height_mm || 0, a_mm: 0, alpha_deg: 90 },
+        { joint_index: 1, theta_offset_deg: 90, d_mm: 0, a_mm: links.upper_arm_mm || 0, alpha_deg: 0 },
+        { joint_index: 2, theta_offset_deg: 0, d_mm: 0, a_mm: links.forearm_mm || 0, alpha_deg: 0 },
+        {
+          joint_index: 3,
+          theta_offset_deg: 0,
+          d_mm: 0,
+          a_mm: (links.wrist_mm || 0) + (links.tool_mm || 0),
+          alpha_deg: 0,
+        },
+      ];
+  let transform = identity4();
+  const points = [robotPointFromDh(transform)];
+  rows.forEach((row, fallbackIndex) => {
+    const jointIndex = Number(row.joint_index ?? row.joint ?? fallbackIndex);
+    const normalizedIndex = jointIndex >= 1 ? jointIndex - 1 : jointIndex;
+    const theta =
+      Number(anglesDeg[normalizedIndex] || 0) * Number(row.direction_sign ?? 1) +
+      Number(row.zero_offset_deg || 0) +
+      Number(row.theta_offset_deg || 0);
+    transform = multiply4(
+      transform,
+      dhMatrix(theta, Number(row.d_mm || 0), Number(row.a_mm || 0), Number(row.alpha_deg || 0))
+    );
+    points.push(robotPointFromDh(transform));
+  });
   return points;
+}
+
+function identity4() {
+  return [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+  ];
+}
+
+function multiply4(a, b) {
+  return a.map((row, rowIndex) =>
+    row.map((_, columnIndex) =>
+      [0, 1, 2, 3].reduce((sum, index) => sum + a[rowIndex][index] * b[index][columnIndex], 0)
+    )
+  );
+}
+
+function dhMatrix(thetaDeg, dMm, aMm, alphaDeg) {
+  const theta = (thetaDeg * Math.PI) / 180;
+  const alpha = (alphaDeg * Math.PI) / 180;
+  const ct = Math.cos(theta);
+  const st = Math.sin(theta);
+  const ca = Math.cos(alpha);
+  const sa = Math.sin(alpha);
+  return [
+    [ct, -st * ca, st * sa, aMm * ct],
+    [st, ct * ca, -ct * sa, aMm * st],
+    [0, sa, ca, dMm],
+    [0, 0, 0, 1],
+  ];
+}
+
+function robotPointFromDh(transform) {
+  return { x: transform[1][3], y: -transform[0][3], z: transform[2][3] };
 }
 
 function makeCylinderBetween(start, end, radius, material) {
@@ -153,9 +193,11 @@ export class RobotView {
     this.armGroup = new THREE.Group();
     this.previewGroup = new THREE.Group();
     this.overlayGroup = new THREE.Group();
+    this.objectGroup = new THREE.Group();
     this.scene.add(this.armGroup);
     this.scene.add(this.previewGroup);
     this.scene.add(this.overlayGroup);
+    this.scene.add(this.objectGroup);
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.8);
     const key = new THREE.DirectionalLight(0xffffff, 1.3);
@@ -211,6 +253,13 @@ export class RobotView {
       emissive: 0x332300,
       roughness: 0.35,
     });
+    this.objectMaterials = {
+      red: new THREE.MeshStandardMaterial({ color: 0xff526d, emissive: 0x28040c, roughness: 0.4 }),
+      green: new THREE.MeshStandardMaterial({ color: 0x53d18e, emissive: 0x052211, roughness: 0.4 }),
+      blue: new THREE.MeshStandardMaterial({ color: 0x6aa7ff, emissive: 0x061629, roughness: 0.4 }),
+      yellow: new THREE.MeshStandardMaterial({ color: 0xffd24a, emissive: 0x2d2203, roughness: 0.4 }),
+      default: new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x121212, roughness: 0.4 }),
+    };
 
     this.resetCamera();
     window.addEventListener("resize", () => this.resize());
@@ -297,6 +346,36 @@ export class RobotView {
     line.userData.kind = "path";
     line.visible = this.pathVisible;
     this.overlayGroup.add(line);
+    this.render();
+  }
+
+  setObjectDetections(detections) {
+    clearGroup(this.objectGroup);
+    if (!Array.isArray(detections) || detections.length === 0) {
+      delete this.container.dataset.objectMarkerCount;
+      this.render();
+      return;
+    }
+
+    let count = 0;
+    detections.forEach((detection) => {
+      const robot = detection.robot || {};
+      if (robot.x_mm == null || robot.y_mm == null) return;
+      const colorName = String(detection.color || "default").toLowerCase();
+      const material = this.objectMaterials[colorName] || this.objectMaterials.default;
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(8, 24, 16), material);
+      marker.position.copy(
+        robotToScene({
+          x: Number(robot.x_mm),
+          y: Number(robot.y_mm),
+          z: Number(robot.z_mm || 0),
+        })
+      );
+      marker.userData.kind = "object";
+      this.objectGroup.add(marker);
+      count += 1;
+    });
+    this.container.dataset.objectMarkerCount = String(count);
     this.render();
   }
 

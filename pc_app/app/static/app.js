@@ -7,6 +7,7 @@ const state = {
   commandTimer: null,
   pendingAngles: null,
   draftAngles: null,
+  commandedAngles: null,
   lastSentAngles: null,
   view: null,
   activeTab: "joint",
@@ -27,6 +28,9 @@ const state = {
   programWaypoints: [],
   hardwareDraftDirty: false,
   taskPreviewId: null,
+  selectedSerialPort: null,
+  latestDetections: [],
+  cameraTimer: null,
 };
 
 const linkCalibrationFields = [
@@ -75,7 +79,11 @@ const elements = {
   lastCommand: $("#lastCommand"),
   lastError: $("#lastError"),
   portStatus: $("#portStatus"),
-  serialPort: $("#serialPort"),
+  serialModal: $("#serialModal"),
+  serialPortList: $("#serialPortList"),
+  refreshPortsBtn: $("#refreshPortsBtn"),
+  closeSerialModalBtn: $("#closeSerialModalBtn"),
+  connectSelectedSerialBtn: $("#connectSelectedSerialBtn"),
   baudRate: $("#baudRate"),
   resetViewBtn: $("#resetViewBtn"),
   togglePreviewBtn: $("#togglePreviewBtn"),
@@ -86,8 +94,10 @@ const elements = {
   disconnectBtn: $("#disconnectBtn"),
   homeBtn: $("#homeBtn"),
   stopBtn: $("#stopBtn"),
-  estopBtn: $("#estopBtn"),
-  clearEstopBtn: $("#clearEstopBtn"),
+  diagnosticsBtn: $("#diagnosticsBtn"),
+  diagnosticsDrawer: $("#diagnosticsDrawer"),
+  diagnosticsSummary: $("#diagnosticsSummary"),
+  closeDiagnosticsBtn: $("#closeDiagnosticsBtn"),
   liveJogToggle: $("#liveJogToggle"),
   liveRealToggle: $("#liveRealToggle"),
   applyJointPreviewBtn: $("#applyJointPreviewBtn"),
@@ -115,7 +125,6 @@ const elements = {
   previewIkBtn: $("#previewIkBtn"),
   executeIkBtn: $("#executeIkBtn"),
   ikStopBtn: $("#ikStopBtn"),
-  ikEstopBtn: $("#ikEstopBtn"),
   ikCandidateList: $("#ikCandidateList"),
   ikPathSummary: $("#ikPathSummary"),
   previewStatus: $("#previewStatus"),
@@ -129,12 +138,18 @@ const elements = {
   programList: $("#programList"),
   programStatus: $("#programStatus"),
   namedPositionsList: $("#namedPositionsList"),
-  refreshEventsBtn: $("#refreshEventsBtn"),
   eventLog: $("#eventLog"),
   toolStatus: $("#toolStatus"),
+  toolSelect: $("#toolSelect"),
+  toolValueSlider: $("#toolValueSlider"),
+  gripperControls: $("#gripperControls"),
+  gripperSliderLabel: $("#gripperSliderLabel"),
+  magnetControls: $("#magnetControls"),
   toolOpenBtn: $("#toolOpenBtn"),
   toolCloseBtn: $("#toolCloseBtn"),
-  toolHalfBtn: $("#toolHalfBtn"),
+  toolSetBtn: $("#toolSetBtn"),
+  toolOnBtn: $("#toolOnBtn"),
+  toolOffBtn: $("#toolOffBtn"),
   taskModeSelect: $("#taskModeSelect"),
   dropZoneSelect: $("#dropZoneSelect"),
   sortColorSelect: $("#sortColorSelect"),
@@ -143,8 +158,14 @@ const elements = {
   taskStatus: $("#taskStatus"),
   taskSummary: $("#taskSummary"),
   detectVisionBtn: $("#detectVisionBtn"),
+  cameraFrame: $("#cameraFrame"),
+  cameraPlaceholder: $("#cameraPlaceholder"),
+  detectionList: $("#detectionList"),
   visionProfileList: $("#visionProfileList"),
   visionSummary: $("#visionSummary"),
+  dhTableEditor: $("#dhTableEditor"),
+  toolCalibration: $("#toolCalibration"),
+  encoderCalibration: $("#encoderCalibration"),
 };
 
 function format(value, decimals = 1) {
@@ -268,6 +289,54 @@ function buildCalibrationEditors() {
     `;
     elements.jointCalibration.appendChild(row);
   });
+
+  if (elements.dhTableEditor) {
+    elements.dhTableEditor.innerHTML = "";
+    (state.config.kinematics?.dh_rows || []).forEach((row, index) => {
+      const item = document.createElement("div");
+      item.className = "dh-row";
+      item.innerHTML = `
+        <strong>J${index + 1}</strong>
+        <label>Theta offset <input data-dh-index="${index}" data-dh-field="theta_offset_deg" type="number" step="0.1" value="${format(row.theta_offset_deg, 1)}" /></label>
+        <label>d mm <input data-dh-index="${index}" data-dh-field="d_mm" type="number" step="0.1" value="${format(row.d_mm, 1)}" /></label>
+        <label>a mm <input data-dh-index="${index}" data-dh-field="a_mm" type="number" step="0.1" value="${format(row.a_mm, 1)}" /></label>
+        <label>alpha <input data-dh-index="${index}" data-dh-field="alpha_deg" type="number" step="0.1" value="${format(row.alpha_deg, 1)}" /></label>
+        <label>Min <input data-dh-index="${index}" data-dh-field="min_deg" type="number" step="0.1" value="${format(row.min_deg ?? state.config.joints[index]?.min_deg ?? -180, 1)}" /></label>
+        <label>Max <input data-dh-index="${index}" data-dh-field="max_deg" type="number" step="0.1" value="${format(row.max_deg ?? state.config.joints[index]?.max_deg ?? 180, 1)}" /></label>
+        <label>Zero <input data-dh-index="${index}" data-dh-field="zero_offset_deg" type="number" step="0.1" value="${format(row.zero_offset_deg ?? 0, 1)}" /></label>
+        <label>Dir
+          <select data-dh-index="${index}" data-dh-field="direction_sign">
+            <option value="1" ${(row.direction_sign ?? 1) === 1 ? "selected" : ""}>+1</option>
+            <option value="-1" ${(row.direction_sign ?? 1) === -1 ? "selected" : ""}>-1</option>
+          </select>
+        </label>
+      `;
+      elements.dhTableEditor.appendChild(item);
+    });
+  }
+
+  if (elements.toolCalibration) {
+    const tools = state.config.tools || {};
+    const active = tools.active || "gripper";
+    const presets = tools.presets || {};
+    elements.toolCalibration.innerHTML = Object.entries(presets)
+      .map(([name, preset]) => {
+        const tcp = preset.tcp_offset_mm || {};
+        return `<div class="log-line"><span>${name}${name === active ? " active" : ""}</span><code>type ${preset.type || "-"}, tcp z ${format(tcp.z, 1)} mm</code></div>`;
+      })
+      .join("");
+  }
+
+  if (elements.encoderCalibration) {
+    const encoders = state.config.encoders || {};
+    elements.encoderCalibration.innerHTML = (encoders.axes || [])
+      .map((axis, index) => {
+        const reported = state.robotState?.encoder_angles_deg?.[index];
+        const err = state.robotState?.encoder_errors_deg?.[index];
+        return `<div class="log-line"><span>${axis.name || `J${index + 1}`} encoder</span><code>cs ${axis.cs_pin}, zero ${format(axis.zero_offset_deg, 2)}, angle ${reported == null ? "-" : format(reported, 2)}, err ${err == null ? "-" : format(err, 2)}</code></div>`;
+      })
+      .join("");
+  }
 }
 
 function buildHardwareIoEditors() {
@@ -319,10 +388,7 @@ function buildHardwareIoEditors() {
           <label>STEP GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="step_pin" type="number" step="1" value="${stepper.step_pin ?? -1}" /></label>
           <label>DIR GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="dir_pin" type="number" step="1" value="${stepper.dir_pin ?? -1}" /></label>
           <label>ENABLE GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="enable_pin" type="number" step="1" value="${stepper.enable_pin ?? -1}" /></label>
-          <label>M0 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m0_pin" type="number" step="1" value="${stepper.m0_pin ?? -1}" /></label>
-          <label>M1 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m1_pin" type="number" step="1" value="${stepper.m1_pin ?? -1}" /></label>
-          <label>M2 GPIO <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="m2_pin" type="number" step="1" value="${stepper.m2_pin ?? -1}" /></label>
-          <label>Driver <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="driver_model" type="text" value="${stepper.driver_model || "TBD"}" /></label>
+          <label>Driver <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="driver_model" type="text" value="${stepper.driver_model || "TB6600"}" /></label>
           <label>Full steps/rev <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="motor_full_steps_per_rev" type="number" min="1" step="1" value="${stepper.motor_full_steps_per_rev ?? 200}" /></label>
           <label>Microsteps <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="microsteps" type="number" min="1" step="1" value="${stepper.microsteps ?? 16}" /></label>
           <label>Gear ratio <input data-hw-index="${index}" data-hw-kind="stepper" data-hw-field="gear_ratio" type="number" min="0.0001" step="0.001" value="${stepper.gear_ratio ?? 1}" /></label>
@@ -354,48 +420,152 @@ function renderHardwareStatus(robotState = state.robotState) {
 }
 
 function renderOperatorPanels() {
-  if (!state.config || !elements.namedPositionsList) return;
+  if (!state.config) return;
   const positions = state.config.named_positions || {};
-  elements.namedPositionsList.innerHTML = "";
-  Object.entries(positions).forEach(([name, position]) => {
+  if (elements.namedPositionsList) {
+    elements.namedPositionsList.innerHTML = "";
+    Object.entries(positions).forEach(([name, position]) => {
+      const item = document.createElement("div");
+      item.className = "program-item";
+      const kind = position.type || "joint";
+      const target = position.target || {};
+      const label =
+        kind === "joint"
+          ? (position.angles_deg || []).map((value) => format(value, 1)).join(", ")
+          : `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, phi ${format(target.phi_deg)}`;
+      item.innerHTML = `
+        <div class="program-title"><span>${name}</span><span>${kind}</span></div>
+        <code>${label}</code>
+        <div class="button-row">
+          <button type="button" class="ghost" data-named-preview="${name}">Preview</button>
+          <button type="button" data-named-apply="${name}">Move</button>
+        </div>
+      `;
+      elements.namedPositionsList.appendChild(item);
+    });
+  }
+
+  if (elements.dropZoneSelect) {
+    elements.dropZoneSelect.innerHTML = "";
+    Object.keys(state.config.drop_zones || {}).forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      elements.dropZoneSelect.appendChild(option);
+    });
+  }
+
+  if (elements.sortColorSelect) elements.sortColorSelect.innerHTML = "";
+  if (elements.visionProfileList) elements.visionProfileList.innerHTML = "";
+  Object.entries(state.config.color_profiles || {}).forEach(([name, profile]) => {
+    if (elements.sortColorSelect) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      elements.sortColorSelect.appendChild(option);
+    }
+    if (elements.visionProfileList) {
+      const line = document.createElement("div");
+      line.className = "log-line";
+      line.innerHTML = `<span>${name}</span><code>${profile.enabled === false ? "off" : "on"} -> ${profile.drop_zone || "-"}</code>`;
+      elements.visionProfileList.appendChild(line);
+    }
+  });
+  renderToolControls();
+}
+
+function renderToolControls() {
+  if (!elements.toolSelect || !state.config) return;
+  const tools = state.config.tools || {};
+  const active = state.robotState?.active_tool || tools.active || "gripper";
+  elements.toolSelect.value = active;
+  const isMagnet = active === "magnet" || tools.presets?.[active]?.type === "electromagnet";
+  if (elements.gripperControls) elements.gripperControls.hidden = isMagnet;
+  if (elements.gripperSliderLabel) elements.gripperSliderLabel.hidden = isMagnet;
+  if (elements.magnetControls) elements.magnetControls.hidden = !isMagnet;
+  if (elements.toolValueSlider && state.robotState?.tool_value != null) {
+    elements.toolValueSlider.value = String(state.robotState.tool_value);
+  }
+}
+
+async function saveActiveTool(active) {
+  if (state.config?.tools) state.config.tools.active = active;
+  if (state.robotState) state.robotState.active_tool = active;
+  renderToolControls();
+  const tools = state.config?.tools || { active, presets: {} };
+  const payload = await postJson("/api/tools", { active, presets: tools.presets || {} });
+  if (payload.ok && payload.config) applyConfig(payload.config);
+  if (payload.state) renderState(payload.state);
+}
+
+function setSerialModalVisible(visible) {
+  if (!elements.serialModal) return;
+  elements.serialModal.hidden = !visible;
+}
+
+async function refreshSerialPorts() {
+  if (!elements.serialPortList) return;
+  const response = await fetch("/api/serial/ports");
+  const payload = await response.json();
+  const ports = payload.ports || [];
+  state.selectedSerialPort = state.selectedSerialPort || payload.last_port || ports[0]?.device || null;
+  elements.serialPortList.innerHTML = "";
+  if (!ports.length) {
     const item = document.createElement("div");
     item.className = "program-item";
-    const kind = position.type || "joint";
-    const target = position.target || {};
-    const label =
-      kind === "joint"
-        ? (position.angles_deg || []).map((value) => format(value, 1)).join(", ")
-        : `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, phi ${format(target.phi_deg)}`;
-    item.innerHTML = `
-      <div class="program-title"><span>${name}</span><span>${kind}</span></div>
-      <code>${label}</code>
-      <div class="button-row">
-        <button type="button" class="ghost" data-named-preview="${name}">Preview</button>
-        <button type="button" data-named-apply="${name}">Move</button>
-      </div>
-    `;
-    elements.namedPositionsList.appendChild(item);
+    item.textContent = "No serial ports detected.";
+    elements.serialPortList.appendChild(item);
+    return;
+  }
+  ports.forEach((port) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `port-option ${state.selectedSerialPort === port.device ? "selected" : ""}`;
+    item.dataset.port = port.device;
+    item.innerHTML = `<strong>${port.device}</strong><span>${port.description || port.name || ""}</span><code>${port.hwid || ""}</code>`;
+    elements.serialPortList.appendChild(item);
   });
+}
 
-  elements.dropZoneSelect.innerHTML = "";
-  Object.keys(state.config.drop_zones || {}).forEach((name) => {
-    const option = document.createElement("option");
-    option.value = name;
-    option.textContent = name;
-    elements.dropZoneSelect.appendChild(option);
+async function openSerialModal() {
+  setSerialModalVisible(true);
+  await refreshSerialPorts();
+}
+
+async function connectSelectedSerial() {
+  if (!state.selectedSerialPort) {
+    showLocalError("choose a serial port first");
+    return;
+  }
+  const payload = await postJson("/api/connect", {
+    simulation: false,
+    port: state.selectedSerialPort,
+    baud_rate: Number(elements.baudRate.value),
   });
+  if (payload.ok) setSerialModalVisible(false);
+}
 
-  elements.sortColorSelect.innerHTML = "";
-  elements.visionProfileList.innerHTML = "";
-  Object.entries(state.config.color_profiles || {}).forEach(([name, profile]) => {
-    const option = document.createElement("option");
-    option.value = name;
-    option.textContent = name;
-    elements.sortColorSelect.appendChild(option);
+async function refreshDiagnostics() {
+  if (!elements.diagnosticsDrawer || elements.diagnosticsDrawer.hidden) return;
+  const response = await fetch("/api/diagnostics");
+  const payload = await response.json();
+  const robotState = payload.state || {};
+  const enc = robotState.encoder_angles_deg || [];
+  const err = robotState.encoder_errors_deg || [];
+  elements.diagnosticsSummary.innerHTML = `
+    <div class="log-line"><span>Pose source</span><code>${robotState.pose_source || "unknown"}</code></div>
+    <div class="log-line"><span>Encoders</span><code>${robotState.encoder_available || "0000"}</code></div>
+    <div class="log-line"><span>Encoder angles</span><code>${enc.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
+    <div class="log-line"><span>Encoder errors</span><code>${err.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
+    <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
+  `;
+  elements.eventLog.innerHTML = "";
+  (payload.events || []).reverse().forEach((event) => {
     const line = document.createElement("div");
     line.className = "log-line";
-    line.innerHTML = `<span>${name}</span><code>${profile.enabled === false ? "off" : "on"} -> ${profile.drop_zone || "-"}</code>`;
-    elements.visionProfileList.appendChild(line);
+    const ts = new Date((event.ts || 0) * 1000).toLocaleTimeString();
+    line.innerHTML = `<span>${ts} ${event.source}</span><code>${event.message}</code>`;
+    elements.eventLog.appendChild(line);
   });
 }
 
@@ -441,9 +611,9 @@ async function moveNamedPosition(name) {
 }
 
 async function sendTool(action, value = null) {
-  const payload = await postJson("/api/tool", { action, value });
+  const payload = await postJson("/api/tool", { action, value, tool: state.config?.tools?.active });
   if (payload.state) renderState(payload.state);
-  await refreshEvents();
+  await refreshDiagnostics();
 }
 
 function renderTaskSummary(sequence, preview) {
@@ -462,10 +632,12 @@ async function previewTask() {
   const task = elements.taskModeSelect.value;
   const objectTarget = ikTargetPayload();
   const request =
-    task === "sorting"
+    task === "color_sorting"
       ? {
           task,
-          detection: { color: elements.sortColorSelect.value, robot: objectTarget },
+          detections: state.latestDetections.length
+            ? state.latestDetections
+            : [{ color: elements.sortColorSelect.value, robot: objectTarget, ok: true }],
           settings: pathSettings(),
           branch: elements.ikBranchSelect.value,
         }
@@ -487,26 +659,33 @@ async function previewTask() {
     renderPreviewFailure(payload);
     elements.taskStatus.textContent = payload.error || "Task preview failed";
   }
-  await refreshEvents();
+  await refreshDiagnostics();
 }
 
 async function executeTask() {
   if (!state.taskPreviewId) return;
   const payload = await postJson("/api/task/execute", { preview_id: state.taskPreviewId });
   elements.taskStatus.textContent = payload.ok ? "Task running" : payload.error || "Task failed";
-  await refreshEvents();
+  await refreshDiagnostics();
 }
 
 async function detectVision() {
   elements.visionSummary.innerHTML = `<div class="log-line"><span>Status</span><code>Detecting...</code></div>`;
-  const payload = await postJson("/api/vision/detect", {
-    profile_names: elements.sortColorSelect.value ? [elements.sortColorSelect.value] : null,
-  });
+  const payload = await fetch("/api/vision/frame").then((response) => response.json());
   elements.visionSummary.innerHTML = "";
   if (!payload.ok) {
     elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
+    if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = false;
     return;
   }
+  state.latestDetections = (payload.detections || []).filter((detection) => detection.ok);
+  if (payload.image_b64 && elements.cameraFrame) {
+    elements.cameraFrame.src = payload.image_b64;
+    elements.cameraFrame.hidden = false;
+    if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = true;
+  }
+  renderDetectionList(payload.detections || []);
+  if (state.view) state.view.setObjectDetections(state.latestDetections);
   (payload.detections || []).forEach((detection) => {
     const line = document.createElement("div");
     line.className = "log-line";
@@ -515,7 +694,29 @@ async function detectVision() {
     line.innerHTML = `<span>${detection.color}</span><code>${detection.ok ? center + robot : detection.reason}</code>`;
     elements.visionSummary.appendChild(line);
   });
-  await refreshEvents();
+  await refreshDiagnostics();
+}
+
+function renderDetectionList(detections) {
+  if (!elements.detectionList) return;
+  elements.detectionList.innerHTML = "";
+  if (!detections.length) {
+    const empty = document.createElement("div");
+    empty.className = "program-item";
+    empty.textContent = "No detections yet.";
+    elements.detectionList.appendChild(empty);
+    return;
+  }
+  detections.forEach((detection, index) => {
+    const item = document.createElement("div");
+    item.className = `program-item ${detection.ok ? "" : "invalid"}`;
+    const robot = detection.robot ? `robot ${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}` : "uncalibrated";
+    item.innerHTML = `
+      <div class="program-title"><span>${index + 1}. ${detection.color || "object"}</span><span>${detection.ok ? "ready" : "ignored"}</span></div>
+      <code>${detection.ok ? robot : detection.reason || "not usable"}</code>
+    `;
+    elements.detectionList.appendChild(item);
+  });
 }
 
 function hardwareDraftState(index, actuator) {
@@ -713,10 +914,9 @@ function updateDisabledState() {
     input.disabled = !enabled;
   });
   elements.applyJointPreviewBtn.disabled = !enabled || !state.draftAngles;
-  elements.resetJointPreviewBtn.disabled = !state.draftAngles;
+  elements.resetJointPreviewBtn.disabled = !state.draftAngles && !state.commandedAngles;
   elements.homeBtn.disabled = !enabled;
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
-  elements.clearEstopBtn.disabled = !state.robotState?.simulation;
   elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
   elements.executeProgramBtn.disabled = !state.previewId || !enabled || state.latestPreview?.mode !== "program";
@@ -735,15 +935,23 @@ function renderState(robotState) {
   );
   setBadge(elements.armedBadge, robotState.hardware_armed ? "Armed" : "Disarmed", robotState.hardware_armed ? "badge-danger" : "");
   if (elements.toolStatus) elements.toolStatus.textContent = robotState.tool_state || "unknown";
+  renderToolControls();
 
   if (!robotState.live_motion_enabled) elements.liveRealToggle.checked = false;
-  const targets = state.draftAngles || state.pendingAngles || robotState.target_angles_deg;
+  if (state.commandedAngles && anglesAlmostEqual(robotState.reported_angles_deg, state.commandedAngles, 0.15)) {
+    state.commandedAngles = null;
+    if (!state.draftAngles && state.viewPreviewSource === "joint") {
+      clearViewPreview();
+    }
+  }
+  const previewAngles = state.draftAngles || state.commandedAngles || state.pendingAngles;
+  const targets = previewAngles || robotState.target_angles_deg;
   syncJointInputs(targets, robotState.reported_angles_deg);
   state.view.setAngles(robotState.reported_angles_deg);
-  if (state.activeTab === "joint" && state.draftAngles && !elements.liveJogToggle.checked) {
+  if (state.activeTab === "joint" && previewAngles) {
     state.viewPreviewSource = "joint";
-    state.view.setPreviewAngles(state.draftAngles);
-  } else if (state.viewPreviewSource === "joint") {
+    state.view.setPreviewAngles(previewAngles);
+  } else if (state.viewPreviewSource === "joint" && !state.commandedAngles) {
     clearViewPreview();
   }
 
@@ -1037,8 +1245,19 @@ function readCalibrationPayload() {
     patch.max_accel_deg_s2 = readNumber($(`.joint-accel-limit[data-index="${index}"]`), joint.max_accel_deg_s2);
     return patch;
   });
+  const dhRows = (state.config.kinematics?.dh_rows || []).map((row, index) => {
+    const patch = { joint: index + 1, joint_type: row.joint_type || "revolute" };
+    document.querySelectorAll(`[data-dh-index="${index}"][data-dh-field]`).forEach((input) => {
+      patch[input.dataset.dhField] = readNumber(input, row[input.dataset.dhField] || 0);
+    });
+    return patch;
+  });
   return {
     links_mm: links,
+    kinematics: {
+      ...(state.config.kinematics || {}),
+      dh_rows: dhRows,
+    },
     joints,
     motion: {
       command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
@@ -1069,7 +1288,7 @@ async function saveCalibration(options = {}) {
 
 function applyConfig(config) {
   state.config = config;
-  elements.serialPort.value = state.config.serial.port;
+  state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
   elements.commandRate.textContent = `${format(state.config.motion.command_rate_limit_hz, 0)} Hz command limit`;
   elements.globalSpeedInput.value = format(Math.min(...state.config.joints.map((joint) => joint.max_speed_deg_s)), 1);
@@ -1115,7 +1334,6 @@ function connectWebSocket() {
     if (payload.type === "state") {
       if (state.pendingAngles && anglesAlmostEqual(payload.state.target_angles_deg, state.pendingAngles)) {
         state.pendingAngles = null;
-        if (elements.liveJogToggle.checked) state.draftAngles = null;
       }
       renderState(payload.state);
     }
@@ -1251,7 +1469,7 @@ function bindActions() {
         scheduleIkPreview(0);
       }
       if (target === "operate") {
-        refreshEvents();
+        detectVision();
       }
       state.view.resize();
     });
@@ -1278,12 +1496,16 @@ function bindActions() {
     const payload = await postJson("/api/joints", { angles_deg: angles });
     if (payload.ok) {
       state.pendingAngles = angles.slice();
+      state.commandedAngles = angles.slice();
       state.draftAngles = null;
-      clearViewPreview();
+      state.viewPreviewSource = "joint";
+      state.view.setPreviewAngles(state.commandedAngles);
     }
   });
   elements.resetJointPreviewBtn.addEventListener("click", () => {
     state.draftAngles = null;
+    state.commandedAngles = null;
+    state.pendingAngles = null;
     if (state.viewPreviewSource === "joint") clearViewPreview();
     if (state.robotState) renderState(state.robotState);
   });
@@ -1306,18 +1528,26 @@ function bindActions() {
   });
 
   elements.connectSimBtn.addEventListener("click", () => postJson("/api/connect", { simulation: true }));
-  elements.connectSerialBtn.addEventListener("click", () =>
-    postJson("/api/connect", {
-      simulation: false,
-      port: elements.serialPort.value,
-      baud_rate: Number(elements.baudRate.value),
-    }),
-  );
+  elements.connectSerialBtn.addEventListener("click", openSerialModal);
+  elements.refreshPortsBtn.addEventListener("click", refreshSerialPorts);
+  elements.closeSerialModalBtn.addEventListener("click", () => setSerialModalVisible(false));
+  elements.serialPortList.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-port]");
+    if (!option) return;
+    state.selectedSerialPort = option.dataset.port;
+    refreshSerialPorts();
+  });
+  elements.connectSelectedSerialBtn.addEventListener("click", connectSelectedSerial);
   elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
   elements.homeBtn.addEventListener("click", () => postJson("/api/home"));
   elements.stopBtn.addEventListener("click", () => postJson("/api/stop"));
-  elements.estopBtn.addEventListener("click", () => postJson("/api/estop"));
-  elements.clearEstopBtn.addEventListener("click", () => postJson("/api/clear-estop"));
+  elements.diagnosticsBtn.addEventListener("click", async () => {
+    elements.diagnosticsDrawer.hidden = false;
+    await refreshDiagnostics();
+  });
+  elements.closeDiagnosticsBtn.addEventListener("click", () => {
+    elements.diagnosticsDrawer.hidden = true;
+  });
   elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
   elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
   elements.hardwareIo.addEventListener("change", markHardwareDraftDirty);
@@ -1336,19 +1566,21 @@ function bindActions() {
     const payload = await postJson("/api/live-motion", { enabled: elements.liveRealToggle.checked });
     elements.liveRealToggle.checked = Boolean(payload.ok && payload.state?.live_motion_enabled);
   });
-  elements.namedPositionsList.addEventListener("click", (event) => {
+  elements.namedPositionsList?.addEventListener("click", (event) => {
     const previewButton = event.target.closest("[data-named-preview]");
     const applyButton = event.target.closest("[data-named-apply]");
     if (previewButton) previewNamedPosition(previewButton.dataset.namedPreview);
     if (applyButton) moveNamedPosition(applyButton.dataset.namedApply);
   });
+  elements.toolSelect.addEventListener("change", () => saveActiveTool(elements.toolSelect.value));
   elements.toolOpenBtn.addEventListener("click", () => sendTool("open"));
   elements.toolCloseBtn.addEventListener("click", () => sendTool("close"));
-  elements.toolHalfBtn.addEventListener("click", () => sendTool("set", 0.5));
+  elements.toolSetBtn.addEventListener("click", () => sendTool("set", Number(elements.toolValueSlider.value || 0)));
+  elements.toolOnBtn.addEventListener("click", () => sendTool("on"));
+  elements.toolOffBtn.addEventListener("click", () => sendTool("off"));
   elements.previewTaskBtn.addEventListener("click", previewTask);
   elements.executeTaskBtn.addEventListener("click", executeTask);
   elements.detectVisionBtn.addEventListener("click", detectVision);
-  elements.refreshEventsBtn.addEventListener("click", refreshEvents);
 
   elements.sliderRangeControls.addEventListener("input", () => {
     state.ikUserEdited = true;
@@ -1374,7 +1606,6 @@ function bindActions() {
   });
   elements.executeIkBtn.addEventListener("click", () => executePreview());
   elements.ikStopBtn.addEventListener("click", () => postJson("/api/stop"));
-  elements.ikEstopBtn.addEventListener("click", () => postJson("/api/estop"));
 
   elements.addCurrentJointWaypointBtn.addEventListener("click", addCurrentJointWaypoint);
   elements.addIkWaypointBtn.addEventListener("click", addIkWaypoint);

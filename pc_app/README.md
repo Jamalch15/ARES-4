@@ -6,21 +6,22 @@ Current scope:
 
 - Python backend with FastAPI and WebSockets
 - Browser dashboard on localhost
-- Manual joint sandbox for four rotary joints
-- Forward and inverse kinematics sandbox
+- Manual Control tab for four rotary joints and active tool controls
+- Standard DH forward kinematics and Jacobian IK sandbox
 - Cartesian target preview with ghost arm, target marker, and path line
+- Task panel with camera/detection placeholders and pick/place or color-sorting preview
 - In-memory program sandbox for multi-waypoint experiments
 - Simulation mode by default
 - Serial transport abstraction for later ESP32-S3 control
-- Persistent Hardware IO settings for pins, gear ratios, microstepping, and servo pulse mapping
+- Persistent Hardware IO settings for pins, TB6600 microstep value, gear ratios, servo pulse mapping, tools, and encoders
 - ESP hardware-config sync on serial connect and Settings save
-- Safety checks for joint limits, known pose, stop, emergency stop, armed hardware mode, live-motion gating, and rate-limited motion
-- Named-position, task, tool, vision, and event-log APIs for the demo path
+- Safety checks for joint limits, known pose, stop, armed hardware mode, live-motion gating, and rate-limited motion
+- Named-position, task, tool, vision, diagnostics, and encoder-readback APIs for the demo path
 
 Not included in this iteration:
 
 - Real homing switches
-- Closed-loop encoder correction
+- Full closed-loop encoder correction
 
 ## Working Assumptions
 
@@ -34,6 +35,7 @@ These are assumptions, not final design decisions.
 - Bluetooth may be added later as another transport implementation
 - Exact link lengths, gear ratios, zero offsets, pin assignments, servo pulse ranges, and homing hardware are not decided
 - Hardware feedback is open-loop for now: steppers report commanded step counts and servos report commanded angles
+- AS5048A base/shoulder encoder readback is staged for known-pose and verification before any full closed-loop control.
 
 ## Quick Start After Restart
 
@@ -113,28 +115,40 @@ The dashboard is a sandbox for testing the arm model and motion behavior before 
 
 - Left panel: operation tabs and settings.
 - Right viewport: live 3D robot view, preview ghost arm, target marker, and path line.
-- Top-right rail: connect/disconnect, home, stop, E-stop, clear E-stop, and armed toggle.
+- Top-right rail: simulation, serial picker, disconnect, home, stop, diagnostics, and armed toggle.
 - View widgets: HUD, target faders, preview/path/frame toggles, reset view, and Live Real.
 
-### Joint Tab
+### Control Tab
 
 Use this for direct joint-angle experiments.
 
 - Move joint sliders or type angles to update the preview ghost.
 - `Apply` sends the current joint preview through the backend motion path.
+- The preview stays visible until the reported pose reaches the commanded target, a newer target replaces it, or you press `Reset`.
 - `Live joint jog` sends rate-limited joint updates while editing.
+- The Tool panel switches between gripper controls and magnet controls from saved tool config.
 - Keep movements small when the physical arm is connected.
 
-### IK Tab
+### Tasks Tab
+
+Use this for demo workflows.
+
+- Select `Color Sorting` or `Pick and Place`.
+- Refresh the camera panel to run current color/blob detection.
+- Preview builds the pick/place sequence before execution.
+- Detected objects can be shown in the 3D view when camera calibration is available.
+
+### Kinematics Tab
 
 Use this for Cartesian target experiments.
 
 - Set `x`, `y`, `z` in millimeters and `phi` in degrees.
 - Sliders and viewport faders auto-preview the target while you move them.
 - `Mode` selects joint-space or Cartesian linear path generation.
-- `Branch` selects automatic nearest IK solution, elbow-up, or elbow-down.
+- `Branch` selects the numerical IK seed preference.
 - `Preview` builds a path and updates the ghost arm, target marker, and path line.
 - `Execute` runs the accepted preview.
+- The Standard DH table is editable and saved through Settings.
 
 ### Program Tab
 
@@ -150,7 +164,7 @@ Use this for temporary waypoint experiments. Programs are in-memory only and are
 Use this as the shared robot model for both FK and IK.
 
 - Edit link lengths, joint limits, home pose, zero offsets, direction signs, and motion defaults.
-- Edit Hardware IO placeholders for stepper pins, servo PWM pins, microstepping, gear ratios, servo pulse range, and enabled axes.
+- Edit Hardware IO placeholders for stepper pins, TB6600 microstep value, gear ratios, servo pulse range, and enabled axes.
 - Draft edits do not affect FK/IK until you press `Save`.
 - After saving, the backend reloads config, refreshes the dashboard from the saved model, and tries to resync the ESP if serial hardware is connected.
 
@@ -160,6 +174,7 @@ The Settings tab is the single source of truth for physical pin and actuator map
 
 - All axes start disabled with unknown pins set to `-1`.
 - Base and shoulder are currently modeled as steppers.
+- Base and shoulder stepper drivers are currently modeled as TB6600 drivers; microstepping is set on physical DIP switches but still stored as a numeric value for steps-per-degree math.
 - Elbow and wrist are currently modeled as 270 degree servos.
 - Disabled axes are simulated by the controller and shown as `simulated`.
 - Enabled valid axes are shown as `hardware`.
@@ -175,9 +190,8 @@ Working assumptions:
 - Real hardware movement requires the backend to be connected to the controller.
 - Real hardware movement requires hardware config sync to be `synced`.
 - `Armed` is required before hardware execution or Live Real hardware movement.
-- `Live Real` is always off after page reload, disconnect, and E-stop clear.
+- `Live Real` is always off after page reload and disconnect.
 - `Stop` cancels active movement.
-- `E-Stop` blocks motion until cleared.
 
 Use `Preview` first, check the ghost/path visually, then arm and execute only when the physical workspace is clear.
 
@@ -204,12 +218,15 @@ Important fields:
 - `motion.acceleration_deg_s2`: simple acceleration limit
 - `motion.allow_sudden_jumps`: keep `false` unless intentionally testing jumps
 - `serial.port` and `serial.baud_rate`: initial USB serial settings
-- `joints[].hardware.stepper`: step/dir/enable/microstep pins, driver model, full steps per rev, microsteps, and motor-to-joint gear ratio
+- `kinematics.dh_rows`: Standard DH rows used for FK and Jacobian IK
+- `joints[].hardware.stepper`: step/dir/enable pins, driver model, full steps per rev, microsteps, and motor-to-joint gear ratio
 - `joints[].hardware.servo`: PWM pin, pulse min/max, PWM frequency, servo range, neutral angle, and servo-to-joint gear ratio
+- `tools`: active gripper or magnet dimensions and IO settings
+- `encoders`: staged AS5048A readback and verification settings
 
-## Coordinate Frame And FK
+## Coordinate Frame And Kinematics
 
-The FK model is intentionally simple and configurable.
+The kinematics model uses Standard DH rows from config. The legacy link dimensions are kept for compatibility and for generating default DH rows.
 
 Working assumption:
 
@@ -220,7 +237,7 @@ Working assumption:
 - Shoulder, elbow, and wrist are pitch joints in the vertical radial plane
 - Shoulder 0 deg points the upper arm vertically upward
 - Positive shoulder, elbow, and wrist angles bend the chain toward the local horizontal reach direction
-- `phi` is the tool angle from the local horizontal reach axis
+- `phi` is the current tool angle target used by the numerical IK workflow
 
 Lengths are in millimeters internally. Trigonometry uses radians internally. UI and config use degrees for joint angles.
 
@@ -274,16 +291,18 @@ ESTOP
 HOME
 TOOL OPEN|CLOSE
 TOOL SET value=0.000
+TOOL ON|OFF
 ```
 
 Current status response:
 
 ```text
-STATUS state=idle homed=0 armed=0 hw=mixed enabled=1000 j1=0.0 j2=20.0 j3=20.0 j4=0.0 fault=OK
+STATUS state=idle homed=0 known=0 pose_source=unknown armed=0 hw=mixed enabled=1000 enc=0000 e1=0.0 e2=0.0 j1=0.0 j2=20.0 j3=20.0 j4=0.0 closed_loop=off tool_type=generic tool=unknown tool_value=0.000 fault=OK
 ```
 
-Optional newer status fields include `known=0|1`, `enc=1100`, `e1=<deg>`,
-`e2=<deg>`, and `tool=<open|closed|moving|unknown>`.
+Optional/newer status fields include `known=0|1`, `pose_source=<manual|setpose|encoder|mixed>`, `enc=1100`, `e1=<deg>`,
+`e2=<deg>`, `closed_loop=<off|readback|settle_correction>`, `tool_type=<generic|servo_gripper|electromagnet>`,
+`tool=<open|closed|on|off|moving|unknown>`, and `tool_value=<0.000..1.000>`.
 
 Working assumption: the PC remains the planner. The ESP is a safe target follower for PC-streamed `MOVEJ` waypoints.
 

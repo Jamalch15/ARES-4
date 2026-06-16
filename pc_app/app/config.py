@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -62,12 +62,37 @@ class JointConfig:
 
 
 @dataclass(frozen=True)
+class DHRowConfig:
+    joint_index: int
+    theta_offset_deg: float
+    d_mm: float
+    a_mm: float
+    alpha_deg: float
+    joint_type: str = "revolute"
+    min_deg: float = -180.0
+    max_deg: float = 180.0
+    zero_offset_deg: float = 0.0
+    direction_sign: int = 1
+
+
+@dataclass(frozen=True)
 class LinkConfig:
     base_height_mm: float
     upper_arm_mm: float
     forearm_mm: float
     wrist_mm: float
     tool_mm: float
+    dh_rows: list[DHRowConfig] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class KinematicsConfig:
+    convention: str
+    dh_rows: list[DHRowConfig]
+    position_tolerance_mm: float
+    orientation_tolerance_deg: float
+    max_iterations: int
+    damping: float
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,7 @@ class SerialConfig:
 class RobotConfig:
     joints: list[JointConfig]
     links: LinkConfig
+    kinematics: KinematicsConfig
     motion: MotionConfig
     serial: SerialConfig
     simulation_default: bool
@@ -135,6 +161,67 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
+def _default_dh_rows(
+    base_height_mm: float,
+    upper_arm_mm: float,
+    forearm_mm: float,
+    wrist_mm: float,
+    tool_mm: float,
+) -> list[DHRowConfig]:
+    # Standard DH table matching the project coordinate convention:
+    # robot x = DH y, robot y = -DH x, robot z = DH z.
+    return [
+        DHRowConfig(0, 0.0, base_height_mm, 0.0, 90.0),
+        DHRowConfig(1, 90.0, 0.0, upper_arm_mm, 0.0),
+        DHRowConfig(2, 0.0, 0.0, forearm_mm, 0.0),
+        DHRowConfig(3, 0.0, 0.0, wrist_mm + tool_mm, 0.0),
+    ]
+
+
+def _parse_dh_rows(raw_rows: Any, fallback: list[DHRowConfig]) -> list[DHRowConfig]:
+    if not isinstance(raw_rows, list) or not raw_rows:
+        return fallback
+    rows: list[DHRowConfig] = []
+    for index, row in enumerate(raw_rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"kinematics.dh_rows[{index}] must be a mapping")
+        raw_joint = row.get("joint_index", row.get("joint", index + 1))
+        joint_index = int(raw_joint)
+        if joint_index >= 1:
+            joint_index -= 1
+        if joint_index < 0 or joint_index > 3:
+            raise ValueError(f"kinematics.dh_rows[{index}].joint must reference joint 1..4")
+        rows.append(
+            DHRowConfig(
+                joint_index=joint_index,
+                theta_offset_deg=_require_number(
+                    row.get("theta_offset_deg", row.get("theta", 0.0)),
+                    f"kinematics.dh_rows[{index}].theta_offset_deg",
+                ),
+                d_mm=_require_number(row.get("d_mm", row.get("d", 0.0)), f"kinematics.dh_rows[{index}].d_mm"),
+                a_mm=_require_number(row.get("a_mm", row.get("a", 0.0)), f"kinematics.dh_rows[{index}].a_mm"),
+                alpha_deg=_require_number(
+                    row.get("alpha_deg", row.get("alpha", 0.0)),
+                    f"kinematics.dh_rows[{index}].alpha_deg",
+                ),
+                joint_type=str(row.get("joint_type", "revolute")),
+                min_deg=_require_number(row.get("min_deg", -180.0), f"kinematics.dh_rows[{index}].min_deg"),
+                max_deg=_require_number(row.get("max_deg", 180.0), f"kinematics.dh_rows[{index}].max_deg"),
+                zero_offset_deg=_require_number(
+                    row.get("zero_offset_deg", 0.0),
+                    f"kinematics.dh_rows[{index}].zero_offset_deg",
+                ),
+                direction_sign=_direction_sign(
+                    row.get("direction_sign", 1),
+                    f"kinematics.dh_rows[{index}].direction_sign",
+                ),
+            )
+        )
+    if len(rows) != 4:
+        raise ValueError("kinematics.dh_rows must define exactly four rows")
+    return rows
+
+
 def _hardware_for_joint(item: dict[str, Any], actuator: str, name: str) -> JointHardwareConfig:
     hardware_raw = item.get("hardware")
     if not isinstance(hardware_raw, dict):
@@ -169,7 +256,7 @@ def _hardware_for_joint(item: dict[str, Any], actuator: str, name: str) -> Joint
             m0_pin=_int_value(raw.get("m0_pin", -1), f"{name}.hardware.stepper.m0_pin"),
             m1_pin=_int_value(raw.get("m1_pin", -1), f"{name}.hardware.stepper.m1_pin"),
             m2_pin=_int_value(raw.get("m2_pin", -1), f"{name}.hardware.stepper.m2_pin"),
-            driver_model=str(raw.get("driver_model", "TBD")),
+            driver_model=str(raw.get("driver_model", "TB6600")),
             motor_full_steps_per_rev=_positive_int(
                 raw.get("motor_full_steps_per_rev", 200),
                 f"{name}.hardware.stepper.motor_full_steps_per_rev",
@@ -233,15 +320,11 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
         min_deg = _require_number(limits.get("min"), f"{name}.limits_deg.min")
         max_deg = _require_number(limits.get("max"), f"{name}.limits_deg.max")
         home_deg = _require_number(item.get("home_deg", 0.0), f"{name}.home_deg")
-        max_speed = _require_number(
-            item.get("max_speed_deg_s", 20.0), f"{name}.max_speed_deg_s"
-        )
+        max_speed = _require_number(item.get("max_speed_deg_s", 20.0), f"{name}.max_speed_deg_s")
         max_accel = _require_number(
             item.get("max_accel_deg_s2", default_joint_accel), f"{name}.max_accel_deg_s2"
         )
-        zero_offset = _require_number(
-            item.get("zero_offset_deg", 0.0), f"{name}.zero_offset_deg"
-        )
+        zero_offset = _require_number(item.get("zero_offset_deg", 0.0), f"{name}.zero_offset_deg")
         direction = _direction_sign(item.get("direction_sign", 1), f"{name}.direction_sign")
         if min_deg >= max_deg:
             raise ValueError(f"{name} min limit must be below max limit")
@@ -268,25 +351,47 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
         )
 
     links_raw = raw.get("links_mm", {})
-    links = LinkConfig(
-        base_height_mm=_require_number(links_raw.get("base_height", 80.0), "base_height"),
-        upper_arm_mm=_require_number(links_raw.get("upper_arm", 140.0), "upper_arm"),
-        forearm_mm=_require_number(links_raw.get("forearm", 120.0), "forearm"),
-        wrist_mm=_require_number(links_raw.get("wrist", 60.0), "wrist"),
-        tool_mm=_require_number(links_raw.get("tool", 30.0), "tool"),
+    base_height = _require_number(links_raw.get("base_height", 80.0), "base_height")
+    upper_arm = _require_number(links_raw.get("upper_arm", 140.0), "upper_arm")
+    forearm = _require_number(links_raw.get("forearm", 120.0), "forearm")
+    wrist = _require_number(links_raw.get("wrist", 60.0), "wrist")
+    tool = _require_number(links_raw.get("tool", 30.0), "tool")
+    fallback_dh = _default_dh_rows(base_height, upper_arm, forearm, wrist, tool)
+
+    kinematics_raw = raw.get("kinematics", {})
+    if not isinstance(kinematics_raw, dict):
+        kinematics_raw = {}
+    convention = str(kinematics_raw.get("convention", "standard_dh"))
+    if convention != "standard_dh":
+        raise ValueError("only standard_dh kinematics are supported")
+    dh_rows = _parse_dh_rows(kinematics_raw.get("dh_rows"), fallback_dh)
+    kinematics = KinematicsConfig(
+        convention=convention,
+        dh_rows=dh_rows,
+        position_tolerance_mm=_require_number(
+            kinematics_raw.get("position_tolerance_mm", 1.0),
+            "kinematics.position_tolerance_mm",
+        ),
+        orientation_tolerance_deg=_require_number(
+            kinematics_raw.get("orientation_tolerance_deg", 1.0),
+            "kinematics.orientation_tolerance_deg",
+        ),
+        max_iterations=int(kinematics_raw.get("max_iterations", 160)),
+        damping=_require_number(kinematics_raw.get("damping", 0.18), "kinematics.damping"),
     )
+    if kinematics.max_iterations <= 0:
+        raise ValueError("kinematics.max_iterations must be positive")
+    if kinematics.damping <= 0:
+        raise ValueError("kinematics.damping must be positive")
+    links = LinkConfig(base_height, upper_arm, forearm, wrist, tool, dh_rows=dh_rows)
 
     motion = MotionConfig(
         update_rate_hz=_require_number(motion_raw.get("update_rate_hz", 30), "update_rate_hz"),
-        smoothing_alpha=_require_number(
-            motion_raw.get("smoothing_alpha", 0.35), "smoothing_alpha"
-        ),
+        smoothing_alpha=_require_number(motion_raw.get("smoothing_alpha", 0.35), "smoothing_alpha"),
         command_rate_limit_hz=_require_number(
             motion_raw.get("command_rate_limit_hz", 12), "command_rate_limit_hz"
         ),
-        acceleration_deg_s2=_require_number(
-            motion_raw.get("acceleration_deg_s2", 120), "acceleration_deg_s2"
-        ),
+        acceleration_deg_s2=_require_number(motion_raw.get("acceleration_deg_s2", 120), "acceleration_deg_s2"),
         allow_sudden_jumps=bool(motion_raw.get("allow_sudden_jumps", False)),
     )
     if motion.update_rate_hz <= 0:
@@ -298,7 +403,7 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
 
     serial_raw = raw.get("serial", {})
     serial = SerialConfig(
-        port=str(serial_raw.get("port", "COM6")),
+        port=str(serial_raw.get("last_port", serial_raw.get("port", "COM6"))),
         baud_rate=int(serial_raw.get("baud_rate", 115200)),
         timeout_s=_require_number(serial_raw.get("timeout_s", 0.2), "serial.timeout_s"),
     )
@@ -306,6 +411,7 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
     return RobotConfig(
         joints=joints,
         links=links,
+        kinematics=kinematics,
         motion=motion,
         serial=serial,
         simulation_default=bool(raw.get("simulation_default", True)),
@@ -313,6 +419,26 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
         raw=raw,
         source_path=config_path,
     )
+
+
+def _write_dh_rows(data: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    data.setdefault("kinematics", {})
+    data["kinematics"]["convention"] = "standard_dh"
+    data["kinematics"]["dh_rows"] = [
+        {
+            "joint": int(row.get("joint", row.get("joint_index", index + 1))),
+            "theta_offset_deg": float(row.get("theta_offset_deg", 0.0)),
+            "d_mm": float(row.get("d_mm", 0.0)),
+            "a_mm": float(row.get("a_mm", 0.0)),
+            "alpha_deg": float(row.get("alpha_deg", 0.0)),
+            "joint_type": str(row.get("joint_type", "revolute")),
+            "min_deg": float(row.get("min_deg", -180.0)),
+            "max_deg": float(row.get("max_deg", 180.0)),
+            "zero_offset_deg": float(row.get("zero_offset_deg", 0.0)),
+            "direction_sign": _direction_sign(row.get("direction_sign", 1), f"kinematics.dh_rows[{index}].direction_sign"),
+        }
+        for index, row in enumerate(rows)
+    ]
 
 
 def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
@@ -336,6 +462,17 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
         for key in ["base_height", "upper_arm", "forearm", "wrist", "tool"]:
             if key in links:
                 data["links_mm"][key] = float(links[key])
+
+    kinematics = updates.get("kinematics")
+    if isinstance(kinematics, dict):
+        data.setdefault("kinematics", {})
+        for key in ["position_tolerance_mm", "orientation_tolerance_deg", "damping"]:
+            if key in kinematics:
+                data["kinematics"][key] = float(kinematics[key])
+        if "max_iterations" in kinematics:
+            data["kinematics"]["max_iterations"] = int(kinematics["max_iterations"])
+        if isinstance(kinematics.get("dh_rows"), list):
+            _write_dh_rows(data, kinematics["dh_rows"])
 
     joints = updates.get("joints")
     if isinstance(joints, list):
@@ -374,9 +511,6 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
                         "dir_pin",
                         "enable_pin",
                         "enable_active_low",
-                        "m0_pin",
-                        "m1_pin",
-                        "m2_pin",
                         "driver_model",
                         "motor_full_steps_per_rev",
                         "microsteps",
@@ -384,6 +518,9 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
                     ]:
                         if key in hardware["stepper"]:
                             stepper[key] = hardware["stepper"][key]
+                    for obsolete_key in ["m0_pin", "m1_pin", "m2_pin"]:
+                        if obsolete_key in stepper:
+                            stepper[obsolete_key] = -1
                 if "servo" in hardware and isinstance(hardware["servo"], dict):
                     servo = joint["hardware"].setdefault("servo", {})
                     for key in [
@@ -413,7 +550,28 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
         if "allow_sudden_jumps" in motion:
             data["motion"]["allow_sudden_jumps"] = bool(motion["allow_sudden_jumps"])
 
-    for key in ["named_positions", "camera", "color_profiles", "drop_zones", "task_defaults", "tool"]:
+    serial = updates.get("serial")
+    if isinstance(serial, dict):
+        data.setdefault("serial", {})
+        if "last_port" in serial:
+            data["serial"]["last_port"] = str(serial["last_port"])
+            data["serial"]["port"] = str(serial["last_port"])
+        if "baud_rate" in serial:
+            data["serial"]["baud_rate"] = int(serial["baud_rate"])
+        if "timeout_s" in serial:
+            data["serial"]["timeout_s"] = float(serial["timeout_s"])
+
+    for key in [
+        "named_positions",
+        "camera",
+        "color_profiles",
+        "drop_zones",
+        "task_defaults",
+        "tool",
+        "tools",
+        "encoders",
+        "calibration",
+    ]:
         if key in updates and isinstance(updates[key], dict):
             data[key] = updates[key]
 

@@ -9,8 +9,8 @@ A newer open-loop full-arm controller now lives in `platformio/src/arm_controlle
 Before writing final motor-control firmware, collect the missing hardware details:
 
 - Stepper driver type for base and shoulder
-- Base stepper pins: direction, step, enable, microstep pins
-- Shoulder stepper pins: direction, step, enable, microstep pins
+- Base stepper pins: direction, step, enable
+- Shoulder stepper pins: direction, step, enable
 - Servo pin for elbow
 - Servo pin for wrist
 - Stepper enable polarity
@@ -72,7 +72,7 @@ Working assumptions:
 - Disabled axes are simulated internally.
 - Enabled invalid axes reject config and block arming.
 - Partial hardware is allowed and reported as `hw=mixed`.
-- Motion is open-loop. AS5048A feedback is planned as readback/pose verification first, not closed-loop correction.
+- Motion is open-loop. AS5048A feedback is staged as readback/pose verification first, not full closed-loop correction.
 - `SETPOSE` is used after manual positioning to establish the open-loop pose.
 - `ESTOP` disarms and blocks motion until the controller is reset.
 

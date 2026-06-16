@@ -20,16 +20,21 @@ def test_parse_status_line():
 def test_parse_extended_status_line():
     status = parse_status(
         "STATUS state=idle homed=1 armed=1 hw=mixed enabled=1100 known=1 "
-        "enc=1100 e1=12.5 e2=-4.25 j1=1 j2=2 j3=3 j4=4 tool=open fault=OK"
+        "pose_source=mixed enc=1100 e1=12.5 e2=-4.25 j1=1 j2=2 j3=3 j4=4 "
+        "closed_loop=readback tool_type=servo_gripper tool=open tool_value=0.250 fault=OK"
     )
 
     assert status.armed is True
     assert status.hardware_mode == "mixed"
     assert status.enabled_axes == "1100"
     assert status.known_pose is True
+    assert status.pose_source == "mixed"
     assert status.encoder_available == "1100"
     assert status.encoder_angles_deg[:2] == [12.5, -4.25]
+    assert status.closed_loop_mode == "readback"
+    assert status.tool_type == "servo_gripper"
     assert status.tool_state == "open"
+    assert status.tool_value == 0.25
 
 
 def test_format_hardware_config_lines_from_config():
@@ -46,6 +51,9 @@ def test_format_hardware_config_lines_from_config():
     assert f"step={base_stepper.step_pin}" in lines[1]
     assert f"full_steps={base_stepper.motor_full_steps_per_rev}" in lines[1]
     assert f"microsteps={base_stepper.microsteps}" in lines[1]
+    assert "m0=" not in lines[1]
+    assert "m1=" not in lines[1]
+    assert "m2=" not in lines[1]
     assert "CONFIG JOINT index=3 name=elbow actuator=servo" in lines[3]
     assert f"servo_range={elbow_servo.servo_range_deg:.3f}" in lines[3]
     assert f"min_us={elbow_servo.pulse_min_us}" in lines[3]
@@ -62,3 +70,5 @@ def test_format_tool_commands():
     assert format_tool("open") == "TOOL OPEN"
     assert format_tool("close") == "TOOL CLOSE"
     assert format_tool("set", 0.3456) == "TOOL SET value=0.346"
+    assert format_tool("on") == "TOOL ON"
+    assert format_tool("off") == "TOOL OFF"

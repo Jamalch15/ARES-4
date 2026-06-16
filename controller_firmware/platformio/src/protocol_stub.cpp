@@ -44,6 +44,7 @@ float lastSpeedDegS = 0.0f;
 float lastAccelDegS2 = 0.0f;
 char faultText[32] = "OK";
 char toolState[12] = "unknown";
+char poseSourceText[12] = "unknown";
 float toolValue = 0.0f;
 String commandLine;
 uint32_t lastStatusMs = 0;
@@ -79,10 +80,10 @@ void printHello() {
 
 void printStatus() {
   ARM_SERIAL.printf(
-      "STATUS state=%s homed=%d known=%d armed=%d hw=simulated enabled=0000 enc=0000 "
-      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f tool=%s fault=%s\r\n",
-      stateName(), homed ? 1 : 0, homed ? 1 : 0, armed ? 1 : 0, currentJointsDeg[0], currentJointsDeg[1],
-      currentJointsDeg[2], currentJointsDeg[3], toolState, faultText);
+      "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=simulated enabled=0000 enc=0000 e1=0.00 e2=0.00 "
+      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=off tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
+      stateName(), homed ? 1 : 0, homed ? 1 : 0, poseSourceText, armed ? 1 : 0, currentJointsDeg[0],
+      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, toolValue, faultText);
 }
 
 void printError(const char* code, const char* message) {
@@ -170,6 +171,7 @@ void handleSetPose(const char* buffer) {
     currentJointsDeg[i] = requested[i];
   }
   homed = true;
+  strlcpy(poseSourceText, "setpose", sizeof(poseSourceText));
   controllerState = ControllerState::Stopped;
   clearFaultText();
   ARM_SERIAL.println("OK command=SETPOSE");
@@ -204,8 +206,14 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
   } else if (upperCommand.startsWith("TOOL SET")) {
     toolValue = max(0.0f, min(1.0f, tokenFloat(rawCommand, "value", toolValue)));
     strlcpy(toolState, "set", sizeof(toolState));
+  } else if (upperCommand.startsWith("TOOL ON")) {
+    strlcpy(toolState, "on", sizeof(toolState));
+    toolValue = 1.0f;
+  } else if (upperCommand.startsWith("TOOL OFF")) {
+    strlcpy(toolState, "off", sizeof(toolState));
+    toolValue = 0.0f;
   } else {
-    printError("USAGE", "TOOL_requires_OPEN_CLOSE_or_SET_value");
+    printError("USAGE", "TOOL_requires_OPEN_CLOSE_ON_OFF_or_SET_value");
     return;
   }
   ARM_SERIAL.printf("OK command=TOOL state=%s value=%.3f\r\n", toolState, toolValue);
@@ -214,8 +222,8 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
 
 void handleConfig(const String& upperCommand) {
   if (upperCommand.startsWith("CONFIG BEGIN")) {
-    if (armed || controllerState == ControllerState::Moving) {
-      printError("CONFIG", "disarm_and_stop_before_config");
+    if (controllerState == ControllerState::Moving) {
+      printError("CONFIG", "stop_motion_before_config");
       return;
     }
     configInProgress = true;
@@ -251,6 +259,7 @@ void handleHome() {
     currentJointsDeg[i] = kHomePose[i];
   }
   homed = true;
+  strlcpy(poseSourceText, "home", sizeof(poseSourceText));
   controllerState = ControllerState::Idle;
   clearFaultText();
   ARM_SERIAL.println("OK command=HOME");

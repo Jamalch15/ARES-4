@@ -45,7 +45,7 @@ def format_setpose(joints_deg: list[float]) -> str:
 
 def format_tool(action: str, value: float | None = None) -> str:
     normalized = action.strip().upper()
-    if normalized in {"OPEN", "CLOSE"}:
+    if normalized in {"OPEN", "CLOSE", "ON", "OFF"}:
         return f"TOOL {normalized}"
     if normalized == "SET":
         if value is None:
@@ -85,7 +85,6 @@ def format_config_lines(joints: list[JointConfig]) -> list[str]:
                 f"{common} enabled={1 if stepper.enabled else 0} "
                 f"step={stepper.step_pin} dir={stepper.dir_pin} enable={stepper.enable_pin} "
                 f"enable_low={1 if stepper.enable_active_low else 0} "
-                f"m0={stepper.m0_pin} m1={stepper.m1_pin} m2={stepper.m2_pin} "
                 f"driver={driver_model} full_steps={stepper.motor_full_steps_per_rev} "
                 f"microsteps={stepper.microsteps} gear={stepper.gear_ratio:.6f}"
             )
@@ -103,9 +102,13 @@ class ControllerStatus:
     hardware_mode: str = "unknown"
     enabled_axes: str = "0000"
     known_pose: bool = False
+    pose_source: str = "unknown"
     encoder_available: str = "0000"
     encoder_angles_deg: list[float | None] | None = None
+    closed_loop_mode: str = "off"
+    tool_type: str = "unknown"
     tool_state: str = "unknown"
+    tool_value: float | None = None
 
 
 def parse_status(line: str) -> ControllerStatus:
@@ -134,7 +137,11 @@ def parse_status(line: str) -> ControllerStatus:
         hardware_mode=values.get("hw", values.get("hardware", "unknown")),
         enabled_axes=values.get("enabled", "0000"),
         known_pose=values.get("known", "1" if homed else "0") in {"1", "true", "True"},
+        pose_source=values.get("pose_source", "home" if homed else "unknown"),
         encoder_available=values.get("enc", "0000"),
         encoder_angles_deg=encoder_angles,
+        closed_loop_mode=values.get("closed_loop", "off"),
+        tool_type=values.get("tool_type", "unknown"),
         tool_state=values.get("tool", "unknown"),
+        tool_value=float(values["tool_value"]) if "tool_value" in values else None,
     )

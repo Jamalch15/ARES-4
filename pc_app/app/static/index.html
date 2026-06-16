@@ -31,9 +31,9 @@
                 <span id="armedBadge" class="badge">Disarmed</span>
               </div>
               <nav class="tab-bar" aria-label="Dashboard tabs">
-                <button class="tab-button active" type="button" data-app-tab="joint">Joint</button>
-                <button class="tab-button" type="button" data-app-tab="operate">Operate</button>
-                <button class="tab-button" type="button" data-app-tab="ik">IK</button>
+                <button class="tab-button active" type="button" data-app-tab="joint">Control</button>
+                <button class="tab-button" type="button" data-app-tab="operate">Tasks</button>
+                <button class="tab-button" type="button" data-app-tab="ik">Kinematics</button>
                 <button class="tab-button" type="button" data-app-tab="program">Program</button>
                 <button class="tab-button" type="button" data-app-tab="settings">Settings</button>
               </nav>
@@ -44,7 +44,7 @@
                 <section class="panel-section">
                   <div class="section-header">
                     <div>
-                      <h2>Joint Sandbox</h2>
+                      <h2>Manual Control</h2>
                       <p class="hint" id="commandRate">12 Hz command limit</p>
                     </div>
                     <div class="button-row">
@@ -59,45 +59,52 @@
                   </label>
                   <div id="jointControls" class="joint-controls"></div>
                 </section>
+
+                <section class="panel-section">
+                  <div class="section-header">
+                    <div>
+                      <h2>Tool</h2>
+                      <p class="hint">Active end effector controls</p>
+                    </div>
+                    <span id="toolStatus" class="status-chip">unknown</span>
+                  </div>
+                  <div class="control-grid">
+                    <label>Active tool
+                      <select id="toolSelect">
+                        <option value="gripper">Gripper</option>
+                        <option value="magnet">Magnet</option>
+                      </select>
+                    </label>
+                    <label id="gripperSliderLabel">Gripper value
+                      <input id="toolValueSlider" type="range" min="0" max="1" step="0.01" value="0" />
+                    </label>
+                  </div>
+                  <div id="gripperControls" class="button-row action-row">
+                    <button id="toolOpenBtn" type="button">Open</button>
+                    <button id="toolCloseBtn" type="button">Close</button>
+                    <button id="toolSetBtn" class="ghost" type="button">Set</button>
+                  </div>
+                  <div id="magnetControls" class="button-row action-row" hidden>
+                    <button id="toolOnBtn" type="button">Magnet On</button>
+                    <button id="toolOffBtn" class="ghost" type="button">Magnet Off</button>
+                  </div>
+                </section>
               </section>
 
               <section id="operateTab" class="app-tab">
                 <section class="panel-section">
                   <div class="section-header">
                     <div>
-                      <h2>Operator</h2>
-                      <p class="hint">Named positions, tool, tasks, vision, and logs</p>
-                    </div>
-                    <button id="refreshEventsBtn" class="ghost" type="button">Refresh Log</button>
-                  </div>
-                  <div id="namedPositionsList" class="program-list"></div>
-                </section>
-
-                <section class="panel-section">
-                  <div class="section-header">
-                    <h2>Tool</h2>
-                    <span id="toolStatus" class="status-chip">unknown</span>
-                  </div>
-                  <div class="button-row action-row">
-                    <button id="toolOpenBtn" type="button">Open</button>
-                    <button id="toolCloseBtn" type="button">Close</button>
-                    <button id="toolHalfBtn" class="ghost" type="button">50%</button>
-                  </div>
-                </section>
-
-                <section class="panel-section">
-                  <div class="section-header">
-                    <div>
-                      <h2>Task</h2>
-                      <p class="hint">Uses current IK target as object position</p>
+                      <h2>Task Panel</h2>
+                      <p class="hint">Choose task, inspect detections, preview, then execute</p>
                     </div>
                     <span id="taskStatus" class="status-chip">No task</span>
                   </div>
                   <div class="control-grid">
                     <label>Task
                       <select id="taskModeSelect">
-                        <option value="pick_and_place">Pick and place</option>
-                        <option value="sorting">Sorting</option>
+                        <option value="color_sorting">Color Sorting</option>
+                        <option value="pick_and_place">Pick and Place</option>
                       </select>
                     </label>
                     <label>Drop zone
@@ -117,10 +124,14 @@
                 <section class="panel-section">
                   <div class="section-header">
                     <div>
-                      <h2>Vision</h2>
-                      <p class="hint">Fixed overhead camera color/blob detector</p>
+                      <h2>Camera</h2>
+                      <p class="hint">Live annotated overhead view</p>
                     </div>
-                    <button id="detectVisionBtn" type="button">Detect</button>
+                    <button id="detectVisionBtn" type="button">Refresh</button>
+                  </div>
+                  <div class="camera-frame">
+                    <img id="cameraFrame" alt="Annotated camera frame" />
+                    <div id="cameraPlaceholder">No camera frame yet</div>
                   </div>
                   <div id="visionProfileList" class="path-summary"></div>
                   <div id="visionSummary" class="path-summary"></div>
@@ -128,9 +139,9 @@
 
                 <section class="panel-section">
                   <div class="section-header">
-                    <h2>Event Log</h2>
+                    <h2>Detections</h2>
                   </div>
-                  <div id="eventLog" class="path-summary"></div>
+                  <div id="detectionList" class="program-list"></div>
                 </section>
               </section>
 
@@ -138,8 +149,8 @@
                 <section class="panel-section">
                   <div class="section-header">
                     <div>
-                      <h2>IK Target</h2>
-                      <p class="hint">x/y/z in mm, phi in deg</p>
+                      <h2>Jacobian IK Target</h2>
+                      <p class="hint">Standard DH model, x/y/z in mm, phi in deg</p>
                     </div>
                     <span id="previewStatus" class="status-chip">No preview</span>
                   </div>
@@ -163,7 +174,6 @@
                     <button id="previewIkBtn" type="button" class="primary">Preview</button>
                     <button id="executeIkBtn" type="button" disabled>Execute</button>
                     <button id="ikStopBtn" type="button" class="warn">Stop</button>
-                    <button id="ikEstopBtn" type="button" class="danger">E-Stop</button>
                   </div>
                 </section>
 
@@ -181,6 +191,16 @@
                     <span class="hint">UI limits only</span>
                   </div>
                   <div id="sliderRangeControls" class="form-grid ranges"></div>
+                </section>
+
+                <section class="panel-section">
+                  <div class="section-header">
+                    <div>
+                      <h2>Standard DH Table</h2>
+                      <p class="hint">theta offset, d, a, alpha</p>
+                    </div>
+                  </div>
+                  <div id="dhTableEditor" class="dh-table"></div>
                 </section>
               </section>
 
@@ -231,6 +251,8 @@
                   </div>
                   <h3>Links</h3>
                   <div id="linkCalibration" class="form-grid links"></div>
+                  <h3>Tool Dimensions</h3>
+                  <div id="toolCalibration" class="path-summary"></div>
                   <h3>Motion Defaults</h3>
                   <div class="control-grid">
                     <label>Speed deg/s <input id="globalSpeedInput" type="number" min="0.1" step="1" /></label>
@@ -260,6 +282,7 @@
                     <span class="hint">limits, home, zero, direction</span>
                   </div>
                   <div id="jointCalibration" class="joint-calibration"></div>
+                  <div id="encoderCalibration" class="path-summary"></div>
                 </section>
 
                 <section class="panel-section">
@@ -345,25 +368,13 @@
             </label>
           </section>
 
-          <section class="connection-panel" aria-label="Serial connection settings">
-            <label>
-              COM port
-              <input id="serialPort" type="text" autocomplete="off" spellcheck="false" placeholder="COM10" />
-            </label>
-            <label>
-              Baud
-              <input id="baudRate" type="number" min="1" step="1" />
-            </label>
-          </section>
-
           <section class="robot-control-rail" aria-label="Robot controls">
             <button id="connectSimBtn" type="button">Sim</button>
             <button id="connectSerialBtn" type="button">Serial</button>
             <button id="disconnectBtn" type="button">Disconnect</button>
             <button id="homeBtn" type="button">Home</button>
             <button id="stopBtn" type="button" class="warn">Stop</button>
-            <button id="clearEstopBtn" type="button">Clear E-Stop</button>
-            <button id="estopBtn" type="button" class="danger">E-Stop</button>
+            <button id="diagnosticsBtn" type="button" class="ghost">Diagnostics</button>
             <label class="arm-toggle">
               <input id="hardwareArmToggle" type="checkbox" />
               Armed
@@ -384,6 +395,40 @@
           </section>
         </section>
       </section>
+
+      <section id="serialModal" class="modal-backdrop" hidden>
+        <div class="modal-panel" role="dialog" aria-modal="true" aria-label="Serial connection">
+          <div class="section-header">
+            <div>
+              <h2>Serial Connection</h2>
+              <p class="hint">Choose the ESP32 port</p>
+            </div>
+            <button id="closeSerialModalBtn" type="button" class="ghost">Close</button>
+          </div>
+          <div class="control-grid">
+            <label>Baud
+              <input id="baudRate" type="number" min="1" step="1" />
+            </label>
+            <button id="refreshPortsBtn" type="button">Refresh Ports</button>
+          </div>
+          <div id="serialPortList" class="program-list"></div>
+          <div class="button-row action-row">
+            <button id="connectSelectedSerialBtn" type="button" class="primary">Connect Selected</button>
+          </div>
+        </div>
+      </section>
+
+      <aside id="diagnosticsDrawer" class="diagnostics-drawer" hidden>
+        <div class="section-header">
+          <div>
+            <h2>Diagnostics</h2>
+            <p class="hint">Controller responses, events, encoders, and solver state</p>
+          </div>
+          <button id="closeDiagnosticsBtn" type="button" class="ghost">Close</button>
+        </div>
+        <div id="diagnosticsSummary" class="path-summary"></div>
+        <div id="eventLog" class="path-summary"></div>
+      </aside>
     </main>
 
     <script type="module" src="/static/app.js"></script>

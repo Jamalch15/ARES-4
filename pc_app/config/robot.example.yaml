@@ -17,6 +17,54 @@ links_mm:
   wrist: 50.0
   tool: 0.0
 
+kinematics:
+  convention: standard_dh
+  position_tolerance_mm: 1.0
+  orientation_tolerance_deg: 1.0
+  max_iterations: 160
+  damping: 0.18
+  dh_rows:
+    - joint: 1
+      theta_offset_deg: 0.0
+      d_mm: 160.0
+      a_mm: 0.0
+      alpha_deg: 90.0
+      joint_type: revolute
+      min_deg: -160.0
+      max_deg: 160.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+    - joint: 2
+      theta_offset_deg: 90.0
+      d_mm: 0.0
+      a_mm: 150.0
+      alpha_deg: 0.0
+      joint_type: revolute
+      min_deg: -30.0
+      max_deg: 115.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+    - joint: 3
+      theta_offset_deg: 0.0
+      d_mm: 0.0
+      a_mm: 150.0
+      alpha_deg: 0.0
+      joint_type: revolute
+      min_deg: -120.0
+      max_deg: 120.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+    - joint: 4
+      theta_offset_deg: 0.0
+      d_mm: 0.0
+      a_mm: 50.0
+      alpha_deg: 0.0
+      joint_type: revolute
+      min_deg: -120.0
+      max_deg: 120.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+
 joints:
   - name: base
     actuator: stepper
@@ -35,10 +83,7 @@ joints:
         dir_pin: 4
         enable_pin: 6
         enable_active_low: true
-        m0_pin: 3
-        m1_pin: 8
-        m2_pin: 18
-        driver_model: DRV8825
+        driver_model: TB6600
         motor_full_steps_per_rev: 200
         microsteps: 16
         gear_ratio: 27
@@ -60,10 +105,7 @@ joints:
         dir_pin: 5
         enable_pin: -1
         enable_active_low: true
-        m0_pin: 40
-        m1_pin: 41
-        m2_pin: 42
-        driver_model: DRV8825
+        driver_model: TB6600
         motor_full_steps_per_rev: 200
         microsteps: 4
         gear_ratio: 27
@@ -193,10 +235,70 @@ task_defaults:
   dropoff_height_mm: 45.0
   default_drop_zone: dropoff_a
 
-tool:
-  type: servo_gripper
-  open_value: 0.0
-  closed_value: 1.0
+tools:
+  active: gripper
+  presets:
+    gripper:
+      type: servo_gripper
+      label: Gripper
+      open_value: 0.0
+      closed_value: 1.0
+      tcp_offset_mm:
+        x: 0.0
+        y: 0.0
+        z: 30.0
+      io:
+        pwm_pin: 9
+        pulse_min_us: 500
+        pulse_max_us: 2500
+        pwm_frequency_hz: 50
+    magnet:
+      type: electromagnet
+      label: Magnet
+      tcp_offset_mm:
+        x: 0.0
+        y: 0.0
+        z: 18.0
+      io:
+        pin: -1
+        active_high: true
+
+encoders:
+  enabled: true
+  closed_loop_mode: settle_correction
+  settle_tolerance_deg: 1.0
+  fault_tolerance_deg: 5.0
+  max_correction_attempts: 2
+  axes:
+    - joint: 1
+      name: base
+      cs_pin: 5
+      zero_offset_deg: 0.0
+      direction_sign: 1
+      enabled: true
+    - joint: 2
+      name: shoulder
+      cs_pin: 7
+      zero_offset_deg: 0.0
+      direction_sign: 1
+      enabled: true
+    - joint: 3
+      name: elbow
+      cs_pin: -1
+      zero_offset_deg: 0.0
+      direction_sign: 1
+      enabled: false
+    - joint: 4
+      name: wrist
+      cs_pin: -1
+      zero_offset_deg: 0.0
+      direction_sign: 1
+      enabled: false
+
+calibration:
+  movement_tolerance_deg: 0.2
+  tool_dimensions_validated: false
+  last_validation: ""
 
 future_transport_notes:
   bluetooth: >

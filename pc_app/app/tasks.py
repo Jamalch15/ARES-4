@@ -91,3 +91,49 @@ def build_sorting_sequence(
     sequence["task"] = "sorting"
     sequence["color"] = color
     return sequence
+
+
+def build_batch_sorting_sequence(
+    config: RobotConfig,
+    detections: list[dict[str, Any]],
+    color_profiles: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    valid = [detection for detection in detections if detection.get("ok") and detection.get("color")]
+    if not valid:
+        return {"ok": False, "errors": ["no sortable detections"], "steps": [], "waypoints": []}
+
+    grouped = sorted(valid, key=lambda detection: str(detection.get("color", "")))
+    all_steps: list[dict[str, Any]] = []
+    all_waypoints: list[dict[str, Any]] = []
+    objects: list[dict[str, Any]] = []
+    for index, detection in enumerate(grouped, start=1):
+        sequence = build_sorting_sequence(config, detection, color_profiles)
+        if not sequence.get("ok"):
+            return {
+                "ok": False,
+                "errors": [f"detection {index}: {'; '.join(sequence.get('errors', []))}"],
+                "steps": all_steps,
+                "waypoints": all_waypoints,
+            }
+        objects.append(
+            {
+                "index": index,
+                "color": sequence.get("color"),
+                "drop_zone": sequence.get("drop_zone"),
+                "object_target": sequence.get("object_target"),
+            }
+        )
+        for step in sequence["steps"]:
+            step = dict(step)
+            step["object_index"] = index
+            all_steps.append(step)
+        all_waypoints.extend(sequence["waypoints"])
+
+    return {
+        "ok": True,
+        "task": "color_sorting",
+        "objects": objects,
+        "steps": all_steps,
+        "waypoints": all_waypoints,
+        "object_count": len(objects),
+    }

@@ -83,9 +83,6 @@ struct StepperConfig {
   int dirPin = -1;
   int enablePin = -1;
   bool enableActiveLow = true;
-  int m0Pin = -1;
-  int m1Pin = -1;
-  int m2Pin = -1;
   int fullStepsPerRev = 200;
   int microsteps = 16;
   float gearRatio = 1.0f;
@@ -144,6 +141,7 @@ bool homed = false;
 bool configInProgress = false;
 char faultText[40] = "OK";
 char toolState[12] = "unknown";
+char poseSourceText[12] = "unknown";
 float toolValue = 0.0f;
 bool encoderAvailable[kJointCount] = {false, false, false, false};
 float encoderAnglesDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -273,8 +271,7 @@ String validationErrorForJoint(const JointConfig& joint, int index) {
     if (joint.stepper.dirPin < 0 || !validPinOrUnused(joint.stepper.dirPin)) {
       return "joint_" + String(index + 1) + "_missing_dir_pin";
     }
-    if (!validPinOrUnused(joint.stepper.enablePin) || !validPinOrUnused(joint.stepper.m0Pin) ||
-        !validPinOrUnused(joint.stepper.m1Pin) || !validPinOrUnused(joint.stepper.m2Pin)) {
+    if (!validPinOrUnused(joint.stepper.enablePin)) {
       return "joint_" + String(index + 1) + "_invalid_optional_pin";
     }
     if (joint.stepper.fullStepsPerRev <= 0) {
@@ -353,6 +350,25 @@ String encoderBits() {
   return bits;
 }
 
+const char* poseSourceName() {
+  const bool encoderPose = encoderAvailable[0] || encoderAvailable[1];
+  if (encoderPose && homed) {
+    return "mixed";
+  }
+  if (encoderPose) {
+    return "encoder";
+  }
+  return poseSourceText;
+}
+
+const char* closedLoopModeName() {
+#if defined(ARM_CONTROLLER_ENABLE_AS5048A)
+  return "readback";
+#else
+  return "off";
+#endif
+}
+
 bool configHasInvalidAxis() {
   for (int i = 0; i < kJointCount; i++) {
     if (joints[i].axisState == AxisState::Invalid) {
@@ -429,33 +445,6 @@ void disableHardwareOutputs() {
   }
 }
 
-void applyMicrostepPins(const StepperConfig& stepper) {
-  bool m0 = false;
-  bool m1 = false;
-  bool m2 = false;
-  if (stepper.microsteps == 2) {
-    m0 = true;
-  } else if (stepper.microsteps == 4) {
-    m1 = true;
-  } else if (stepper.microsteps == 8) {
-    m0 = true;
-    m1 = true;
-  } else if (stepper.microsteps >= 16) {
-    m0 = true;
-    m1 = true;
-    m2 = true;
-  }
-  if (stepper.m0Pin >= 0) {
-    digitalWrite(stepper.m0Pin, m0 ? HIGH : LOW);
-  }
-  if (stepper.m1Pin >= 0) {
-    digitalWrite(stepper.m1Pin, m1 ? HIGH : LOW);
-  }
-  if (stepper.m2Pin >= 0) {
-    digitalWrite(stepper.m2Pin, m2 ? HIGH : LOW);
-  }
-}
-
 void configurePins() {
   for (int i = 0; i < kJointCount; i++) {
     if (joints[i].axisState != AxisState::Hardware) {
@@ -471,16 +460,6 @@ void configurePins() {
         pinMode(stepper.enablePin, OUTPUT);
         writeStepperEnable(i, false);
       }
-      if (stepper.m0Pin >= 0) {
-        pinMode(stepper.m0Pin, OUTPUT);
-      }
-      if (stepper.m1Pin >= 0) {
-        pinMode(stepper.m1Pin, OUTPUT);
-      }
-      if (stepper.m2Pin >= 0) {
-        pinMode(stepper.m2Pin, OUTPUT);
-      }
-      applyMicrostepPins(stepper);
     } else if (joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].channel = kServoPwmChannelBase + i;
       ledcSetup(servoRuntime[i].channel, joints[i].servo.pwmFrequencyHz, kServoPwmResolutionBits);
@@ -605,11 +584,12 @@ void printStatus() {
   updateEncoderReadback();
   const bool knownPose = homed || encoderAvailable[0] || encoderAvailable[1];
   ARM_SERIAL.printf(
-      "STATUS state=%s homed=%d known=%d armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
-      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f tool=%s fault=%s\r\n",
-      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, armed ? 1 : 0, hardwareMode().c_str(),
+      "STATUS state=%s homed=%d known=%d pose_source=%s armed=%d hw=%s enabled=%s enc=%s e1=%.2f e2=%.2f "
+      "j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=%s tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
+      stateName(), homed ? 1 : 0, knownPose ? 1 : 0, poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(),
       enabledBits().c_str(), encoderBits().c_str(), encoderAnglesDeg[0], encoderAnglesDeg[1], currentJointsDeg[0],
-      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, faultText);
+      currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), toolState, toolValue,
+      faultText);
 }
 
 void printError(const char* code, const String& message) {
@@ -618,8 +598,8 @@ void printError(const char* code, const String& message) {
 
 void handleConfig(const String& rawCommand, const String& upperCommand) {
   if (upperCommand.startsWith("CONFIG BEGIN")) {
-    if (armed || controllerState == ControllerState::Moving) {
-      printError("CONFIG", "disarm_and_stop_before_config");
+    if (controllerState == ControllerState::Moving) {
+      printError("CONFIG", "stop_motion_before_config");
       return;
     }
     const int axes = tokenInt(rawCommand, "axes", 0);
@@ -659,9 +639,6 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
       joint.stepper.dirPin = tokenInt(rawCommand, "dir", -1);
       joint.stepper.enablePin = tokenInt(rawCommand, "enable", -1);
       joint.stepper.enableActiveLow = tokenInt(rawCommand, "enable_low", 1) != 0;
-      joint.stepper.m0Pin = tokenInt(rawCommand, "m0", -1);
-      joint.stepper.m1Pin = tokenInt(rawCommand, "m1", -1);
-      joint.stepper.m2Pin = tokenInt(rawCommand, "m2", -1);
       joint.stepper.fullStepsPerRev = tokenInt(rawCommand, "full_steps", 200);
       joint.stepper.microsteps = tokenInt(rawCommand, "microsteps", 16);
       joint.stepper.gearRatio = tokenFloat(rawCommand, "gear", 1.0f);
@@ -710,6 +687,15 @@ void handleConfig(const String& rawCommand, const String& upperCommand) {
     }
     configurePins();
     syncRuntimeFromCurrentPose();
+    if (armed) {
+      for (int i = 0; i < kJointCount; i++) {
+        if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+          writeStepperEnable(i, true);
+        } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
+          writeServoPwm(i, true);
+        }
+      }
+    }
     clearFaultText();
     ARM_SERIAL.printf("OK command=CONFIG axes=4 hw=%s enabled=%s\r\n", hardwareMode().c_str(), enabledBits().c_str());
     printStatus();
@@ -810,6 +796,7 @@ void handleHome() {
   }
   setTargetPose(requested);
   homed = true;
+  strlcpy(poseSourceText, "home", sizeof(poseSourceText));
   ARM_SERIAL.println("OK command=HOME");
   printStatus();
 }
@@ -838,6 +825,7 @@ void handleSetPose(const char* buffer) {
   }
   syncRuntimeFromCurrentPose();
   homed = true;
+  strlcpy(poseSourceText, "setpose", sizeof(poseSourceText));
   controllerState = ControllerState::Stopped;
   clearFaultText();
   ARM_SERIAL.println("OK command=SETPOSE");
@@ -892,8 +880,14 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
   } else if (upperCommand.startsWith("TOOL SET")) {
     toolValue = clampFloat(tokenFloat(rawCommand, "value", toolValue), 0.0f, 1.0f);
     strlcpy(toolState, "set", sizeof(toolState));
+  } else if (upperCommand.startsWith("TOOL ON")) {
+    strlcpy(toolState, "on", sizeof(toolState));
+    toolValue = 1.0f;
+  } else if (upperCommand.startsWith("TOOL OFF")) {
+    strlcpy(toolState, "off", sizeof(toolState));
+    toolValue = 0.0f;
   } else {
-    printError("USAGE", "TOOL_requires_OPEN_CLOSE_or_SET_value");
+    printError("USAGE", "TOOL_requires_OPEN_CLOSE_ON_OFF_or_SET_value");
     return;
   }
   ARM_SERIAL.printf("OK command=TOOL state=%s value=%.3f\r\n", toolState, toolValue);

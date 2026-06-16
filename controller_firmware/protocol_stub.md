@@ -36,7 +36,7 @@ ASCII text
 HELLO
 STATUS
 CONFIG BEGIN axes=4
-CONFIG JOINT index=1 name=base actuator=stepper enabled=0 step=-1 dir=-1 enable=-1 enable_low=1 m0=-1 m1=-1 m2=-1 driver=TBD full_steps=200 microsteps=16 gear=1.000 zero=0.000 sign=1 min=-160.000 max=160.000 home=0.000 max_speed=45.000 max_accel=120.000
+CONFIG JOINT index=1 name=base actuator=stepper enabled=0 step=-1 dir=-1 enable=-1 enable_low=1 driver=TB6600 full_steps=200 microsteps=16 gear=1.000 zero=0.000 sign=1 min=-160.000 max=160.000 home=0.000 max_speed=45.000 max_accel=120.000
 CONFIG JOINT index=3 name=elbow actuator=servo enabled=0 pwm=-1 min_us=500 max_us=2500 freq=50 servo_range=270.000 neutral=135.000 gear=1.000 zero=0.000 sign=1 min=-120.000 max=120.000 home=20.000 max_speed=60.000 max_accel=180.000
 CONFIG END
 ARM 0
@@ -49,6 +49,8 @@ HOME
 TOOL OPEN
 TOOL CLOSE
 TOOL SET value=0.000
+TOOL ON
+TOOL OFF
 ```
 
 Angles are in degrees at the joint output, not raw motor shaft degrees.
@@ -80,7 +82,7 @@ STATUS state=idle homed=0 armed=0 hw=mixed enabled=1000 j1=0.0 j2=20.0 j3=20.0 j
 Newer firmware may include optional readback and tool fields:
 
 ```text
-STATUS state=idle homed=1 known=1 armed=1 hw=mixed enabled=1100 enc=1100 e1=12.5 e2=-4.2 j1=12.4 j2=-4.1 j3=20.0 j4=0.0 tool=open fault=OK
+STATUS state=idle homed=1 known=1 pose_source=mixed armed=1 hw=mixed enabled=1100 enc=1100 e1=12.5 e2=-4.2 j1=12.4 j2=-4.1 j3=20.0 j4=0.0 closed_loop=readback tool_type=generic tool=open tool_value=0.000 fault=OK
 ```
 
 Error:
@@ -117,6 +119,7 @@ fault
 - Unknown pins use `-1`.
 - Disabled axes are simulated in reported joint state.
 - Enabled stepper axes require at least STEP and DIR pins, positive full steps/rev, positive microsteps, and positive gear ratio.
+- TB6600 microstep pins are physical DIP switches, so the protocol keeps only the `microsteps` value for step math.
 - Enabled servo axes require PWM pin, valid pulse range, positive PWM frequency, positive servo range, and positive gear ratio.
 - `hw=hardware` means all axes are valid physical axes.
 - `hw=mixed` means at least one physical axis and at least one simulated axis.

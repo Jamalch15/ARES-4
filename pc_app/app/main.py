@@ -17,11 +17,14 @@ from pydantic import BaseModel
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
     camera_settings,
+    calibration_settings,
     color_profiles,
     drop_zones,
+    encoder_settings,
     named_positions,
     task_defaults,
     tool_settings,
+    tools_settings,
     validate_named_position,
 )
 from .event_log import EventLog
@@ -50,8 +53,8 @@ from .robot_state import MotionState, RobotState
 from .safety import validate_can_move, validate_joint_targets
 from .serial_client import SerialClient, SerialClientError
 from .simulator import apply_simulation_step
-from .tasks import build_pick_and_place_sequence, build_sorting_sequence
-from .vision import decode_image_b64, detect_configured_colors
+from .tasks import build_batch_sorting_sequence, build_pick_and_place_sequence, build_sorting_sequence
+from .vision import annotated_detection_frame, decode_image_b64, detect_configured_colors, encode_image_b64
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -67,6 +70,9 @@ state = RobotState(
     serial_port=None,
     known_pose=config.simulation_default,
 )
+state.active_tool = str(tools_settings(config).get("active", "gripper"))
+state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
+state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
 state.fk = forward_kinematics(state.reported_angles_deg, config.links)
 limiter = RateLimitedMotion(config, state.reported_angles_deg.copy(), state.target_angles_deg.copy())
 serial_client = SerialClient(config.serial)
@@ -153,14 +159,19 @@ class LiveTargetRequest(BaseModel):
 
 class CalibrationRequest(BaseModel):
     links_mm: dict[str, float] | None = None
+    kinematics: dict[str, Any] | None = None
     joints: list[dict[str, Any]] | None = None
     motion: dict[str, Any] | None = None
+    serial: dict[str, Any] | None = None
     named_positions: dict[str, dict[str, Any]] | None = None
     camera: dict[str, Any] | None = None
     color_profiles: dict[str, dict[str, Any]] | None = None
     drop_zones: dict[str, dict[str, Any]] | None = None
     task_defaults: dict[str, Any] | None = None
     tool: dict[str, Any] | None = None
+    tools: dict[str, Any] | None = None
+    encoders: dict[str, Any] | None = None
+    calibration: dict[str, Any] | None = None
 
 
 class SetPoseRequest(BaseModel):
@@ -170,6 +181,12 @@ class SetPoseRequest(BaseModel):
 class ToolRequest(BaseModel):
     action: str
     value: float | None = None
+    tool: str | None = None
+
+
+class ToolsRequest(BaseModel):
+    active: str
+    presets: dict[str, dict[str, Any]] | None = None
 
 
 class NamedPositionsRequest(BaseModel):
@@ -190,6 +207,7 @@ class VisionDetectRequest(BaseModel):
 class TaskPreviewRequest(BaseModel):
     task: str = "pick_and_place"
     object_target: dict[str, Any] | None = None
+    detections: list[dict[str, Any]] | None = None
     drop_zone: str | dict[str, Any] | None = None
     detection: dict[str, Any] | None = None
     settings: PathSettingsRequest | None = None
@@ -204,6 +222,7 @@ def public_config() -> dict[str, Any]:
     return {
         "joints": [asdict(joint) for joint in config.joints],
         "links_mm": asdict(config.links),
+        "kinematics": asdict(config.kinematics),
         "motion": asdict(config.motion),
         "serial": asdict(config.serial),
         "simulation_default": config.simulation_default,
@@ -216,6 +235,9 @@ def public_config() -> dict[str, Any]:
         "drop_zones": drop_zones(config),
         "task_defaults": task_defaults(config),
         "tool": tool_settings(config),
+        "tools": tools_settings(config),
+        "encoders": encoder_settings(config),
+        "calibration": calibration_settings(config),
     }
 
 
@@ -313,10 +335,12 @@ def hardware_ready_for_motion() -> tuple[bool, str]:
 
 
 def config_sync_ready() -> tuple[bool, str]:
-    if state.hardware_armed:
-        return False, "disarm hardware before saving or syncing config"
     if state.motion_state == MotionState.MOVING:
         return False, "stop motion before saving or syncing config"
+    if state.live_motion_enabled:
+        return False, "turn off live motion before saving or syncing config"
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        return False, "wait for active motion or task execution to finish before syncing config"
     return True, ""
 
 
@@ -369,6 +393,45 @@ def disable_live_motion(command: str | None = None) -> None:
 
 def log_event(source: str, message: str, **data: Any) -> None:
     event_log.add(source, message, **data)
+
+
+def list_serial_ports() -> list[dict[str, Any]]:
+    try:
+        from serial.tools import list_ports
+    except Exception:
+        return []
+    ports = []
+    for port in list_ports.comports():
+        ports.append(
+            {
+                "device": port.device,
+                "name": port.name,
+                "description": port.description,
+                "hwid": port.hwid,
+                "manufacturer": port.manufacturer,
+            }
+        )
+    return ports
+
+
+def update_encoder_verification() -> None:
+    settings = encoder_settings(config)
+    fault_tolerance = float(settings.get("fault_tolerance_deg", 5.0))
+    errors: list[float | None] = []
+    fault = False
+    for index, encoder_angle in enumerate(state.encoder_angles_deg):
+        available = index < len(state.encoder_available) and state.encoder_available[index] == "1"
+        if available and encoder_angle is not None:
+            error = float(encoder_angle) - float(state.target_angles_deg[index])
+            errors.append(error)
+            if abs(error) > fault_tolerance:
+                fault = True
+        else:
+            errors.append(None)
+    state.encoder_errors_deg = errors
+    state.encoder_fault = fault
+    if fault:
+        state.set_error("encoder verification exceeded fault tolerance", fault=True)
 
 
 def read_serial_until_any(prefixes: tuple[str, ...], timeout_s: float = 2.0) -> str:
@@ -621,12 +684,19 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
         await broadcast_state()
 
 
-async def apply_tool_action(action: str, value: float | None = None) -> dict[str, Any]:
+async def apply_tool_action(action: str, value: float | None = None, tool: str | None = None) -> dict[str, Any]:
     normalized = action.strip().lower()
+    active_tool = tool or str(tools_settings(config).get("active", "gripper"))
+    state.active_tool = active_tool
+    state.tool_type = str((tools_settings(config).get("presets", {}).get(active_tool, {}) or {}).get("type", "unknown"))
     if normalized in {"open", "close"}:
         command = format_tool(normalized)
         state.tool_state = "open" if normalized == "open" else "closed"
         state.tool_value = tool_settings(config).get("open_value" if normalized == "open" else "closed_value")
+    elif normalized in {"on", "off"}:
+        command = format_tool(normalized)
+        state.tool_state = normalized
+        state.tool_value = 1.0 if normalized == "on" else 0.0
     else:
         command = format_tool("set", value)
         state.tool_state = "set"
@@ -711,6 +781,9 @@ def reload_runtime_config() -> None:
     serial_client.config = config.serial
     state.joint_names = config.joint_names
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
+    state.active_tool = str(tools_settings(config).get("active", "gripper"))
+    state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
+    state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
     if not state.simulation:
         apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
     else:
@@ -722,6 +795,7 @@ def apply_controller_status(status_line: str) -> None:
     state.reported_angles_deg = status.joints_deg
     state.homed = status.homed
     state.known_pose = status.known_pose
+    state.pose_source = status.pose_source
     state.hardware_armed = status.armed
     if status.hardware_mode != "unknown":
         state.hardware_mode = status.hardware_mode
@@ -729,10 +803,22 @@ def apply_controller_status(status_line: str) -> None:
         state.hardware_enabled_axes = status.enabled_axes
     state.encoder_available = status.encoder_available
     state.encoder_angles_deg = status.encoder_angles_deg or [None] * len(config.joints)
+    for index, angle in enumerate(state.encoder_angles_deg[: len(state.reported_angles_deg)]):
+        if index < len(state.encoder_available) and state.encoder_available[index] == "1" and angle is not None:
+            state.reported_angles_deg[index] = float(angle)
+            state.known_pose = True
+            if state.pose_source in {"unknown", ""}:
+                state.pose_source = "encoder"
+    state.closed_loop_mode = status.closed_loop_mode
+    if status.tool_type != "unknown":
+        state.tool_type = status.tool_type
     state.tool_state = status.tool_state
+    if status.tool_value is not None:
+        state.tool_value = status.tool_value
     if status.state in {item.value for item in MotionState}:
         state.motion_state = MotionState(status.state)
     state.last_error = "" if status.fault == "OK" else status.fault
+    update_encoder_verification()
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
     state.updated_at = time()
 
@@ -772,6 +858,11 @@ async def get_state() -> dict[str, Any]:
     return state.to_dict()
 
 
+@app.get("/api/serial/ports")
+async def get_serial_ports() -> dict[str, Any]:
+    return {"ok": True, "ports": list_serial_ports(), "last_port": config.serial.port}
+
+
 @app.get("/api/events")
 async def get_events(limit: int = 100) -> dict[str, Any]:
     return {"ok": True, "events": event_log.list(limit)}
@@ -781,6 +872,22 @@ async def get_events(limit: int = 100) -> dict[str, Any]:
 async def clear_events() -> dict[str, Any]:
     event_log.clear()
     return {"ok": True, "events": []}
+
+
+@app.get("/api/diagnostics")
+async def diagnostics(limit: int = 120) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "events": event_log.list(limit),
+        "state": state.to_dict(),
+        "hardware": {
+            "evaluation": evaluate_hardware_config(),
+            "sync_status": state.config_sync_status,
+            "sync_message": state.config_sync_message,
+        },
+        "encoders": encoder_settings(config),
+        "kinematics": asdict(config.kinematics),
+    }
 
 
 @app.get("/api/named-positions")
@@ -818,7 +925,34 @@ async def save_named_positions(request: NamedPositionsRequest) -> dict[str, Any]
 
 @app.post("/api/tool")
 async def tool_command(request: ToolRequest) -> dict[str, Any]:
-    return await apply_tool_action(request.action, request.value)
+    return await apply_tool_action(request.action, request.value, request.tool)
+
+
+@app.get("/api/tools")
+async def get_tools() -> dict[str, Any]:
+    return {"ok": True, "tools": tools_settings(config), "active": tools_settings(config).get("active", "gripper")}
+
+
+@app.post("/api/tools")
+async def save_tools(request: ToolsRequest) -> dict[str, Any]:
+    tools = tools_settings(config)
+    tools["active"] = request.active
+    if request.presets:
+        presets = tools.setdefault("presets", {})
+        for name, preset in request.presets.items():
+            merged = presets.get(name, {})
+            merged.update(preset)
+            presets[name] = merged
+    try:
+        save_calibration_updates(ensure_local_config(), {"tools": tools})
+        reload_runtime_config()
+    except Exception as exc:
+        state.set_error(f"could not save tool settings: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    log_event("config", "tool settings saved", active=request.active)
+    await broadcast_state()
+    return {"ok": True, "tools": tools_settings(config), "config": public_config(), "state": state.to_dict()}
 
 
 @app.get("/api/vision/config")
@@ -871,6 +1005,24 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     log_event("vision", "detection complete", detections=detections)
     return {"ok": True, "detections": detections}
+
+
+@app.get("/api/vision/frame")
+async def get_vision_frame() -> dict[str, Any]:
+    try:
+        import cv2
+
+        camera = camera_settings(config)
+        capture = cv2.VideoCapture(int(camera.get("source_index", 0)))
+        ok, image = capture.read()
+        capture.release()
+        if not ok:
+            raise RuntimeError("could not read camera frame")
+        detections = detect_configured_colors(image, color_profiles(config), camera.get("calibration", {}))
+        annotated = annotated_detection_frame(image, detections)
+        return {"ok": True, "image_b64": encode_image_b64(annotated), "detections": detections}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "detections": []}
 
 
 @app.post("/api/hardware-arm")
@@ -943,6 +1095,7 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         limiter.set_target(state.target_angles_deg)
         state.homed = True
         state.known_pose = True
+        state.pose_source = "setpose"
         state.last_command = "SETPOSE_SIM"
         log_event("safety", "simulation pose set", angles_deg=state.reported_angles_deg)
         await broadcast_state()
@@ -962,6 +1115,7 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         refresh_serial_status()
         align_target_to_reported()
         state.known_pose = True
+        state.pose_source = "setpose"
         log_event("safety", "hardware pose set", angles_deg=state.reported_angles_deg)
     except SerialClientError as exc:
         state.set_error(str(exc), fault=True)
@@ -969,6 +1123,26 @@ async def hardware_setpose(request: SetPoseRequest) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "state": state.to_dict()}
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
+
+
+@app.get("/api/kinematics/dh")
+async def get_dh_table() -> dict[str, Any]:
+    return {"ok": True, "kinematics": asdict(config.kinematics), "fk": state.fk}
+
+
+@app.post("/api/kinematics/dh")
+async def save_dh_table(request: CalibrationRequest) -> dict[str, Any]:
+    if not request.kinematics:
+        return {"ok": False, "error": "kinematics payload is required", "state": state.to_dict()}
+    try:
+        save_calibration_updates(ensure_local_config(), {"kinematics": request.kinematics})
+        reload_runtime_config()
+    except Exception as exc:
+        state.set_error(f"could not save DH table: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    await broadcast_state()
+    return {"ok": True, "config": public_config(), "state": state.to_dict()}
 
 
 @app.post("/api/ik/solve")
@@ -1041,9 +1215,13 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
 @app.post("/api/task/preview")
 async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
     profiles = color_profiles(config)
-    if request.task == "sorting":
-        detection = request.detection or {}
-        sequence = build_sorting_sequence(config, detection, profiles)
+    if request.task in {"sorting", "color_sorting"}:
+        detections = request.detections or ([request.detection] if request.detection else [])
+        if len(detections) > 1:
+            sequence = build_batch_sorting_sequence(config, detections, profiles)
+        else:
+            detection = detections[0] if detections else {}
+            sequence = build_sorting_sequence(config, detection, profiles)
     else:
         target = request.object_target or request.detection or {}
         sequence = build_pick_and_place_sequence(config, target, request.drop_zone)
@@ -1260,6 +1438,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.serial_port = None
         state.hardware_armed = False
         state.known_pose = True
+        state.pose_source = "simulation"
         apply_hardware_evaluation("simulation", "simulation mode")
         state.motion_state = MotionState.IDLE
         state.last_command = "SIMULATION CONNECT"
@@ -1280,6 +1459,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         state.simulation = False
         state.hardware_armed = False
         state.known_pose = False
+        state.pose_source = "unknown"
         state.set_error(str(exc))
         await broadcast_state()
         return {"ok": False, "error": str(exc), "state": state.to_dict()}
@@ -1293,6 +1473,13 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
     apply_controller_status(status_line)
     align_target_to_reported()
     sync_hardware_config()
+    try:
+        save_calibration_updates(
+            ensure_local_config(),
+            {"serial": {"last_port": state.serial_port, "baud_rate": request.baud_rate or config.serial.baud_rate}},
+        )
+    except Exception as exc:
+        log_event("connection", "could not save last serial port", error=str(exc))
     log_event("connection", "serial connected", port=state.serial_port)
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
@@ -1307,6 +1494,7 @@ async def disconnect() -> dict[str, Any]:
     state.hardware_armed = False
     state.live_motion_enabled = False
     state.known_pose = False
+    state.pose_source = "unknown"
     state.config_sync_status = "not_connected"
     state.config_sync_message = "serial hardware is disconnected"
     apply_hardware_evaluation()
@@ -1344,6 +1532,7 @@ async def home() -> dict[str, Any]:
     state.homed = response["ok"]
     if response["ok"]:
         state.known_pose = True
+        state.pose_source = "home"
         log_event("motion", "home accepted")
     if not state.simulation and serial_client.is_connected and response["ok"]:
         serial_client.send_line(format_home())

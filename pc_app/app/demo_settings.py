@@ -114,12 +114,94 @@ def drop_zones(config: RobotConfig) -> dict[str, dict[str, float]]:
 
 
 def tool_settings(config: RobotConfig) -> dict[str, Any]:
+    tools = tools_settings(config)
+    active = str(tools.get("active", "gripper"))
+    presets = tools.get("presets", {})
+    preset = deepcopy(presets.get(active, presets.get("gripper", {})))
+    preset["active"] = active
+    preset["tools"] = tools
+    return preset
+
+
+def tools_settings(config: RobotConfig) -> dict[str, Any]:
     defaults: dict[str, Any] = {
-        "type": "servo_gripper",
-        "open_value": 0.0,
-        "closed_value": 1.0,
+        "active": "gripper",
+        "presets": {
+            "gripper": {
+                "type": "servo_gripper",
+                "label": "Gripper",
+                "open_value": 0.0,
+                "closed_value": 1.0,
+                "tcp_offset_mm": {"x": 0.0, "y": 0.0, "z": 30.0},
+                "io": {
+                    "pwm_pin": 9,
+                    "pulse_min_us": 500,
+                    "pulse_max_us": 2500,
+                    "pwm_frequency_hz": 50,
+                },
+            },
+            "magnet": {
+                "type": "electromagnet",
+                "label": "Magnet",
+                "tcp_offset_mm": {"x": 0.0, "y": 0.0, "z": 18.0},
+                "io": {
+                    "pin": -1,
+                    "active_high": True,
+                },
+            },
+        },
     }
-    raw = config.raw.get("tool")
+    legacy = config.raw.get("tool")
+    if isinstance(legacy, dict):
+        defaults["active"] = "gripper" if legacy.get("type", "servo_gripper") != "electromagnet" else "magnet"
+        defaults["presets"]["gripper"].update(deepcopy(legacy))
+    raw = config.raw.get("tools")
+    if isinstance(raw, dict):
+        if "active" in raw:
+            defaults["active"] = str(raw["active"])
+        if isinstance(raw.get("presets"), dict):
+            for name, preset in raw["presets"].items():
+                if isinstance(preset, dict):
+                    base = defaults["presets"].get(name, {})
+                    merged = deepcopy(base)
+                    merged.update(deepcopy(preset))
+                    defaults["presets"][name] = merged
+    return defaults
+
+
+def encoder_settings(config: RobotConfig) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "closed_loop_mode": "settle_correction",
+        "settle_tolerance_deg": 1.0,
+        "fault_tolerance_deg": 5.0,
+        "max_correction_attempts": 2,
+        "axes": [
+            {"joint": 1, "name": "base", "cs_pin": 5, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": True},
+            {"joint": 2, "name": "shoulder", "cs_pin": 7, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": True},
+            {"joint": 3, "name": "elbow", "cs_pin": -1, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": False},
+            {"joint": 4, "name": "wrist", "cs_pin": -1, "zero_offset_deg": 0.0, "direction_sign": 1, "enabled": False},
+        ],
+    }
+    raw = config.raw.get("encoders")
+    if isinstance(raw, dict):
+        defaults.update({key: deepcopy(value) for key, value in raw.items() if key != "axes"})
+        if isinstance(raw.get("axes"), list):
+            axes = deepcopy(defaults["axes"])
+            for index, patch in enumerate(raw["axes"]):
+                if index < len(axes) and isinstance(patch, dict):
+                    axes[index].update(deepcopy(patch))
+            defaults["axes"] = axes
+    return defaults
+
+
+def calibration_settings(config: RobotConfig) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "movement_tolerance_deg": 0.2,
+        "tool_dimensions_validated": False,
+        "last_validation": "",
+    }
+    raw = config.raw.get("calibration")
     if isinstance(raw, dict):
         defaults.update(deepcopy(raw))
     return defaults
@@ -164,4 +246,3 @@ def validate_named_position(config: RobotConfig, name: str, position: dict[str, 
     if not ik["ok"]:
         errors.append(f"{name} has no valid IK solution")
     return errors
-
