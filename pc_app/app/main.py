@@ -81,6 +81,7 @@ websockets: set[WebSocket] = set()
 path_previews: dict[str, dict[str, Any]] = {}
 task_previews: dict[str, dict[str, Any]] = {}
 path_task: asyncio.Task[None] | None = None
+path_task_source: str | None = None
 live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
 event_log = EventLog()
@@ -98,10 +99,12 @@ class ConnectRequest(BaseModel):
 class JointTargetRequest(BaseModel):
     index: int
     angle_deg: float
+    settings: dict[str, Any] | None = None
 
 
 class AllTargetsRequest(BaseModel):
     angles_deg: list[float]
+    settings: dict[str, Any] | None = None
 
 
 class ArmRequest(BaseModel):
@@ -373,10 +376,24 @@ def links_from_override(links_mm: dict[str, float] | None) -> LinkConfig:
     return LinkConfig(**values)
 
 
-def request_settings(settings: PathSettingsRequest | None) -> dict[str, Any]:
+def default_path_settings() -> dict[str, Any]:
+    return {
+        "global_speed_deg_s": min(joint.max_speed_deg_s for joint in config.joints),
+        "global_accel_deg_s2": config.motion.acceleration_deg_s2,
+        "waypoint_rate_hz": config.motion.command_rate_limit_hz,
+        "planner_type": "s_curve",
+        "per_joint_speed_deg_s": [joint.max_speed_deg_s for joint in config.joints],
+        "per_joint_accel_deg_s2": [joint.max_accel_deg_s2 for joint in config.joints],
+    }
+
+
+def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
+    merged = default_path_settings()
     if settings is None:
-        return {}
-    return {key: value for key, value in settings.__dict__.items() if value is not None}
+        return merged
+    values = settings if isinstance(settings, dict) else settings.__dict__
+    merged.update({key: value for key, value in values.items() if value is not None})
+    return merged
 
 
 def cancel_task(task: asyncio.Task[None] | None) -> None:
@@ -638,6 +655,75 @@ def set_targets(
             return {"ok": False, "error": str(exc), "state": state.to_dict()}
 
     return {"ok": True, "command": command_label, "state": state.to_dict()}
+
+
+async def start_joint_target_trajectory(
+    targets: list[float],
+    command_label: str,
+    settings_payload: PathSettingsRequest | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    global path_task, path_task_source
+
+    if path_task is not None and not path_task.done():
+        replaceable_sources = {"set_joint_target", "set_all_joint_targets", "ws_set_joint", "ws_set_all"}
+        if command_label in replaceable_sources and path_task_source in replaceable_sources:
+            cancel_task(path_task)
+        else:
+            state.set_error("a path is already executing")
+            await broadcast_state()
+            return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if live_task is not None and not live_task.done():
+        state.set_error("live motion is already executing")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.simulation and not state.hardware_armed:
+        state.set_error("hardware moves require the Armed toggle")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.simulation:
+        ready, reason = hardware_ready_for_motion()
+        if not ready:
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "state": state.to_dict()}
+
+    can_move = validate_can_move(state)
+    if not can_move.ok:
+        state.set_error(can_move.reason)
+        await broadcast_state()
+        return {"ok": False, "error": can_move.reason, "state": state.to_dict()}
+
+    settings = request_settings(settings_payload)
+    trajectory = build_joint_trajectory(
+        state.reported_angles_deg,
+        [float(value) for value in targets],
+        config.joints,
+        settings,
+    )
+    if not trajectory["ok"]:
+        state.set_error("; ".join(trajectory.get("errors", [])) or "joint trajectory failed")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "trajectory": trajectory, "state": state.to_dict()}
+
+    preview_id = str(uuid4())
+    preview = {
+        "id": preview_id,
+        "created_at": time(),
+        "source": command_label,
+        "mode": "joint",
+        "target": {},
+        "settings": settings,
+        "ik": None,
+        "trajectory": trajectory,
+        "completion_feedback": "timed + STATUS estimate for hardware",
+    }
+    path_previews[preview_id] = preview
+    state.clear_error()
+    state.last_command = f"{command_label.upper()} {preview_id}"
+    path_task_source = command_label
+    path_task = asyncio.create_task(execute_waypoint_path(preview))
+    await broadcast_state()
+    return {"ok": True, "command": command_label, "preview_id": preview_id, "preview": preview, "state": state.to_dict()}
 
 
 async def execute_waypoint_path(preview: dict[str, Any]) -> None:
@@ -1179,7 +1265,7 @@ async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
 
 @app.post("/api/path/execute")
 async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
-    global path_task
+    global path_task, path_task_source
     preview = path_previews.get(request.preview_id)
     if preview is None:
         state.set_error("path preview not found or expired")
@@ -1212,6 +1298,7 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
 
     state.clear_error()
     state.last_command = f"PATH_EXECUTE {request.preview_id}"
+    path_task_source = "path_execute"
     path_task = asyncio.create_task(execute_waypoint_path(preview))
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
@@ -1518,16 +1605,12 @@ async def set_joint_target(request: JointTargetRequest) -> dict[str, Any]:
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     targets = state.target_angles_deg.copy()
     targets[request.index] = request.angle_deg
-    response = set_targets(targets, "set_joint_target")
-    await broadcast_state()
-    return response
+    return await start_joint_target_trajectory(targets, "set_joint_target", request.settings)
 
 
 @app.post("/api/joints")
 async def set_all_joint_targets(request: AllTargetsRequest) -> dict[str, Any]:
-    response = set_targets(request.angles_deg, "set_all_joint_targets")
-    await broadcast_state()
-    return response
+    return await start_joint_target_trajectory(request.angles_deg, "set_all_joint_targets", request.settings)
 
 
 @app.post("/api/home")
@@ -1605,13 +1688,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             payload = await websocket.receive_json()
             command = payload.get("command")
             if command == "set_all_joint_targets":
-                set_targets([float(value) for value in payload.get("angles_deg", [])], "ws_set_all")
+                await start_joint_target_trajectory(
+                    [float(value) for value in payload.get("angles_deg", [])],
+                    "ws_set_all",
+                    payload.get("settings"),
+                )
             elif command == "set_joint_target":
                 index = int(payload.get("index", -1))
                 targets = state.target_angles_deg.copy()
                 if 0 <= index < len(targets):
                     targets[index] = float(payload.get("angle_deg", targets[index]))
-                    set_targets(targets, "ws_set_joint")
+                    await start_joint_target_trajectory(targets, "ws_set_joint", payload.get("settings"))
                 else:
                     state.set_error("joint index out of range")
             elif command == "stop":

@@ -125,6 +125,8 @@ struct ServoRuntime {
   int pulseUs = 1500;
   int channel = -1;
   bool attached = false;
+  float velocityDegS = 0.0f;
+  unsigned long lastUpdateUs = 0;
 };
 
 ControllerState controllerState = ControllerState::Idle;
@@ -471,12 +473,15 @@ void configurePins() {
 }
 
 void syncRuntimeFromCurrentPose() {
+  const unsigned long nowUs = micros();
   for (int i = 0; i < kJointCount; i++) {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].currentSteps = jointDegToSteps(i, currentJointsDeg[i]);
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
     } else if (joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].velocityDegS = 0.0f;
+      servoRuntime[i].lastUpdateUs = nowUs;
       servoRuntime[i].pulseUs = servoPulseForJoint(i, currentJointsDeg[i]);
       writeServoPwm(i, armed && joints[i].axisState == AxisState::Hardware);
     }
@@ -555,18 +560,27 @@ bool hasHardwareMotionPending() {
         stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps) {
       return true;
     }
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo &&
+        (fabsf(targetJointsDeg[i] - currentJointsDeg[i]) > 0.05f || fabsf(servoRuntime[i].velocityDegS) > 0.05f)) {
+      return true;
+    }
   }
   return false;
 }
 
 void setTargetPose(const float requested[kJointCount]) {
+  const unsigned long nowUs = micros();
   for (int i = 0; i < kJointCount; i++) {
     targetJointsDeg[i] = requested[i];
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = jointDegToSteps(i, requested[i]);
+    } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].lastUpdateUs = nowUs;
     } else {
       currentJointsDeg[i] = requested[i];
       if (joints[i].actuator == ActuatorType::Servo) {
+        servoRuntime[i].velocityDegS = 0.0f;
+        servoRuntime[i].lastUpdateUs = nowUs;
         servoRuntime[i].pulseUs = servoPulseForJoint(i, requested[i]);
         writeServoPwm(i, armed && joints[i].axisState == AxisState::Hardware);
       }
@@ -727,10 +741,14 @@ void handleArm(const String& rawCommand) {
     clearFaultText();
   } else {
     armed = false;
+    const unsigned long nowUs = micros();
     for (int i = 0; i < kJointCount; i++) {
       targetJointsDeg[i] = currentJointsDeg[i];
       if (joints[i].actuator == ActuatorType::Stepper) {
         stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      } else if (joints[i].actuator == ActuatorType::Servo) {
+        servoRuntime[i].velocityDegS = 0.0f;
+        servoRuntime[i].lastUpdateUs = nowUs;
       }
     }
     disableHardwareOutputs();
@@ -833,10 +851,14 @@ void handleSetPose(const char* buffer) {
 }
 
 void handleStop() {
+  const unsigned long nowUs = micros();
   for (int i = 0; i < kJointCount; i++) {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    } else if (joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].velocityDegS = 0.0f;
+      servoRuntime[i].lastUpdateUs = nowUs;
     }
   }
   if (controllerState != ControllerState::Estop) {
@@ -849,10 +871,14 @@ void handleStop() {
 
 void handleEstop() {
   armed = false;
+  const unsigned long nowUs = micros();
   for (int i = 0; i < kJointCount; i++) {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    } else if (joints[i].actuator == ActuatorType::Servo) {
+      servoRuntime[i].velocityDegS = 0.0f;
+      servoRuntime[i].lastUpdateUs = nowUs;
     }
   }
   disableHardwareOutputs();
@@ -933,7 +959,80 @@ void updateSteppers(unsigned long nowUs) {
 }
 
 void updateServoPwm(unsigned long nowUs) {
-  (void)nowUs;
+  if (!armed || controllerState == ControllerState::Estop || controllerState == ControllerState::Stopped ||
+      controllerState == ControllerState::Fault) {
+    for (int i = 0; i < kJointCount; i++) {
+      if (joints[i].actuator == ActuatorType::Servo) {
+        servoRuntime[i].velocityDegS = 0.0f;
+        servoRuntime[i].lastUpdateUs = nowUs;
+      }
+    }
+    return;
+  }
+
+  for (int i = 0; i < kJointCount; i++) {
+    if (joints[i].axisState != AxisState::Hardware || joints[i].actuator != ActuatorType::Servo) {
+      continue;
+    }
+    ServoRuntime& runtime = servoRuntime[i];
+    if (!runtime.attached) {
+      continue;
+    }
+    if (runtime.lastUpdateUs == 0) {
+      runtime.lastUpdateUs = nowUs;
+      continue;
+    }
+
+    const unsigned long elapsedUs = nowUs - runtime.lastUpdateUs;
+    if (elapsedUs < 20000UL) {
+      continue;
+    }
+    runtime.lastUpdateUs = nowUs;
+
+    const float dtS = static_cast<float>(elapsedUs) / 1000000.0f;
+    const float delta = targetJointsDeg[i] - currentJointsDeg[i];
+    if (fabsf(delta) <= 0.05f) {
+      currentJointsDeg[i] = targetJointsDeg[i];
+      runtime.velocityDegS = 0.0f;
+      runtime.pulseUs = servoPulseForJoint(i, currentJointsDeg[i]);
+      writeServoPwm(i, true);
+      continue;
+    }
+
+    const float direction = delta > 0.0f ? 1.0f : -1.0f;
+    const float speedLimit = max(0.1f, min(lastSpeedDegS, joints[i].maxSpeedDegS));
+    const float accelLimit = max(0.1f, min(lastAccelDegS2, joints[i].maxAccelDegS2));
+    const float stoppingDistance = (runtime.velocityDegS * runtime.velocityDegS) / (2.0f * accelLimit);
+    float desiredVelocity = direction * speedLimit;
+    if (runtime.velocityDegS * direction > 0.0f && stoppingDistance >= fabsf(delta)) {
+      desiredVelocity = 0.0f;
+    }
+
+    const float maxVelocityStep = accelLimit * dtS;
+    const float velocityDelta = desiredVelocity - runtime.velocityDegS;
+    if (velocityDelta > maxVelocityStep) {
+      runtime.velocityDegS += maxVelocityStep;
+    } else if (velocityDelta < -maxVelocityStep) {
+      runtime.velocityDegS -= maxVelocityStep;
+    } else {
+      runtime.velocityDegS = desiredVelocity;
+    }
+
+    const float step = runtime.velocityDegS * dtS;
+    if (fabsf(step) >= fabsf(delta)) {
+      currentJointsDeg[i] = targetJointsDeg[i];
+      runtime.velocityDegS = 0.0f;
+    } else {
+      currentJointsDeg[i] += step;
+    }
+    runtime.pulseUs = servoPulseForJoint(i, currentJointsDeg[i]);
+    writeServoPwm(i, true);
+  }
+
+  if (controllerState == ControllerState::Moving && !hasHardwareMotionPending()) {
+    controllerState = ControllerState::Idle;
+    clearFaultText();
+  }
 }
 
 void handleCommand(String rawCommand) {
@@ -1032,5 +1131,4 @@ void loop() {
     lastStatusMs = nowMs;
     printStatus();
   }
-  (void)lastAccelDegS2;
 }

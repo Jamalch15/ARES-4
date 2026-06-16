@@ -65,3 +65,44 @@ def test_live_target_accepts_simulation_joint_target_when_enabled():
     assert payload["preview"]["mode"] == "jog"
     assert payload["preview"]["trajectory"]["waypoints"][-1] == target
     reset_runtime_state()
+
+
+def test_direct_joint_apply_uses_requested_motion_settings():
+    reset_runtime_state()
+    client = TestClient(main.app)
+    target = main.config.home_pose.copy()
+    target[2] += 8.0
+
+    response = client.post(
+        "/api/joints",
+        json={
+            "angles_deg": target,
+            "settings": {
+                "global_speed_deg_s": 12.0,
+                "global_accel_deg_s2": 6.0,
+                "waypoint_rate_hz": 20.0,
+                "per_joint_speed_deg_s": [12.0, 12.0, 8.0, 12.0],
+                "per_joint_accel_deg_s2": [6.0, 6.0, 4.0, 6.0],
+            },
+        },
+    )
+
+    payload = response.json()
+    assert payload["ok"]
+    trajectory = payload["preview"]["trajectory"]
+    assert trajectory["waypoints"][-1] == target
+    assert trajectory["speed_limits_deg_s"][2] == 8.0
+    assert trajectory["accel_limits_deg_s2"][2] == 4.0
+    reset_runtime_state()
+
+
+def test_default_path_settings_follow_saved_joint_limits():
+    reset_runtime_state()
+
+    settings = main.request_settings(None)
+
+    assert settings["global_speed_deg_s"] == min(joint.max_speed_deg_s for joint in main.config.joints)
+    assert settings["global_accel_deg_s2"] == main.config.motion.acceleration_deg_s2
+    assert settings["waypoint_rate_hz"] == main.config.motion.command_rate_limit_hz
+    assert settings["per_joint_speed_deg_s"] == [joint.max_speed_deg_s for joint in main.config.joints]
+    assert settings["per_joint_accel_deg_s2"] == [joint.max_accel_deg_s2 for joint in main.config.joints]

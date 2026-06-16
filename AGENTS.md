@@ -17,6 +17,11 @@ The project definition is still fluid. Agents should treat all architecture note
 
 Agents should optimize for clarity and low-friction iteration, not premature rigidity.
 
+Agents should also keep changes future-oriented: prefer small interfaces and
+data shapes that can support the planned robot stack later, and avoid quick
+fixes that make future motion planning, perception, transport, calibration, or
+hardware changes harder.
+
 ## Early Project Direction
 
 The broad idea is a software stack for a 4DOF robot arm with:
@@ -48,6 +53,9 @@ When writing code or proposing structure:
 - Avoid locking the project into one vision model, one transport layer, or one GUI framework too early
 - Prefer configuration files for values that are likely to change
 - Document units, coordinate frames, and hardware assumptions explicitly whenever they appear
+- When fixing a near-term issue, consider the likely future subsystem it will
+  belong to and leave a path toward that subsystem instead of embedding a
+  one-off shortcut
 
 ## Likely Subsystems
 

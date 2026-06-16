@@ -1142,10 +1142,11 @@ function queueTarget(angles) {
 function sendPendingTarget() {
   if (state.pendingAngles) {
     state.lastSentAngles = state.pendingAngles.slice();
+    const payload = { angles_deg: state.pendingAngles, settings: pathSettings() };
     if (state.ws?.readyState === WebSocket.OPEN) {
-      state.ws.send(JSON.stringify({ command: "set_all_joint_targets", angles_deg: state.pendingAngles }));
+      state.ws.send(JSON.stringify({ command: "set_all_joint_targets", ...payload }));
     } else {
-      postJson("/api/joints", { angles_deg: state.pendingAngles });
+      postJson("/api/joints", payload);
     }
   }
   state.commandTimer = null;
@@ -1774,7 +1775,7 @@ function bindActions() {
   elements.applyJointPreviewBtn.addEventListener("click", async () => {
     const angles = state.draftAngles || state.robotState?.target_angles_deg;
     if (!angles) return;
-    const payload = await postJson("/api/joints", { angles_deg: angles });
+    const payload = await postJson("/api/joints", { angles_deg: angles, settings: pathSettings() });
     if (payload.ok) {
       state.pendingAngles = angles.slice();
       state.commandedAngles = angles.slice();
