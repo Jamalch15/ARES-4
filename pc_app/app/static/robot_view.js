@@ -314,6 +314,19 @@ function makeFrameAxes(transform, frameIndex, radiusScale) {
   return group;
 }
 
+function makeJointHub(transform, frameIndex, radiusScale, material) {
+  const origin = robotToScene(robotPointFromDh(transform));
+  const axis = sceneDirectionFromDh(transform, [0, 0, 1]);
+  const length = (frameIndex === 1 ? 34 : 30) * radiusScale;
+  const radius = (frameIndex === 1 ? 17 : 14) * radiusScale;
+  return makeCylinderBetween(
+    origin.clone().addScaledVector(axis, -length / 2),
+    origin.clone().addScaledVector(axis, length / 2),
+    radius,
+    material
+  );
+}
+
 function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
   const group = new THREE.Group();
   const points = pose.frames.map(robotToScene);
@@ -331,11 +344,15 @@ function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
   });
 
   points.forEach((point, index) => {
+    const isBaseFrame = index === 0;
     const isToolMount = index === points.length - 1 && points.length > 4;
-    const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry((isToolMount ? 8 : 16) * radiusScale, 24, 16),
-      materials.joint
-    );
+    const transform = pose.frameTransforms?.[index];
+    if (isBaseFrame) return;
+    if (!isToolMount && transform) {
+      group.add(makeJointHub(transform, index, radiusScale, materials.joint));
+      return;
+    }
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(7 * radiusScale, 18, 12), materials.joint);
     sphere.position.set(point.x, point.y, point.z);
     group.add(sphere);
   });
