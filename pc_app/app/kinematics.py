@@ -15,8 +15,8 @@ Standard DH kinematics with the project robot frame mapped from the DH frame:
 - Robot coordinates are mapped as robot x = DH y, robot y = -DH x, robot z = DH z.
 - At base/theta1 = 0 deg, positive planar reach points along global +Y.
 - +Z points upward from the mounting plane.
-- Working assumption for the measured L convention: d1=L1+L3, a1=L2,
-  d2=s4*L4, a2=L5, d3=s6*L6, a3=L7, d4=s8*L8, a4=L9.
+- Working assumption for the measured L convention: d1=L1+L3, base side
+  offset=L2, d2=s4*L4, a2=L5, d3=s6*L6, a3=L7, d4=s8*L8, a4=L9.
 - tool_phi_deg is the first-pass pitch task angle theta2 + theta3 + theta4 after direction and zero offsets.
 - The active tool TCP offset is applied after the final DH joint transform.
 - Tool TCP +Z is treated as the tool-forward axis, which maps to local DH +X.
@@ -112,6 +112,22 @@ def _dh_step(
     return final, after_d, after_a
 
 
+def _dh_step_with_side_offset(
+    transform: np.ndarray,
+    theta_deg: float,
+    d_mm: float,
+    a_mm: float,
+    alpha_deg: float,
+    side_offset_mm: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    after_theta = transform @ _rotation_z(theta_deg)
+    after_d = after_theta @ _translation(0.0, 0.0, d_mm)
+    after_side = after_d @ _translation(0.0, side_offset_mm, 0.0)
+    after_a = after_side @ _translation(a_mm, 0.0, 0.0)
+    final = after_a @ _rotation_x(alpha_deg)
+    return final, after_d, after_side, after_a
+
+
 def _robot_point_from_dh(vector: np.ndarray) -> dict[str, float]:
     return {"x_mm": float(vector[1]), "y_mm": float(-vector[0]), "z_mm": float(vector[2])}
 
@@ -127,13 +143,15 @@ def dh_transforms(joint_angles_deg: list[float], links: LinkConfig) -> list[np.n
     transforms: list[np.ndarray] = []
     transform = np.identity(4)
     transforms.append(transform.copy())
-    for row in _rows(links):
-        transform, _, _ = _dh_step(
+    for row_index, row in enumerate(_rows(links)):
+        side_offset = links.base_side_offset_mm if row_index == 0 else 0.0
+        transform, _, _, _ = _dh_step_with_side_offset(
             transform,
             _row_theta(row, joint_angles_deg),
             row.d_mm,
             row.a_mm,
             row.alpha_deg,
+            side_offset,
         )
         transforms.append(transform.copy())
     return transforms
@@ -145,7 +163,7 @@ def joint_frame_points(joint_angles_deg: list[float], links: LinkConfig) -> list
 
 def _segment_label(row_index: int, kind: str) -> str:
     labels = [
-        {"d": "L1+L3", "a": "L2"},
+        {"d": "L1+L3", "side": "L2", "a": "a1"},
         {"d": "s4*L4", "a": "L5"},
         {"d": "s6*L6", "a": "L7"},
         {"d": "s8*L8", "a": "L9"},
@@ -162,15 +180,18 @@ def dh_segment_points(joint_angles_deg: list[float], links: LinkConfig) -> list[
     transform = np.identity(4)
     segments: list[dict[str, Any]] = []
     for row_index, row in enumerate(_rows(links)):
-        final, after_d, after_a = _dh_step(
+        side_offset = links.base_side_offset_mm if row_index == 0 else 0.0
+        final, after_d, after_side, after_a = _dh_step_with_side_offset(
             transform,
             _row_theta(row, joint_angles_deg),
             row.d_mm,
             row.a_mm,
             row.alpha_deg,
+            side_offset,
         )
         start = _robot_point_from_dh(transform[:3, 3])
         d_end = _robot_point_from_dh(after_d[:3, 3])
+        side_end = _robot_point_from_dh(after_side[:3, 3])
         a_end = _robot_point_from_dh(after_a[:3, 3])
         if abs(row.d_mm) > 1e-9:
             segments.append(
@@ -185,6 +206,19 @@ def dh_segment_points(joint_angles_deg: list[float], links: LinkConfig) -> list[
                     "end": d_end,
                 }
             )
+        if abs(side_offset) > 1e-9:
+            segments.append(
+                {
+                    "kind": "side",
+                    "row": row_index + 1,
+                    "joint": row.joint_index + 1,
+                    "label": _segment_label(row_index, "side"),
+                    "signed_length_mm": float(side_offset),
+                    "length_mm": abs(float(side_offset)),
+                    "start": d_end,
+                    "end": side_end,
+                }
+            )
         if abs(row.a_mm) > 1e-9:
             segments.append(
                 {
@@ -194,7 +228,7 @@ def dh_segment_points(joint_angles_deg: list[float], links: LinkConfig) -> list[
                     "label": _segment_label(row_index, "a"),
                     "signed_length_mm": float(row.a_mm),
                     "length_mm": abs(float(row.a_mm)),
-                    "start": d_end,
+                    "start": side_end,
                     "end": a_end,
                 }
             )

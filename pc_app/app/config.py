@@ -114,6 +114,7 @@ class LinkConfig:
     forearm_mm: float
     wrist_mm: float
     tool_mm: float
+    base_side_offset_mm: float = 0.0
     dh_rows: list[DHRowConfig] = field(default_factory=list)
     tool_tcp_offset_mm: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "z": 0.0})
 
@@ -235,7 +236,7 @@ def matlab_geometry_to_dh_rows(preset: dict[str, Any] | None = None) -> list[DHR
             joint_index=0,
             theta_offset_deg=0.0,
             d_mm=length("L_1") + length("L_3"),
-            a_mm=length("L_2"),
+            a_mm=0.0,
             alpha_deg=90.0,
             min_deg=limit(1, "min", -180.0),
             max_deg=limit(1, "max", 180.0),
@@ -464,12 +465,25 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
             )
         )
 
+    geometry_raw = raw.get("geometry", {})
+    active_geometry = {}
+    if isinstance(geometry_raw, dict):
+        presets = geometry_raw.get("presets", {})
+        active_name = geometry_raw.get("active_preset")
+        if isinstance(presets, dict) and active_name in presets and isinstance(presets[active_name], dict):
+            active_geometry = presets[active_name]
+    active_dimensions = active_geometry.get("dimensions_mm", {}) if isinstance(active_geometry, dict) else {}
+
     links_raw = raw.get("links_mm", {})
     base_height = _require_number(links_raw.get("base_height", 80.0), "base_height")
     upper_arm = _require_number(links_raw.get("upper_arm", 140.0), "upper_arm")
     forearm = _require_number(links_raw.get("forearm", 120.0), "forearm")
     wrist = _require_number(links_raw.get("wrist", 60.0), "wrist")
     tool = _require_number(links_raw.get("tool", 30.0), "tool")
+    base_side_offset = _require_number(
+        links_raw.get("base_side_offset", active_dimensions.get("L_2", 0.0)),
+        "base_side_offset",
+    )
     fallback_dh = _default_dh_rows(base_height, upper_arm, forearm, wrist, tool)
 
     kinematics_raw = raw.get("kinematics", {})
@@ -503,6 +517,7 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
         forearm,
         wrist,
         tool,
+        base_side_offset,
         dh_rows=dh_rows,
         tool_tcp_offset_mm=_active_tool_tcp_offset(raw),
     )
@@ -581,7 +596,7 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
     links = updates.get("links_mm")
     if isinstance(links, dict):
         data.setdefault("links_mm", {})
-        for key in ["base_height", "upper_arm", "forearm", "wrist", "tool"]:
+        for key in ["base_height", "upper_arm", "forearm", "wrist", "tool", "base_side_offset"]:
             if key in links:
                 data["links_mm"][key] = float(links[key])
 

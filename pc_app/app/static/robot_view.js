@@ -21,6 +21,9 @@ function armPose(anglesDeg, links, geometryPreset = {}) {
   const frameTransforms = [transform];
   const segments = [];
   const dimensions = geometryPreset.dimensions_mm || {};
+  const baseSideOffsetMm = Number(
+    links.base_side_offset_mm ?? links.base_side_offset ?? dimensions.L_2 ?? 0
+  );
   rows.forEach((row, fallbackIndex) => {
     const usesMeasuredBaseSupport = fallbackIndex === 0 && hasMeasuredBaseSupport(dimensions);
     const normalizedIndex = dhJointIndex(row, fallbackIndex);
@@ -30,13 +33,16 @@ function armPose(anglesDeg, links, geometryPreset = {}) {
       Number(row.theta_offset_deg || 0);
     const dMm = Number(row.d_mm || 0);
     const aMm = Number(row.a_mm || 0);
+    const sideMm = fallbackIndex === 0 ? baseSideOffsetMm : 0;
     const afterTheta = multiply4(transform, rotationZ(theta));
     const afterD = multiply4(afterTheta, translation4(0, 0, dMm));
-    const afterA = multiply4(afterD, translation4(aMm, 0, 0));
+    const afterSide = multiply4(afterD, translation4(0, sideMm, 0));
+    const afterA = multiply4(afterSide, translation4(aMm, 0, 0));
     if (usesMeasuredBaseSupport) {
       addMeasuredBaseSupportSegments(segments, fallbackIndex, transform, afterTheta, dimensions);
     } else {
       addDhSegment(segments, fallbackIndex, "d", transform, afterD, dMm);
+      addDhSegment(segments, fallbackIndex, "side", afterD, afterSide, sideMm);
     }
     if (!usesMeasuredBaseSupport) {
       addDhSegment(segments, fallbackIndex, "a", afterD, afterA, aMm);
@@ -120,7 +126,7 @@ function robotPointFromDhVector(vector) {
 
 function dhSegmentLabel(rowIndex, kind) {
   const labels = [
-    { d: "L1+L3", a: "L2" },
+    { d: "L1+L3", side: "L2", a: "a1" },
     { d: "s4*L4", a: "L5" },
     { d: "s6*L6", a: "L7" },
     { d: "s8*L8", a: "L9" },
@@ -137,7 +143,7 @@ function addMeasuredBaseSupportSegments(segments, rowIndex, startTransform, afte
   const l2 = Number(dimensions.L_2 || 0);
   const l3 = Number(dimensions.L_3 || 0);
   const afterL1 = multiply4(afterTheta, translation4(0, 0, l1));
-  const afterL2 = multiply4(afterL1, translation4(l2, 0, 0));
+  const afterL2 = multiply4(afterL1, translation4(0, l2, 0));
   const afterL3 = multiply4(afterL2, translation4(0, 0, l3));
   addDhSegment(segments, rowIndex, "support", startTransform, afterL1, l1, "L1");
   addDhSegment(segments, rowIndex, "bracket", afterL1, afterL2, l2, "L2");
@@ -257,6 +263,9 @@ function segmentMaterial(segment, materials) {
   if (segment.kind === "bracket") {
     return materials.dhOffset || materials.linkAlt;
   }
+  if (segment.kind === "side") {
+    return materials.dhOffset || materials.linkAlt;
+  }
   if (segment.kind === "d") {
     return segment.rowIndex === 0 ? materials.base || materials.dhOffset : materials.dhOffset || materials.linkAlt;
   }
@@ -268,6 +277,9 @@ function segmentRadius(segment, radiusScale) {
     return (segment.label === "L1" ? 16 : 10) * radiusScale;
   }
   if (segment.kind === "bracket") {
+    return 5 * radiusScale;
+  }
+  if (segment.kind === "side") {
     return 5 * radiusScale;
   }
   if (segment.kind === "d") {

@@ -360,6 +360,8 @@ def links_from_override(links_mm: dict[str, float] | None) -> LinkConfig:
             "forearm": "forearm_mm",
             "wrist": "wrist_mm",
             "tool": "tool_mm",
+            "base_side_offset": "base_side_offset_mm",
+            "side_offset": "base_side_offset_mm",
         }
         for key, value in links_mm.items():
             normalized_key = aliases.get(key, key)

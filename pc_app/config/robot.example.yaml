@@ -12,6 +12,7 @@ coordinate_frame_notes: >
 links_mm:
   # Derived compatibility values. Edit geometry.presets.*.dimensions_mm in the UI.
   base_height: 157.95
+  base_side_offset: 23.2
   upper_arm: 160.15
   forearm: 142.55
   wrist: 15.0
@@ -67,7 +68,7 @@ kinematics:
     - joint: 1
       theta_offset_deg: 0.0
       d_mm: 157.95
-      a_mm: 23.2
+      a_mm: 0.0
       alpha_deg: 90.0
       joint_type: revolute
       min_deg: -180.0

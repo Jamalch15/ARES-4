@@ -104,8 +104,8 @@ prefer elbow down: true
 The prototype uses Standard DH. The active DH table is:
 
 ```text
-joint  theta   alpha   a     d
-1      th1     pi/2    L2    L1 + L3
+joint  theta   alpha   a     d          extra measured offset
+1      th1     pi/2    0     L1 + L3   L2 side offset after d1
 2      th2     0       L5    s4 * L4
 3      th3     0       L7    s6 * L6
 4      th4     0       L9    s8 * L8
@@ -396,7 +396,8 @@ Work:
 - Add a named geometry preset based on the MATLAB prototype.
 - Store values as measured link dimensions, not hardcoded solver constants.
 - Include `L_1..L_9` and sign values `s4`, `s6`, `s8`.
-- Keep `L_2` in the active derived DH table as the first-row `a1` offset.
+- Keep `L_2` in the active measured model as a base side offset, not as
+  first-row `a1`.
 - Label all units as `mm` and `deg`.
 
 Acceptance:
@@ -447,7 +448,7 @@ Work:
 
 ```text
 d1 = L1 + L3
-a1 = L2
+base side offset = L2
 d2 = s4 * L4
 d3 = s6 * L6
 d4 = s8 * L8
@@ -999,8 +1000,8 @@ Status: implemented as a first pass.
 
 Reality note: the 3D view now renders Standard DH `d` and `a` translations as
 separate visible segments and can show labels/frame axes through the Frames
-toggle. `L_2` is part of the active first-row `a1` offset and is also shown in
-the measured base support sketch.
+toggle. `L_2` is part of the active measured base side offset and is also shown
+in the measured base support sketch.
 
 Work:
 
