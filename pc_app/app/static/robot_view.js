@@ -22,6 +22,7 @@ function armPose(anglesDeg, links, geometryPreset = {}) {
   const segments = [];
   const dimensions = geometryPreset.dimensions_mm || {};
   rows.forEach((row, fallbackIndex) => {
+    const usesMeasuredBaseSupport = fallbackIndex === 0 && hasMeasuredBaseSupport(dimensions);
     const normalizedIndex = dhJointIndex(row, fallbackIndex);
     const theta =
       Number(anglesDeg[normalizedIndex] || 0) * Number(row.direction_sign ?? 1) +
@@ -32,12 +33,14 @@ function armPose(anglesDeg, links, geometryPreset = {}) {
     const afterTheta = multiply4(transform, rotationZ(theta));
     const afterD = multiply4(afterTheta, translation4(0, 0, dMm));
     const afterA = multiply4(afterD, translation4(aMm, 0, 0));
-    if (fallbackIndex === 0 && hasMeasuredBaseSupport(dimensions)) {
+    if (usesMeasuredBaseSupport) {
       addMeasuredBaseSupportSegments(segments, fallbackIndex, transform, afterTheta, dimensions);
     } else {
       addDhSegment(segments, fallbackIndex, "d", transform, afterD, dMm);
     }
-    addDhSegment(segments, fallbackIndex, "a", afterD, afterA, aMm);
+    if (!usesMeasuredBaseSupport) {
+      addDhSegment(segments, fallbackIndex, "a", afterD, afterA, aMm);
+    }
     transform = multiply4(afterA, rotationX(Number(row.alpha_deg || 0)));
     frames.push(robotPointFromDh(transform));
     frameTransforms.push(transform);
@@ -117,7 +120,7 @@ function robotPointFromDhVector(vector) {
 
 function dhSegmentLabel(rowIndex, kind) {
   const labels = [
-    { d: "L1+L3", a: "a1" },
+    { d: "L1+L3", a: "L2" },
     { d: "s4*L4", a: "L5" },
     { d: "s6*L6", a: "L7" },
     { d: "s8*L8", a: "L9" },
@@ -134,7 +137,7 @@ function addMeasuredBaseSupportSegments(segments, rowIndex, startTransform, afte
   const l2 = Number(dimensions.L_2 || 0);
   const l3 = Number(dimensions.L_3 || 0);
   const afterL1 = multiply4(afterTheta, translation4(0, 0, l1));
-  const afterL2 = multiply4(afterL1, translation4(0, l2, 0));
+  const afterL2 = multiply4(afterL1, translation4(l2, 0, 0));
   const afterL3 = multiply4(afterL2, translation4(0, 0, l3));
   addDhSegment(segments, rowIndex, "support", startTransform, afterL1, l1, "L1");
   addDhSegment(segments, rowIndex, "bracket", afterL1, afterL2, l2, "L2");

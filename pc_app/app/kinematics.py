@@ -15,9 +15,8 @@ Standard DH kinematics with the project robot frame mapped from the DH frame:
 - Robot coordinates are mapped as robot x = DH y, robot y = -DH x, robot z = DH z.
 - At base/theta1 = 0 deg, positive planar reach points along global +Y.
 - +Z points upward from the mounting plane.
-- Working assumption for the measured L convention: d1=L1+L3, d2=s4*L4,
-  a2=L5, d3=s6*L6, a3=L7, d4=s8*L8, a4=L9. L2 is recorded but is
-  not yet part of the active DH table.
+- Working assumption for the measured L convention: d1=L1+L3, a1=L2,
+  d2=s4*L4, a2=L5, d3=s6*L6, a3=L7, d4=s8*L8, a4=L9.
 - tool_phi_deg is the first-pass pitch task angle theta2 + theta3 + theta4 after direction and zero offsets.
 - The active tool TCP offset is applied after the final DH joint transform.
 - Tool TCP +Z is treated as the tool-forward axis, which maps to local DH +X.
@@ -146,7 +145,7 @@ def joint_frame_points(joint_angles_deg: list[float], links: LinkConfig) -> list
 
 def _segment_label(row_index: int, kind: str) -> str:
     labels = [
-        {"d": "L1+L3", "a": "a1"},
+        {"d": "L1+L3", "a": "L2"},
         {"d": "s4*L4", "a": "L5"},
         {"d": "s6*L6", "a": "L7"},
         {"d": "s8*L8", "a": "L9"},

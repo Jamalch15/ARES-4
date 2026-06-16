@@ -57,7 +57,7 @@ Working assumption: these are current measured/prototype values, not final calib
 
 ```text
 L_1 = 93.45 mm
-L_2 = 23.20 mm, currently not used in the DH table
+L_2 = 23.20 mm
 L_3 = 64.50 mm
 L_4 = 42.69 mm
 L_5 = 160.15 mm
@@ -105,7 +105,7 @@ The prototype uses Standard DH. The active DH table is:
 
 ```text
 joint  theta   alpha   a     d
-1      th1     pi/2    0     L1 + L3
+1      th1     pi/2    L2    L1 + L3
 2      th2     0       L5    s4 * L4
 3      th3     0       L7    s6 * L6
 4      th4     0       L9    s8 * L8
@@ -396,7 +396,7 @@ Work:
 - Add a named geometry preset based on the MATLAB prototype.
 - Store values as measured link dimensions, not hardcoded solver constants.
 - Include `L_1..L_9` and sign values `s4`, `s6`, `s8`.
-- Keep `L_2` recorded even though it is not currently used in the DH table.
+- Keep `L_2` in the active derived DH table as the first-row `a1` offset.
 - Label all units as `mm` and `deg`.
 
 Acceptance:
@@ -437,16 +437,17 @@ Acceptance:
 
 Status: implemented as a first pass.
 
-Reality note: Python FK is tested against selected MATLAB-style DH poses. The coordinate-frame convention is still a project working assumption until measured against the physical arm.
+Reality note: Python FK is tested against selected measured-prototype DH poses. The coordinate-frame convention is still a project working assumption until measured against the physical arm.
 
 Work:
 
 - Derive Standard DH from the active measured-geometry preset.
 - Verify the app uses the same transform order as the MATLAB prototype.
-- Support the MATLAB-style table:
+- Support the measured-prototype table:
 
 ```text
 d1 = L1 + L3
+a1 = L2
 d2 = s4 * L4
 d3 = s6 * L6
 d4 = s8 * L8
@@ -458,7 +459,7 @@ alpha2..4 = 0 deg
 ```
 
 - Apply active tool TCP after the final joint transform.
-- Add FK tests against known MATLAB-style poses.
+- Add FK tests against known measured-prototype poses.
 
 Acceptance:
 
@@ -998,12 +999,12 @@ Status: implemented as a first pass.
 
 Reality note: the 3D view now renders Standard DH `d` and `a` translations as
 separate visible segments and can show labels/frame axes through the Frames
-toggle. `L_2` is still recorded in the geometry preset but is not yet part of
-the active DH table.
+toggle. `L_2` is part of the active first-row `a1` offset and is also shown in
+the measured base support sketch.
 
 Work:
 
-- Use MATLAB-style segment data to show DH `d` and `a` offsets.
+- Use measured-prototype segment data to show DH `d` and `a` offsets.
 - Add optional labels in diagnostics/calibration mode.
 - Keep normal operator view less cluttered.
 
@@ -1140,7 +1141,7 @@ Work:
 - Test config precedence and saving to `robot.local.yaml`.
 - Test tool config validation.
 - Test DH config load/save.
-- Test FK against MATLAB-style known poses.
+- Test FK against measured-prototype known poses.
 - Test analytic seed candidate behavior.
 - Test Jacobian IK success/failure.
 - Test encoder parsing.
@@ -1193,7 +1194,7 @@ Acceptance:
 These should be answered before implementing hardware-heavy packages.
 
 - Are the MATLAB `L_1..L_9` values the newest measurements?
-- What is `L_2` physically, and should it enter the final DH/table model?
+- Is the current `L_2` sign/direction correct after measuring against the physical arm?
 - Are `s4 = -1`, `s6 = -1`, and `s8 = 1` final for the current build?
 - Does the app coordinate frame match the MATLAB coordinate frame?
 - Are the MATLAB joint limits final and mechanically safe?

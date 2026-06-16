@@ -67,7 +67,7 @@ kinematics:
     - joint: 1
       theta_offset_deg: 0.0
       d_mm: 157.95
-      a_mm: 0.0
+      a_mm: 23.2
       alpha_deg: 90.0
       joint_type: revolute
       min_deg: -180.0

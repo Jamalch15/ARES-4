@@ -242,6 +242,8 @@ Working assumption:
 - Shoulder 0 deg points the upper arm vertically upward
 - Positive shoulder, elbow, and wrist angles bend the chain toward the local horizontal reach direction
 - `phi` is the current tool angle target used by the numerical IK workflow
+- The measured prototype geometry currently derives `d1 = L1 + L3`, `a1 = L2`,
+  `d2 = s4*L4`, `a2 = L5`, `d3 = s6*L6`, `a3 = L7`, `d4 = s8*L8`, and `a4 = L9`
 
 Lengths are in millimeters internally. Trigonometry uses radians internally. UI and config use degrees for joint angles.
 

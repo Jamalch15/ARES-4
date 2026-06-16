@@ -32,6 +32,7 @@ def test_matlab_geometry_builds_documented_dh_rows():
 
     assert [row.joint_index for row in rows] == [0, 1, 2, 3]
     assert rows[0].d_mm == approx(157.95)
+    assert rows[0].a_mm == approx(23.2)
     assert rows[1].d_mm == approx(-42.69)
     assert rows[2].d_mm == approx(-41.39)
     assert rows[3].d_mm == approx(49.20)
@@ -41,7 +42,7 @@ def test_matlab_geometry_builds_documented_dh_rows():
     assert rows[0].alpha_deg == approx(90.0)
 
 
-def test_forward_kinematics_matches_matlab_style_dh_poses():
+def test_forward_kinematics_matches_measured_prototype_dh_poses():
     rows = matlab_geometry_to_dh_rows(MATLAB_PROTOTYPE_GEOMETRY)
     links = LinkConfig(
         base_height_mm=157.95,
@@ -54,13 +55,13 @@ def test_forward_kinematics_matches_matlab_style_dh_poses():
 
     zero = forward_kinematics([0.0, 0.0, 0.0, 0.0], links)
     assert zero["x_mm"] == approx(34.88)
-    assert zero["y_mm"] == approx(-317.70)
+    assert zero["y_mm"] == approx(-340.90)
     assert zero["z_mm"] == approx(157.95)
     assert zero["tool_phi_deg"] == approx(0.0)
 
     start = forward_kinematics([0.0, 0.0, -70.0, -20.0], links)
     assert start["x_mm"] == approx(34.88)
-    assert start["y_mm"] == approx(-208.9049714311)
+    assert start["y_mm"] == approx(-232.1049714311)
     assert start["z_mm"] == approx(8.9968169070)
     assert start["tool_phi_deg"] == approx(-90.0)
 
@@ -216,6 +217,7 @@ def test_forward_kinematics_exposes_dh_d_and_a_segments():
 
     assert [segment["label"] for segment in segments] == [
         "L1+L3",
+        "L2",
         "s4*L4",
         "L5",
         "s6*L6",
@@ -223,10 +225,11 @@ def test_forward_kinematics_exposes_dh_d_and_a_segments():
         "s8*L8",
         "L9",
     ]
-    assert [segment["kind"] for segment in segments] == ["d", "d", "a", "d", "a", "d", "a"]
+    assert [segment["kind"] for segment in segments] == ["d", "a", "d", "a", "d", "a", "d", "a"]
     assert segments[0]["length_mm"] == approx(157.95)
-    assert segments[1]["signed_length_mm"] == approx(-42.69)
-    assert segments[2]["length_mm"] == approx(160.15)
+    assert segments[1]["length_mm"] == approx(23.2)
+    assert segments[2]["signed_length_mm"] == approx(-42.69)
+    assert segments[3]["length_mm"] == approx(160.15)
     assert segments[-1]["end"]["x_mm"] == approx(result["wrist_frame"]["x_mm"])
     assert segments[-1]["end"]["y_mm"] == approx(result["wrist_frame"]["y_mm"])
     assert segments[-1]["end"]["z_mm"] == approx(result["wrist_frame"]["z_mm"])

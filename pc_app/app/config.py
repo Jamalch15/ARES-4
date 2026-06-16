@@ -212,7 +212,7 @@ def _default_dh_rows(
 
 
 def matlab_geometry_to_dh_rows(preset: dict[str, Any] | None = None) -> list[DHRowConfig]:
-    """Build the Standard DH rows used by the MATLAB prototype geometry."""
+    """Build the Standard DH rows used by the measured prototype geometry."""
     source = deepcopy(preset or MATLAB_PROTOTYPE_GEOMETRY)
     dimensions = source.get("dimensions_mm", {})
     signs = source.get("signs", {})
@@ -235,7 +235,7 @@ def matlab_geometry_to_dh_rows(preset: dict[str, Any] | None = None) -> list[DHR
             joint_index=0,
             theta_offset_deg=0.0,
             d_mm=length("L_1") + length("L_3"),
-            a_mm=0.0,
+            a_mm=length("L_2"),
             alpha_deg=90.0,
             min_deg=limit(1, "min", -180.0),
             max_deg=limit(1, "max", 180.0),
