@@ -21,6 +21,7 @@ from .demo_settings import (
     color_profiles,
     drop_zones,
     encoder_settings,
+    geometry_settings,
     named_positions,
     task_defaults,
     tool_settings,
@@ -172,6 +173,7 @@ class CalibrationRequest(BaseModel):
     tools: dict[str, Any] | None = None
     encoders: dict[str, Any] | None = None
     calibration: dict[str, Any] | None = None
+    geometry: dict[str, Any] | None = None
 
 
 class SetPoseRequest(BaseModel):
@@ -238,6 +240,7 @@ def public_config() -> dict[str, Any]:
         "tools": tools_settings(config),
         "encoders": encoder_settings(config),
         "calibration": calibration_settings(config),
+        "geometry": geometry_settings(config),
     }
 
 

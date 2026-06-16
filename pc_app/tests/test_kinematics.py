@@ -1,6 +1,12 @@
 from pytest import approx
 
-from app.config import LinkConfig, load_config
+from app.config import (
+    EXAMPLE_CONFIG_PATH,
+    MATLAB_PROTOTYPE_GEOMETRY,
+    LinkConfig,
+    load_config,
+    matlab_geometry_to_dh_rows,
+)
 from app.kinematics import forward_kinematics, inverse_kinematics
 
 
@@ -18,7 +24,45 @@ def test_forward_kinematics_zero_pose_extends_up_from_shoulder():
     assert abs(result["x_mm"]) < 1e-9
     assert abs(result["y_mm"]) < 1e-9
     assert result["z_mm"] == 430.0
-    assert result["tool_phi_deg"] == 90.0
+    assert result["tool_phi_deg"] == 0.0
+
+
+def test_matlab_geometry_builds_documented_dh_rows():
+    rows = matlab_geometry_to_dh_rows(MATLAB_PROTOTYPE_GEOMETRY)
+
+    assert [row.joint_index for row in rows] == [0, 1, 2, 3]
+    assert rows[0].d_mm == approx(157.95)
+    assert rows[1].d_mm == approx(-42.69)
+    assert rows[2].d_mm == approx(-41.39)
+    assert rows[3].d_mm == approx(49.20)
+    assert rows[1].a_mm == approx(160.15)
+    assert rows[2].a_mm == approx(142.55)
+    assert rows[3].a_mm == approx(15.0)
+    assert rows[0].alpha_deg == approx(90.0)
+
+
+def test_forward_kinematics_matches_matlab_style_dh_poses():
+    rows = matlab_geometry_to_dh_rows(MATLAB_PROTOTYPE_GEOMETRY)
+    links = LinkConfig(
+        base_height_mm=157.95,
+        upper_arm_mm=160.15,
+        forearm_mm=142.55,
+        wrist_mm=15.0,
+        tool_mm=0.0,
+        dh_rows=rows,
+    )
+
+    zero = forward_kinematics([0.0, 0.0, 0.0, 0.0], links)
+    assert zero["x_mm"] == approx(34.88)
+    assert zero["y_mm"] == approx(-317.70)
+    assert zero["z_mm"] == approx(157.95)
+    assert zero["tool_phi_deg"] == approx(0.0)
+
+    start = forward_kinematics([0.0, 0.0, -70.0, -20.0], links)
+    assert start["x_mm"] == approx(34.88)
+    assert start["y_mm"] == approx(-208.9049714311)
+    assert start["z_mm"] == approx(8.9968169070)
+    assert start["tool_phi_deg"] == approx(-90.0)
 
 
 def test_forward_kinematics_base_zero_points_along_y_axis():
@@ -38,6 +82,23 @@ def test_forward_kinematics_base_yaw_rotates_positive_toward_negative_x():
 
     assert round(result["x_mm"], 6) == -100.0
     assert abs(result["y_mm"]) < 1e-9
+
+
+def test_tool_tcp_z_offset_extends_along_tool_axis():
+    links = LinkConfig(
+        0.0,
+        100.0,
+        0.0,
+        0.0,
+        0.0,
+        tool_tcp_offset_mm={"x": 0.0, "y": 0.0, "z": 20.0},
+    )
+
+    result = forward_kinematics([0.0, 90.0, 0.0, 0.0], links)
+
+    assert abs(result["x_mm"]) < 1e-9
+    assert result["y_mm"] == approx(120.0)
+    assert abs(result["z_mm"]) < 1e-9
 
 
 def test_inverse_kinematics_round_trips_reachable_target():
@@ -111,8 +172,8 @@ def test_inverse_kinematics_filters_joint_limits():
 
 
 def test_inverse_kinematics_prefers_nearest_valid_solution():
-    config = load_config()
-    target_fk = forward_kinematics([-90.0, -20.0, -80.0, 80.0], config.links)
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    target_fk = forward_kinematics([-60.0, -20.0, 30.0, -80.0], config.links)
     target = {
         "x_mm": target_fk["x_mm"],
         "y_mm": target_fk["y_mm"],
@@ -135,4 +196,37 @@ def test_forward_kinematics_exposes_dh_frames():
     result = forward_kinematics(config.home_pose, config.links)
 
     assert len(result["dh_frames"]) == 5
-    assert result["dh_frames"][-1]["x_mm"] == approx(result["x_mm"])
+    assert result["dh_frames"][-1]["x_mm"] == approx(result["wrist_frame"]["x_mm"])
+    assert set(result["tool_tcp_offset_mm"]) == {"x", "y", "z"}
+
+
+def test_forward_kinematics_exposes_dh_d_and_a_segments():
+    rows = matlab_geometry_to_dh_rows(MATLAB_PROTOTYPE_GEOMETRY)
+    links = LinkConfig(
+        base_height_mm=157.95,
+        upper_arm_mm=160.15,
+        forearm_mm=142.55,
+        wrist_mm=15.0,
+        tool_mm=0.0,
+        dh_rows=rows,
+    )
+
+    result = forward_kinematics([0.0, 0.0, 0.0, 0.0], links)
+    segments = result["dh_segments"]
+
+    assert [segment["label"] for segment in segments] == [
+        "L1+L3",
+        "s4*L4",
+        "L5",
+        "s6*L6",
+        "L7",
+        "s8*L8",
+        "L9",
+    ]
+    assert [segment["kind"] for segment in segments] == ["d", "d", "a", "d", "a", "d", "a"]
+    assert segments[0]["length_mm"] == approx(157.95)
+    assert segments[1]["signed_length_mm"] == approx(-42.69)
+    assert segments[2]["length_mm"] == approx(160.15)
+    assert segments[-1]["end"]["x_mm"] == approx(result["wrist_frame"]["x_mm"])
+    assert segments[-1]["end"]["y_mm"] == approx(result["wrist_frame"]["y_mm"])
+    assert segments[-1]["end"]["z_mm"] == approx(result["wrist_frame"]["z_mm"])

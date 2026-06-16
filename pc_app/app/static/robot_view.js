@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-function jointPositions(anglesDeg, links) {
+function armPose(anglesDeg, links) {
   const rows = Array.isArray(links.dh_rows) && links.dh_rows.length
     ? links.dh_rows
     : [
@@ -17,21 +17,39 @@ function jointPositions(anglesDeg, links) {
         },
       ];
   let transform = identity4();
-  const points = [robotPointFromDh(transform)];
+  const frames = [robotPointFromDh(transform)];
+  const frameTransforms = [transform];
+  const segments = [];
   rows.forEach((row, fallbackIndex) => {
-    const jointIndex = Number(row.joint_index ?? row.joint ?? fallbackIndex);
-    const normalizedIndex = jointIndex >= 1 ? jointIndex - 1 : jointIndex;
+    const normalizedIndex = dhJointIndex(row, fallbackIndex);
     const theta =
       Number(anglesDeg[normalizedIndex] || 0) * Number(row.direction_sign ?? 1) +
       Number(row.zero_offset_deg || 0) +
       Number(row.theta_offset_deg || 0);
-    transform = multiply4(
-      transform,
-      dhMatrix(theta, Number(row.d_mm || 0), Number(row.a_mm || 0), Number(row.alpha_deg || 0))
-    );
-    points.push(robotPointFromDh(transform));
+    const dMm = Number(row.d_mm || 0);
+    const aMm = Number(row.a_mm || 0);
+    const afterTheta = multiply4(transform, rotationZ(theta));
+    const afterD = multiply4(afterTheta, translation4(0, 0, dMm));
+    const afterA = multiply4(afterD, translation4(aMm, 0, 0));
+    addDhSegment(segments, fallbackIndex, "d", transform, afterD, dMm);
+    addDhSegment(segments, fallbackIndex, "a", afterD, afterA, aMm);
+    transform = multiply4(afterA, rotationX(Number(row.alpha_deg || 0)));
+    frames.push(robotPointFromDh(transform));
+    frameTransforms.push(transform);
   });
-  return points;
+  const tcp = toolTcpPoint(transform, links);
+  const lastFrame = frames[frames.length - 1];
+  return { frames, frameTransforms, segments, tcp, hasTcpOffset: !samePoint(tcp, lastFrame) };
+}
+
+function dhJointIndex(row, fallbackIndex) {
+  if (row.joint_index !== undefined && row.joint_index !== null) {
+    return Number(row.joint_index);
+  }
+  if (row.joint !== undefined && row.joint !== null) {
+    return Number(row.joint) - 1;
+  }
+  return fallbackIndex;
 }
 
 function identity4() {
@@ -51,23 +69,97 @@ function multiply4(a, b) {
   );
 }
 
-function dhMatrix(thetaDeg, dMm, aMm, alphaDeg) {
+function rotationZ(thetaDeg) {
   const theta = (thetaDeg * Math.PI) / 180;
-  const alpha = (alphaDeg * Math.PI) / 180;
   const ct = Math.cos(theta);
   const st = Math.sin(theta);
+  return [
+    [ct, -st, 0, 0],
+    [st, ct, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+  ];
+}
+
+function rotationX(alphaDeg) {
+  const alpha = (alphaDeg * Math.PI) / 180;
   const ca = Math.cos(alpha);
   const sa = Math.sin(alpha);
   return [
-    [ct, -st * ca, st * sa, aMm * ct],
-    [st, ct * ca, -ct * sa, aMm * st],
-    [0, sa, ca, dMm],
+    [1, 0, 0, 0],
+    [0, ca, -sa, 0],
+    [0, sa, ca, 0],
+    [0, 0, 0, 1],
+  ];
+}
+
+function translation4(xMm, yMm, zMm) {
+  return [
+    [1, 0, 0, xMm],
+    [0, 1, 0, yMm],
+    [0, 0, 1, zMm],
     [0, 0, 0, 1],
   ];
 }
 
 function robotPointFromDh(transform) {
   return { x: transform[1][3], y: -transform[0][3], z: transform[2][3] };
+}
+
+function robotPointFromDhVector(vector) {
+  return { x: vector[1], y: -vector[0], z: vector[2] };
+}
+
+function dhSegmentLabel(rowIndex, kind) {
+  const labels = [
+    { d: "L1+L3", a: "a1" },
+    { d: "s4*L4", a: "L5" },
+    { d: "s6*L6", a: "L7" },
+    { d: "s8*L8", a: "L9" },
+  ];
+  return labels[rowIndex]?.[kind] || `${kind}${rowIndex + 1}`;
+}
+
+function addDhSegment(segments, rowIndex, kind, startTransform, endTransform, signedLengthMm) {
+  const start = robotPointFromDh(startTransform);
+  const end = robotPointFromDh(endTransform);
+  if (Math.abs(Number(signedLengthMm || 0)) <= 0.0001 || samePoint(start, end)) return;
+  segments.push({
+    kind,
+    rowIndex,
+    label: dhSegmentLabel(rowIndex, kind),
+    signedLengthMm,
+    lengthMm: Math.abs(Number(signedLengthMm)),
+    start,
+    end,
+  });
+}
+
+function samePoint(a, b, tolerance = 0.0001) {
+  return (
+    Math.abs(a.x - b.x) <= tolerance &&
+    Math.abs(a.y - b.y) <= tolerance &&
+    Math.abs(a.z - b.z) <= tolerance
+  );
+}
+
+function toolTcpPoint(transform, links) {
+  const offset = links.tool_tcp_offset_mm || {};
+  const toolX = Number(offset.x ?? offset.x_mm ?? 0);
+  const toolY = Number(offset.y ?? offset.y_mm ?? 0);
+  const toolZ = Number(offset.z ?? offset.z_mm ?? 0);
+  // Config uses tool +Z as the forward TCP axis. In this DH model the visible
+  // link/tool extension is local DH +X, matching the backend FK mapping.
+  const local = [
+    toolZ,
+    toolX,
+    toolY,
+    1,
+  ];
+  const vector = [0, 1, 2, 3].map((rowIndex) =>
+    [0, 1, 2, 3].reduce((sum, columnIndex) => sum + transform[rowIndex][columnIndex] * local[columnIndex], 0)
+  );
+  return robotPointFromDhVector(vector);
 }
 
 function makeCylinderBetween(start, end, radius, material) {
@@ -87,35 +179,174 @@ function robotToScene(point) {
   return new THREE.Vector3(point.x, point.z, -point.y);
 }
 
-function makeArmObjects(points, materials, radiusScale = 1) {
-  const group = new THREE.Group();
+function sceneDirectionFromDh(transform, direction) {
+  const dhVector = [0, 1, 2].map((rowIndex) =>
+    [0, 1, 2].reduce((sum, columnIndex) => sum + transform[rowIndex][columnIndex] * direction[columnIndex], 0)
+  );
+  const robotVector = robotPointFromDhVector(dhVector);
+  return new THREE.Vector3(robotVector.x, robotVector.z, -robotVector.y).normalize();
+}
 
-  for (let i = 0; i < points.length - 1; i += 1) {
+function makeTextSprite(text, color = "#dce4ee") {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  const fontSize = 30;
+  context.font = `700 ${fontSize}px Segoe UI, Arial, sans-serif`;
+  const metrics = context.measureText(text);
+  canvas.width = Math.ceil(metrics.width + 22);
+  canvas.height = 44;
+
+  context.font = `700 ${fontSize}px Segoe UI, Arial, sans-serif`;
+  context.fillStyle = "rgba(10, 14, 22, 0.72)";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = color;
+  context.textBaseline = "middle";
+  context.fillText(text, 11, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthWrite: false,
+  });
+  material.userData.disposeWithObject = true;
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(canvas.width * 0.23, canvas.height * 0.23, 1);
+  return sprite;
+}
+
+function segmentMidpoint(segment) {
+  const start = segment.start;
+  const end = segment.end;
+  return robotToScene({
+    x: (start.x + end.x) / 2,
+    y: (start.y + end.y) / 2,
+    z: (start.z + end.z) / 2,
+  });
+}
+
+function segmentMaterial(segment, materials) {
+  if (segment.kind === "d") {
+    return segment.rowIndex === 0 ? materials.base || materials.dhOffset : materials.dhOffset || materials.linkAlt;
+  }
+  return segment.rowIndex === 2 ? materials.linkAlt : materials.link;
+}
+
+function segmentRadius(segment, radiusScale) {
+  if (segment.kind === "d") {
+    return (segment.rowIndex === 0 ? 16 : 5) * radiusScale;
+  }
+  return (segment.rowIndex >= 3 ? 7 : 12) * radiusScale;
+}
+
+function fallbackFrameSegments(frames) {
+  return frames.slice(0, -1).map((start, index) => ({
+    kind: "a",
+    rowIndex: index,
+    label: `J${index + 1}`,
+    start,
+    end: frames[index + 1],
+  }));
+}
+
+function makeFrameAxes(transform, frameIndex, radiusScale) {
+  const group = new THREE.Group();
+  const origin = robotToScene(robotPointFromDh(transform));
+  const length = (frameIndex === 0 ? 48 : 34) * radiusScale;
+  [
+    { direction: [1, 0, 0], color: 0xff6374 },
+    { direction: [0, 1, 0], color: 0x53d18e },
+    { direction: [0, 0, 1], color: 0x6aa7ff },
+  ].forEach((axis) => {
+    const helper = new THREE.ArrowHelper(
+      sceneDirectionFromDh(transform, axis.direction),
+      origin,
+      length,
+      axis.color,
+      8 * radiusScale,
+      4 * radiusScale
+    );
+    helper.line.material.userData.disposeWithObject = true;
+    helper.cone.material.userData.disposeWithObject = true;
+    group.add(helper);
+  });
+  const label = makeTextSprite(`F${frameIndex}`, "#dce4ee");
+  label.position.copy(origin).add(new THREE.Vector3(0, length * 0.75, 0));
+  label.scale.multiplyScalar(0.72);
+  group.add(label);
+  return group;
+}
+
+function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
+  const group = new THREE.Group();
+  const points = pose.frames.map(robotToScene);
+  const segments = pose.segments?.length ? pose.segments : fallbackFrameSegments(pose.frames);
+
+  segments.forEach((segment) => {
     group.add(
       makeCylinderBetween(
-        points[i],
-        points[i + 1],
-        (i === points.length - 2 ? 9 : 12) * radiusScale,
-        i === 1 ? materials.linkAlt : materials.link
+        robotToScene(segment.start),
+        robotToScene(segment.end),
+        segmentRadius(segment, radiusScale),
+        segmentMaterial(segment, materials)
       )
     );
-  }
+  });
 
   points.forEach((point, index) => {
+    const isToolMount = index === points.length - 1 && points.length > 4;
     const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry((index === points.length - 1 ? 12 : 16) * radiusScale, 24, 16),
-      index === points.length - 1 ? materials.tool : materials.joint
+      new THREE.SphereGeometry((isToolMount ? 8 : 16) * radiusScale, 24, 16),
+      materials.joint
     );
     sphere.position.set(point.x, point.y, point.z);
     group.add(sphere);
   });
 
+  if (pose.hasTcpOffset) {
+    const wristPoint = points[points.length - 1];
+    const tcpPoint = robotToScene(pose.tcp);
+    group.add(makeCylinderBetween(wristPoint, tcpPoint, 2.5 * radiusScale, materials.tool));
+
+    const tcpMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(5.5 * radiusScale, 18, 12),
+      materials.tool
+    );
+    tcpMarker.position.copy(tcpPoint);
+    group.add(tcpMarker);
+  }
+
+  if (options.showDhHelpers) {
+    segments.forEach((segment) => {
+      const label = makeTextSprite(segment.label, segment.kind === "d" ? "#f2b45b" : "#5ee6c5");
+      label.position.copy(segmentMidpoint(segment));
+      label.position.y += (segment.kind === "d" ? 14 : 19) * radiusScale;
+      group.add(label);
+    });
+    (pose.frameTransforms || []).forEach((transform, frameIndex) => {
+      group.add(makeFrameAxes(transform, frameIndex, radiusScale));
+    });
+  }
+
   return group;
+}
+
+function disposeMaterial(material) {
+  if (Array.isArray(material)) {
+    material.forEach(disposeMaterial);
+    return;
+  }
+  if (!material) return;
+  if (!material.userData?.disposeWithObject) return;
+  if (material.map) material.map.dispose();
+  material.dispose();
 }
 
 function disposeObject(object) {
   object.traverse((child) => {
     if (child.geometry) child.geometry.dispose();
+    if (child.material) disposeMaterial(child.material);
   });
 }
 
@@ -214,10 +445,18 @@ export class RobotView {
       base: new THREE.MeshStandardMaterial({ color: 0x0d1318, roughness: 0.55 }),
       link: new THREE.MeshStandardMaterial({ color: 0x0f6f69, roughness: 0.48 }),
       linkAlt: new THREE.MeshStandardMaterial({ color: 0xb98225, roughness: 0.5 }),
+      dhOffset: new THREE.MeshStandardMaterial({ color: 0xf2b45b, roughness: 0.52 }),
       joint: new THREE.MeshStandardMaterial({ color: 0xdce4ee, roughness: 0.4 }),
       tool: new THREE.MeshStandardMaterial({ color: 0xff6374, roughness: 0.42 }),
     };
     this.previewMaterials = {
+      base: new THREE.MeshStandardMaterial({
+        color: 0x627086,
+        roughness: 0.5,
+        transparent: true,
+        opacity: 0.32,
+        depthWrite: false,
+      }),
       link: new THREE.MeshStandardMaterial({
         color: 0x6f96d1,
         roughness: 0.48,
@@ -230,6 +469,13 @@ export class RobotView {
         roughness: 0.48,
         transparent: true,
         opacity: 0.34,
+        depthWrite: false,
+      }),
+      dhOffset: new THREE.MeshStandardMaterial({
+        color: 0xf2b45b,
+        roughness: 0.48,
+        transparent: true,
+        opacity: 0.38,
         depthWrite: false,
       }),
       joint: new THREE.MeshStandardMaterial({
@@ -296,8 +542,8 @@ export class RobotView {
     clearGroup(this.previewGroup);
     this.previewAngles = normalizedAngles;
     this.container.dataset.previewAngles = normalizedAngles.map((angle) => angle.toFixed(3)).join(",");
-    const points = jointPositions(normalizedAngles, this.links).map(robotToScene);
-    this.previewGroup.add(makeArmObjects(points, this.previewMaterials, 0.82));
+    const pose = armPose(normalizedAngles, this.links);
+    this.previewGroup.add(makeArmObjects(pose, this.previewMaterials, 0.82));
     this.previewGroup.visible = this.previewVisible;
     this.render();
   }
@@ -338,8 +584,7 @@ export class RobotView {
 
     this.container.dataset.pathWaypointCount = String(waypoints.length);
     const pathPoints = waypoints.map((angles) => {
-      const joints = jointPositions(angles.map(Number), this.links);
-      return robotToScene(joints[joints.length - 1]);
+      return robotToScene(armPose(angles.map(Number), this.links).tcp);
     });
     const geometry = new THREE.BufferGeometry().setFromPoints(pathPoints);
     const line = new THREE.Line(geometry, this.pathMaterial);
@@ -399,6 +644,7 @@ export class RobotView {
     this.framesVisible = Boolean(visible);
     this.grid.visible = this.framesVisible;
     this.axes.visible = this.framesVisible;
+    this.renderRobot();
     this.render();
   }
 
@@ -435,9 +681,8 @@ export class RobotView {
   renderRobot() {
     clearGroup(this.armGroup);
     this.lastRenderedAngles = this.angles.slice();
-    const points = jointPositions(this.angles, this.links).map(robotToScene);
+    const pose = armPose(this.angles, this.links);
 
-    const baseHeight = this.links.base_height_mm || 80;
     const base = new THREE.Mesh(
       new THREE.CylinderGeometry(54, 66, 28, 32),
       this.materials.base
@@ -445,15 +690,7 @@ export class RobotView {
     base.position.set(0, 14, 0);
     this.armGroup.add(base);
 
-    const pedestal = makeCylinderBetween(
-      robotToScene({ x: 0, y: 0, z: 28 }),
-      robotToScene({ x: 0, y: 0, z: baseHeight }),
-      22,
-      this.materials.base
-    );
-    this.armGroup.add(pedestal);
-
-    this.armGroup.add(makeArmObjects(points, this.materials));
+    this.armGroup.add(makeArmObjects(pose, this.materials, 1, { showDhHelpers: this.framesVisible }));
 
     this.render();
   }

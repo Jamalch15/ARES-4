@@ -10,7 +10,7 @@ def test_load_config_prefers_local_config(tmp_path, monkeypatch):
     local = tmp_path / "robot.local.yaml"
     copyfile(source, example)
     copyfile(source, local)
-    text = local.read_text(encoding="utf-8").replace("base_height: 160.0", "base_height: 123.0")
+    text = local.read_text(encoding="utf-8").replace("base_height: 157.95", "base_height: 123.0")
     local.write_text(text, encoding="utf-8")
     monkeypatch.setattr(config_module, "EXAMPLE_CONFIG_PATH", example)
     monkeypatch.setattr(config_module, "LOCAL_CONFIG_PATH", local)

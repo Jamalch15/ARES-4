@@ -10,12 +10,52 @@ coordinate_frame_notes: >
   from vertical +Z toward the local horizontal reach direction.
 
 links_mm:
-  # Placeholder measurements. Replace with measured center-to-center distances.
-  base_height: 160.0
-  upper_arm: 150.0
-  forearm: 150.0
-  wrist: 50.0
+  # Derived compatibility values. Edit geometry.presets.*.dimensions_mm in the UI.
+  base_height: 157.95
+  upper_arm: 160.15
+  forearm: 142.55
+  wrist: 15.0
   tool: 0.0
+
+geometry:
+  # Working assumption from the MATLAB prototype, not final calibration.
+  active_preset: matlab_prototype
+  presets:
+    matlab_prototype:
+      label: MATLAB prototype
+      status: working_assumption
+      source: jacobian_ik_robotarm_analytic_seed.m
+      units:
+        length: mm
+        angle: deg
+      dimensions_mm:
+        L_1: 93.45
+        L_2: 23.20
+        L_3: 64.50
+        L_4: 42.69
+        L_5: 160.15
+        L_6: 41.39
+        L_7: 142.55
+        L_8: 49.20
+        L_9: 15.00
+      signs:
+        s4: -1
+        s6: -1
+        s8: 1
+      joint_limits_deg:
+        theta1:
+          min: -180.0
+          max: 180.0
+        theta2:
+          min: -90.0
+          max: 160.0
+        theta3:
+          min: -160.0
+          max: 160.0
+        theta4:
+          min: -180.0
+          max: 180.0
+      starting_pose_deg: [0.0, 0.0, -70.0, -20.0]
 
 kinematics:
   convention: standard_dh
@@ -26,42 +66,42 @@ kinematics:
   dh_rows:
     - joint: 1
       theta_offset_deg: 0.0
-      d_mm: 160.0
+      d_mm: 157.95
       a_mm: 0.0
       alpha_deg: 90.0
+      joint_type: revolute
+      min_deg: -180.0
+      max_deg: 180.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+    - joint: 2
+      theta_offset_deg: 0.0
+      d_mm: -42.69
+      a_mm: 160.15
+      alpha_deg: 0.0
+      joint_type: revolute
+      min_deg: -90.0
+      max_deg: 160.0
+      zero_offset_deg: 0.0
+      direction_sign: 1
+    - joint: 3
+      theta_offset_deg: 0.0
+      d_mm: -41.39
+      a_mm: 142.55
+      alpha_deg: 0.0
       joint_type: revolute
       min_deg: -160.0
       max_deg: 160.0
       zero_offset_deg: 0.0
       direction_sign: 1
-    - joint: 2
-      theta_offset_deg: 90.0
-      d_mm: 0.0
-      a_mm: 150.0
-      alpha_deg: 0.0
-      joint_type: revolute
-      min_deg: -30.0
-      max_deg: 115.0
-      zero_offset_deg: 0.0
-      direction_sign: 1
-    - joint: 3
-      theta_offset_deg: 0.0
-      d_mm: 0.0
-      a_mm: 150.0
-      alpha_deg: 0.0
-      joint_type: revolute
-      min_deg: -120.0
-      max_deg: 120.0
-      zero_offset_deg: 0.0
-      direction_sign: 1
     - joint: 4
       theta_offset_deg: 0.0
-      d_mm: 0.0
-      a_mm: 50.0
+      d_mm: 49.2
+      a_mm: 15.0
       alpha_deg: 0.0
       joint_type: revolute
-      min_deg: -120.0
-      max_deg: 120.0
+      min_deg: -180.0
+      max_deg: 180.0
       zero_offset_deg: 0.0
       direction_sign: 1
 

@@ -148,7 +148,7 @@ Use this for Cartesian target experiments.
 - `Branch` selects the numerical IK seed preference.
 - `Preview` builds a path and updates the ghost arm, target marker, and path line.
 - `Execute` runs the accepted preview.
-- The Standard DH table is editable and saved through Settings.
+- The active model is edited from Settings. Kinematics uses the saved derived DH rows.
 
 ### Program Tab
 
@@ -163,7 +163,8 @@ Use this for temporary waypoint experiments. Programs are in-memory only and are
 
 Use this as the shared robot model for both FK and IK.
 
-- Edit link lengths, joint limits, home pose, zero offsets, direction signs, and motion defaults.
+- Edit measured geometry, joint limits, home pose, zero offsets, direction signs, and motion defaults.
+- Derived link values and Standard DH rows are shown read-only so the saved model can be inspected without creating a second dimension input path.
 - Edit Hardware IO placeholders for stepper pins, TB6600 microstep value, gear ratios, servo pulse range, and enabled axes.
 - Draft edits do not affect FK/IK until you press `Save`.
 - After saving, the backend reloads config, refreshes the dashboard from the saved model, and tries to resync the ESP if serial hardware is connected.
@@ -195,6 +196,8 @@ Working assumptions:
 
 Use `Preview` first, check the ghost/path visually, then arm and execute only when the physical workspace is clear.
 
+If hardware reports `known=0` or asks for `SETPOSE`, leave hardware disarmed, move the joint sliders to match the real arm's current physical pose, and click `Set Pose` in the top robot-control rail. This tells the controller and PC that the current pose is known; then you can arm and run commands.
+
 ## Tests
 
 ```powershell
@@ -210,7 +213,8 @@ Use `config/robot.example.yaml` as the tracked template. The app prefers `config
 
 Important fields:
 
-- `links_mm`: link dimensions in millimeters
+- `geometry`: measured dimensions and signs used as the editable robot model source
+- `links_mm`: derived compatibility link dimensions in millimeters
 - `joints[].limits_deg`: conservative joint limits in degrees
 - `joints[].home_deg`: configured home/reset pose
 - `joints[].max_speed_deg_s`: per-joint speed limit
@@ -218,7 +222,7 @@ Important fields:
 - `motion.acceleration_deg_s2`: simple acceleration limit
 - `motion.allow_sudden_jumps`: keep `false` unless intentionally testing jumps
 - `serial.port` and `serial.baud_rate`: initial USB serial settings
-- `kinematics.dh_rows`: Standard DH rows used for FK and Jacobian IK
+- `kinematics.dh_rows`: derived Standard DH rows used for FK and Jacobian IK
 - `joints[].hardware.stepper`: step/dir/enable pins, driver model, full steps per rev, microsteps, and motor-to-joint gear ratio
 - `joints[].hardware.servo`: PWM pin, pulse min/max, PWM frequency, servo range, neutral angle, and servo-to-joint gear ratio
 - `tools`: active gripper or magnet dimensions and IO settings
@@ -226,7 +230,7 @@ Important fields:
 
 ## Coordinate Frame And Kinematics
 
-The kinematics model uses Standard DH rows from config. The legacy link dimensions are kept for compatibility and for generating default DH rows.
+The editable model starts from measured geometry. The app derives compatibility link dimensions and Standard DH rows from that geometry so FK, IK, and the 3D view use one coherent model.
 
 Working assumption:
 

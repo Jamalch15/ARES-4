@@ -23,6 +23,7 @@ Currently present at a rough level:
 - The Control tab has a gripper/magnet tool selector.
 - The backend has generic `TOOL` commands and a `tools` config section.
 - The backend has a Standard DH data model and Jacobian IK plumbing.
+- The app has an editable MATLAB prototype geometry preset with `L_1..L_9`, `s4`, `s6`, and `s8`.
 - The 3D view has DH-based rendering and object marker plumbing.
 - The backend has basic color/blob vision helpers and task sequence builders.
 - Firmware/backend protocol parsing includes some newer status fields.
@@ -188,7 +189,7 @@ The prototype includes:
 These ideas should be added to the implementation plan:
 
 - Use the measured `L_1..L_9` and sign-offset model as a geometry preset or calibration starting point.
-- Make Standard DH the source of truth, with the MATLAB DH table as the first known-good physical model.
+- Make measured geometry the editable source of truth, with Standard DH derived from the MATLAB dimensions as the first known-good physical model.
 - Add an analytic seed step before numerical Jacobian IK.
 - Use DH frame axes to compute the Jacobian, not ad hoc or inconsistent derivatives.
 - Preserve the `phi = theta2 + theta3 + theta4` task orientation model for the first pass.
@@ -386,7 +387,9 @@ Acceptance:
 
 ### KIN-01: Import MATLAB Physical Geometry As A Preset
 
-Status: missing.
+Status: implemented as a first pass.
+
+Reality note: the MATLAB values are stored as a `working_assumption` preset, not as final calibration. Applying the preset fills a DH draft; it does not silently prove the physical arm is calibrated.
 
 Work:
 
@@ -403,7 +406,9 @@ Acceptance:
 
 ### KIN-02: Professional DH Table Editor
 
-Status: partial, needs real UI.
+Status: implemented as a first pass.
+
+Reality note: the table editor now validates and previews DH drafts, but it is not yet a guided calibration workflow.
 
 Work:
 
@@ -424,17 +429,19 @@ Work:
 
 Acceptance:
 
-- DH values are edited in a proper table.
-- Bad numeric values are rejected visibly.
-- FK preview updates predictably.
+- Measured geometry is edited in one place.
+- Derived DH values are shown read-only and validated visibly.
+- FK preview updates predictably from the derived model.
 
 ### KIN-03: DH Forward Kinematics Aligned With MATLAB
 
-Status: partial, needs verification.
+Status: implemented as a first pass.
+
+Reality note: Python FK is tested against selected MATLAB-style DH poses. The coordinate-frame convention is still a project working assumption until measured against the physical arm.
 
 Work:
 
-- Make Standard DH the source of truth.
+- Derive Standard DH from the active measured-geometry preset.
 - Verify the app uses the same transform order as the MATLAB prototype.
 - Support the MATLAB-style table:
 
@@ -987,7 +994,12 @@ Acceptance:
 
 ### VIEW-01: DH Segment Visualization
 
-Status: missing or partial.
+Status: implemented as a first pass.
+
+Reality note: the 3D view now renders Standard DH `d` and `a` translations as
+separate visible segments and can show labels/frame axes through the Frames
+toggle. `L_2` is still recorded in the geometry preset but is not yet part of
+the active DH table.
 
 Work:
 

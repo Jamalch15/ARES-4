@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .config import RobotConfig
+from .config import DEFAULT_GEOMETRY_CONFIG, RobotConfig
 from .kinematics import forward_kinematics, inverse_kinematics
 from .safety import validate_joint_targets
 
@@ -204,6 +204,28 @@ def calibration_settings(config: RobotConfig) -> dict[str, Any]:
     raw = config.raw.get("calibration")
     if isinstance(raw, dict):
         defaults.update(deepcopy(raw))
+    return defaults
+
+
+def geometry_settings(config: RobotConfig) -> dict[str, Any]:
+    defaults = deepcopy(DEFAULT_GEOMETRY_CONFIG)
+    raw = config.raw.get("geometry")
+    if not isinstance(raw, dict):
+        return defaults
+    if "active_preset" in raw:
+        defaults["active_preset"] = str(raw["active_preset"])
+    if isinstance(raw.get("presets"), dict):
+        for name, preset in raw["presets"].items():
+            if isinstance(preset, dict):
+                merged = deepcopy(defaults["presets"].get(name, {}))
+                for key, value in preset.items():
+                    if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                        nested = deepcopy(merged[key])
+                        nested.update(deepcopy(value))
+                        merged[key] = nested
+                    else:
+                        merged[key] = deepcopy(value)
+                defaults["presets"][name] = merged
     return defaults
 
 

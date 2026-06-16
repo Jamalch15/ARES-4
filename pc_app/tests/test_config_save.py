@@ -1,7 +1,10 @@
 from pathlib import Path
 from shutil import copyfile
 
+import yaml
+
 from app.config import load_config, save_calibration_updates
+from app.demo_settings import geometry_settings
 
 
 def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
@@ -40,13 +43,26 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
                 }
             ],
             "motion": {"command_rate_limit_hz": 14.0, "acceleration_deg_s2": 130.0},
+            "geometry": {
+                "active_preset": "matlab_prototype",
+                "presets": {
+                    "matlab_prototype": {
+                        "label": "MATLAB prototype",
+                        "status": "working_assumption",
+                        "source": "jacobian_ik_robotarm_analytic_seed.m",
+                        "units": {"length": "mm", "angle": "deg"},
+                        "dimensions_mm": {"L_1": 93.45, "L_2": 23.2, "L_3": 64.5},
+                        "signs": {"s4": -1, "s6": -1, "s8": 1},
+                    }
+                },
+            },
         },
     )
 
     text = target.read_text(encoding="utf-8")
     saved = load_config(target)
 
-    assert "# Placeholder measurements" in text
+    assert "# Derived compatibility values" in text
     assert saved.links.base_height_mm == 81.5
     assert saved.joints[0].min_deg == -150.0
     assert saved.joints[0].max_deg == 150.0
@@ -62,3 +78,23 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
     assert saved.joints[0].hardware.stepper.gear_ratio == 4.5
     assert saved.motion.command_rate_limit_hz == 14.0
     assert saved.motion.acceleration_deg_s2 == 130.0
+    geometry = geometry_settings(saved)
+    assert geometry["presets"]["matlab_prototype"]["dimensions_mm"]["L_2"] == 23.2
+    assert geometry["presets"]["matlab_prototype"]["signs"]["s4"] == -1
+
+
+def test_load_config_keeps_joint_index_zero_based(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "config" / "robot.example.yaml"
+    target = tmp_path / "robot.yaml"
+    data = yaml.safe_load(source.read_text(encoding="utf-8"))
+    data["kinematics"]["dh_rows"] = [
+        {"joint_index": 0, "theta_offset_deg": 0.0, "d_mm": 1.0, "a_mm": 0.0, "alpha_deg": 90.0},
+        {"joint_index": 1, "theta_offset_deg": 0.0, "d_mm": 2.0, "a_mm": 10.0, "alpha_deg": 0.0},
+        {"joint_index": 2, "theta_offset_deg": 0.0, "d_mm": 3.0, "a_mm": 20.0, "alpha_deg": 0.0},
+        {"joint_index": 3, "theta_offset_deg": 0.0, "d_mm": 4.0, "a_mm": 30.0, "alpha_deg": 0.0},
+    ]
+    target.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    loaded = load_config(target)
+
+    assert [row.joint_index for row in loaded.kinematics.dh_rows] == [0, 1, 2, 3]

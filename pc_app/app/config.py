@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,37 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 EXAMPLE_CONFIG_PATH = CONFIG_DIR / "robot.example.yaml"
 LOCAL_CONFIG_PATH = CONFIG_DIR / "robot.local.yaml"
 CONFIG_PATH = EXAMPLE_CONFIG_PATH
+
+MATLAB_PROTOTYPE_GEOMETRY: dict[str, Any] = {
+    "label": "MATLAB prototype",
+    "status": "working_assumption",
+    "source": "jacobian_ik_robotarm_analytic_seed.m",
+    "units": {"length": "mm", "angle": "deg"},
+    "dimensions_mm": {
+        "L_1": 93.45,
+        "L_2": 23.20,
+        "L_3": 64.50,
+        "L_4": 42.69,
+        "L_5": 160.15,
+        "L_6": 41.39,
+        "L_7": 142.55,
+        "L_8": 49.20,
+        "L_9": 15.00,
+    },
+    "signs": {"s4": -1, "s6": -1, "s8": 1},
+    "joint_limits_deg": {
+        "theta1": {"min": -180.0, "max": 180.0},
+        "theta2": {"min": -90.0, "max": 160.0},
+        "theta3": {"min": -160.0, "max": 160.0},
+        "theta4": {"min": -180.0, "max": 180.0},
+    },
+    "starting_pose_deg": [0.0, 0.0, -70.0, -20.0],
+}
+
+DEFAULT_GEOMETRY_CONFIG: dict[str, Any] = {
+    "active_preset": "matlab_prototype",
+    "presets": {"matlab_prototype": MATLAB_PROTOTYPE_GEOMETRY},
+}
 
 
 @dataclass(frozen=True)
@@ -83,6 +115,7 @@ class LinkConfig:
     wrist_mm: float
     tool_mm: float
     dh_rows: list[DHRowConfig] = field(default_factory=list)
+    tool_tcp_offset_mm: dict[str, float] = field(default_factory=lambda: {"x": 0.0, "y": 0.0, "z": 0.0})
 
 
 @dataclass(frozen=True)
@@ -178,6 +211,65 @@ def _default_dh_rows(
     ]
 
 
+def matlab_geometry_to_dh_rows(preset: dict[str, Any] | None = None) -> list[DHRowConfig]:
+    """Build the Standard DH rows used by the MATLAB prototype geometry."""
+    source = deepcopy(preset or MATLAB_PROTOTYPE_GEOMETRY)
+    dimensions = source.get("dimensions_mm", {})
+    signs = source.get("signs", {})
+    limits = source.get("joint_limits_deg", {})
+
+    def length(name: str) -> float:
+        return _require_number(dimensions.get(name), f"geometry.dimensions_mm.{name}")
+
+    def sign(name: str) -> int:
+        return _direction_sign(signs.get(name), f"geometry.signs.{name}")
+
+    def limit(index: int, side: str, fallback: float) -> float:
+        row_limits = limits.get(f"theta{index}", {})
+        if not isinstance(row_limits, dict):
+            return fallback
+        return _require_number(row_limits.get(side, fallback), f"geometry.joint_limits_deg.theta{index}.{side}")
+
+    return [
+        DHRowConfig(
+            joint_index=0,
+            theta_offset_deg=0.0,
+            d_mm=length("L_1") + length("L_3"),
+            a_mm=0.0,
+            alpha_deg=90.0,
+            min_deg=limit(1, "min", -180.0),
+            max_deg=limit(1, "max", 180.0),
+        ),
+        DHRowConfig(
+            joint_index=1,
+            theta_offset_deg=0.0,
+            d_mm=sign("s4") * length("L_4"),
+            a_mm=length("L_5"),
+            alpha_deg=0.0,
+            min_deg=limit(2, "min", -90.0),
+            max_deg=limit(2, "max", 160.0),
+        ),
+        DHRowConfig(
+            joint_index=2,
+            theta_offset_deg=0.0,
+            d_mm=sign("s6") * length("L_6"),
+            a_mm=length("L_7"),
+            alpha_deg=0.0,
+            min_deg=limit(3, "min", -160.0),
+            max_deg=limit(3, "max", 160.0),
+        ),
+        DHRowConfig(
+            joint_index=3,
+            theta_offset_deg=0.0,
+            d_mm=sign("s8") * length("L_8"),
+            a_mm=length("L_9"),
+            alpha_deg=0.0,
+            min_deg=limit(4, "min", -180.0),
+            max_deg=limit(4, "max", 180.0),
+        ),
+    ]
+
+
 def _parse_dh_rows(raw_rows: Any, fallback: list[DHRowConfig]) -> list[DHRowConfig]:
     if not isinstance(raw_rows, list) or not raw_rows:
         return fallback
@@ -185,12 +277,12 @@ def _parse_dh_rows(raw_rows: Any, fallback: list[DHRowConfig]) -> list[DHRowConf
     for index, row in enumerate(raw_rows):
         if not isinstance(row, dict):
             raise ValueError(f"kinematics.dh_rows[{index}] must be a mapping")
-        raw_joint = row.get("joint_index", row.get("joint", index + 1))
-        joint_index = int(raw_joint)
-        if joint_index >= 1:
-            joint_index -= 1
+        if "joint_index" in row:
+            joint_index = int(row["joint_index"])
+        else:
+            joint_index = int(row.get("joint", index + 1)) - 1
         if joint_index < 0 or joint_index > 3:
-            raise ValueError(f"kinematics.dh_rows[{index}].joint must reference joint 1..4")
+            raise ValueError(f"kinematics.dh_rows[{index}] must reference joint_index 0..3 or joint 1..4")
         rows.append(
             DHRowConfig(
                 joint_index=joint_index,
@@ -220,6 +312,28 @@ def _parse_dh_rows(raw_rows: Any, fallback: list[DHRowConfig]) -> list[DHRowConf
     if len(rows) != 4:
         raise ValueError("kinematics.dh_rows must define exactly four rows")
     return rows
+
+
+def _active_tool_tcp_offset(raw_config: dict[str, Any]) -> dict[str, float]:
+    tools_raw = raw_config.get("tools")
+    active = "gripper"
+    preset: dict[str, Any] = {}
+    if isinstance(tools_raw, dict):
+        active = str(tools_raw.get("active", active))
+        presets = tools_raw.get("presets")
+        if isinstance(presets, dict) and isinstance(presets.get(active), dict):
+            preset = presets[active]
+    legacy_tool = raw_config.get("tool")
+    if not preset and isinstance(legacy_tool, dict):
+        preset = legacy_tool
+    offset = preset.get("tcp_offset_mm") if isinstance(preset, dict) else None
+    if not isinstance(offset, dict):
+        offset = {}
+    return {
+        "x": _require_number(offset.get("x", 0.0), "tools.active.tcp_offset_mm.x"),
+        "y": _require_number(offset.get("y", 0.0), "tools.active.tcp_offset_mm.y"),
+        "z": _require_number(offset.get("z", 0.0), "tools.active.tcp_offset_mm.z"),
+    }
 
 
 def _hardware_for_joint(item: dict[str, Any], actuator: str, name: str) -> JointHardwareConfig:
@@ -383,7 +497,15 @@ def load_config(path: str | Path | None = None) -> RobotConfig:
         raise ValueError("kinematics.max_iterations must be positive")
     if kinematics.damping <= 0:
         raise ValueError("kinematics.damping must be positive")
-    links = LinkConfig(base_height, upper_arm, forearm, wrist, tool, dh_rows=dh_rows)
+    links = LinkConfig(
+        base_height,
+        upper_arm,
+        forearm,
+        wrist,
+        tool,
+        dh_rows=dh_rows,
+        tool_tcp_offset_mm=_active_tool_tcp_offset(raw),
+    )
 
     motion = MotionConfig(
         update_rate_hz=_require_number(motion_raw.get("update_rate_hz", 30), "update_rate_hz"),
@@ -571,6 +693,7 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
         "tools",
         "encoders",
         "calibration",
+        "geometry",
     ]:
         if key in updates and isinstance(updates[key], dict):
             data[key] = updates[key]

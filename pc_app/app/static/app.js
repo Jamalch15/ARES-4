@@ -31,14 +31,26 @@ const state = {
   selectedSerialPort: null,
   latestDetections: [],
   cameraTimer: null,
+  linkDraft: null,
+  dhDraftRows: null,
 };
 
-const linkCalibrationFields = [
-  ["base_height", "L1 base"],
-  ["upper_arm", "L2 upper"],
-  ["forearm", "L3 forearm"],
-  ["wrist", "Wrist"],
-  ["tool", "Tool"],
+const geometryDimensionFields = [
+  ["L_1", "L1"],
+  ["L_2", "L2"],
+  ["L_3", "L3"],
+  ["L_4", "L4"],
+  ["L_5", "L5"],
+  ["L_6", "L6"],
+  ["L_7", "L7"],
+  ["L_8", "L8"],
+  ["L_9", "L9"],
+];
+
+const geometrySignFields = [
+  ["s4", "s4"],
+  ["s6", "s6"],
+  ["s8", "s8"],
 ];
 
 const targetDefs = [
@@ -93,6 +105,7 @@ const elements = {
   connectSerialBtn: $("#connectSerialBtn"),
   disconnectBtn: $("#disconnectBtn"),
   homeBtn: $("#homeBtn"),
+  setPoseBtn: $("#setPoseBtn"),
   stopBtn: $("#stopBtn"),
   diagnosticsBtn: $("#diagnosticsBtn"),
   diagnosticsDrawer: $("#diagnosticsDrawer"),
@@ -164,6 +177,8 @@ const elements = {
   visionProfileList: $("#visionProfileList"),
   visionSummary: $("#visionSummary"),
   dhTableEditor: $("#dhTableEditor"),
+  dhTableStatus: $("#dhTableStatus"),
+  geometryPresetEditor: $("#geometryPresetEditor"),
   toolCalibration: $("#toolCalibration"),
   encoderCalibration: $("#encoderCalibration"),
 };
@@ -208,12 +223,21 @@ function isMoveEnabled() {
 }
 
 function linkDefaults() {
-  const links = state.config?.links_mm || {};
+  const links = state.linkDraft;
+  if (links) {
+    return {
+      l1: links.base_height || 0,
+      l2: links.upper_arm || 0,
+      l3: links.forearm || 0,
+      l4: (links.wrist || 0) + (links.tool || 0),
+    };
+  }
+  const configLinks = state.config?.links_mm || {};
   return {
-    l1: links.base_height_mm || 0,
-    l2: links.upper_arm_mm || 0,
-    l3: links.forearm_mm || 0,
-    l4: (links.wrist_mm || 0) + (links.tool_mm || 0),
+    l1: configLinks.base_height_mm ?? configLinks.base_height ?? 0,
+    l2: configLinks.upper_arm_mm ?? configLinks.upper_arm ?? 0,
+    l3: configLinks.forearm_mm ?? configLinks.forearm ?? 0,
+    l4: (configLinks.wrist_mm ?? configLinks.wrist ?? 0) + (configLinks.tool_mm ?? configLinks.tool ?? 0),
   };
 }
 
@@ -254,21 +278,277 @@ function buildPerJointTuning() {
   });
 }
 
-function buildCalibrationEditors() {
-  const links = state.config.links_mm;
-  const values = {
-    base_height: links.base_height_mm,
-    upper_arm: links.upper_arm_mm,
-    forearm: links.forearm_mm,
-    wrist: links.wrist_mm,
-    tool: links.tool_mm,
-  };
-  elements.linkCalibration.innerHTML = "";
-  linkCalibrationFields.forEach(([key, label]) => {
-    const field = document.createElement("label");
-    field.innerHTML = `${label}<input data-link-key="${key}" type="number" min="0" step="0.1" value="${format(values[key], 1)}" />`;
-    elements.linkCalibration.appendChild(field);
+function clonePlain(value) {
+  return JSON.parse(JSON.stringify(value || {}));
+}
+
+function activeGeometryPreset() {
+  const geometry = state.config?.geometry || {};
+  const presets = geometry.presets || {};
+  const names = Object.keys(presets);
+  const active = geometry.active_preset || names[0] || "matlab_prototype";
+  return { geometry, active, preset: presets[active] || {} };
+}
+
+function buildGeometryPresetEditor() {
+  if (!elements.geometryPresetEditor) return;
+  const { geometry, active, preset } = activeGeometryPreset();
+  const presets = geometry.presets || {};
+  const names = Object.keys(presets).length ? Object.keys(presets) : [active];
+  const dimensions = preset.dimensions_mm || {};
+  const signs = preset.signs || {};
+  const units = preset.units || { length: "mm", angle: "deg" };
+  elements.geometryPresetEditor.innerHTML = `
+    <div class="geometry-header">
+      <label>Preset
+        <select id="geometryPresetSelect">
+          ${names.map((name) => `<option value="${name}" ${name === active ? "selected" : ""}>${presets[name]?.label || name}</option>`).join("")}
+        </select>
+      </label>
+      <div class="geometry-source">
+        <span class="badge">${preset.status || "working_assumption"}</span>
+        <code>${preset.source || "manual"}</code>
+        <code>${units.length || "mm"} / ${units.angle || "deg"}</code>
+      </div>
+    </div>
+    <div class="geometry-grid">
+      ${geometryDimensionFields.map(([key, label]) => `
+        <label>${label}
+          <input data-geometry-dimension="${key}" type="number" min="0" step="0.01" value="${format(dimensions[key], 2)}" />
+        </label>
+      `).join("")}
+    </div>
+    <div class="geometry-sign-grid">
+      ${geometrySignFields.map(([key, label]) => `
+        <label>${label}
+          <select data-geometry-sign="${key}">
+            <option value="1" ${Number(signs[key] ?? 1) === 1 ? "selected" : ""}>+1</option>
+            <option value="-1" ${Number(signs[key] ?? 1) === -1 ? "selected" : ""}>-1</option>
+          </select>
+        </label>
+      `).join("")}
+      <button id="applyGeometryPresetBtn" class="ghost" type="button">Preview Model Draft</button>
+    </div>
+  `;
+}
+
+function readGeometryPayload() {
+  const geometry = clonePlain(state.config?.geometry || {});
+  geometry.presets = geometry.presets || {};
+  const select = $("#geometryPresetSelect");
+  const active = select?.value || geometry.active_preset || Object.keys(geometry.presets)[0] || "matlab_prototype";
+  geometry.active_preset = active;
+  const preset = clonePlain(geometry.presets[active]);
+  preset.label = preset.label || active;
+  preset.status = preset.status || "working_assumption";
+  preset.units = preset.units || { length: "mm", angle: "deg" };
+  preset.dimensions_mm = preset.dimensions_mm || {};
+  document.querySelectorAll("[data-geometry-dimension]").forEach((input) => {
+    preset.dimensions_mm[input.dataset.geometryDimension] = readNumber(input, 0);
   });
+  preset.signs = preset.signs || {};
+  document.querySelectorAll("[data-geometry-sign]").forEach((input) => {
+    preset.signs[input.dataset.geometrySign] = Number(input.value) === -1 ? -1 : 1;
+  });
+  geometry.presets[active] = preset;
+  return geometry;
+}
+
+function dhRowsFromGeometryPreset(preset) {
+  const dimensions = preset.dimensions_mm || {};
+  const signs = preset.signs || {};
+  const limits = preset.joint_limits_deg || {};
+  const length = (name) => Number(dimensions[name] || 0);
+  const sign = (name) => (Number(signs[name] ?? 1) === -1 ? -1 : 1);
+  const limit = (name, side, fallback) => Number(limits[name]?.[side] ?? fallback);
+  return [
+    {
+      joint: 1,
+      theta_offset_deg: 0.0,
+      d_mm: length("L_1") + length("L_3"),
+      a_mm: 0.0,
+      alpha_deg: 90.0,
+      joint_type: "revolute",
+      min_deg: limit("theta1", "min", -180.0),
+      max_deg: limit("theta1", "max", 180.0),
+      zero_offset_deg: 0.0,
+      direction_sign: 1,
+    },
+    {
+      joint: 2,
+      theta_offset_deg: 0.0,
+      d_mm: sign("s4") * length("L_4"),
+      a_mm: length("L_5"),
+      alpha_deg: 0.0,
+      joint_type: "revolute",
+      min_deg: limit("theta2", "min", -90.0),
+      max_deg: limit("theta2", "max", 160.0),
+      zero_offset_deg: 0.0,
+      direction_sign: 1,
+    },
+    {
+      joint: 3,
+      theta_offset_deg: 0.0,
+      d_mm: sign("s6") * length("L_6"),
+      a_mm: length("L_7"),
+      alpha_deg: 0.0,
+      joint_type: "revolute",
+      min_deg: limit("theta3", "min", -160.0),
+      max_deg: limit("theta3", "max", 160.0),
+      zero_offset_deg: 0.0,
+      direction_sign: 1,
+    },
+    {
+      joint: 4,
+      theta_offset_deg: 0.0,
+      d_mm: sign("s8") * length("L_8"),
+      a_mm: length("L_9"),
+      alpha_deg: 0.0,
+      joint_type: "revolute",
+      min_deg: limit("theta4", "min", -180.0),
+      max_deg: limit("theta4", "max", 180.0),
+      zero_offset_deg: 0.0,
+      direction_sign: 1,
+    },
+  ];
+}
+
+function linksFromGeometryPreset(preset) {
+  const dimensions = preset.dimensions_mm || {};
+  return {
+    base_height: Number(dimensions.L_1 || 0) + Number(dimensions.L_3 || 0),
+    upper_arm: Number(dimensions.L_5 || 0),
+    forearm: Number(dimensions.L_7 || 0),
+    wrist: Number(dimensions.L_9 || 0),
+    tool: 0.0,
+  };
+}
+
+function geometryDraft() {
+  const geometry = readGeometryPayload();
+  const preset = geometry.presets?.[geometry.active_preset] || {};
+  const links = linksFromGeometryPreset(preset);
+  const dhRows = dhRowsFromGeometryPreset(preset);
+  return { geometry, preset, links, dhRows };
+}
+
+function readLinkPayload() {
+  return geometryDraft().links;
+}
+
+function readDhRowsFromEditor() {
+  return geometryDraft().dhRows;
+}
+
+function validateDhDraft() {
+  if (!elements.dhTableEditor) return { ok: true, rows: [], errors: [] };
+  const rows = readDhRowsFromEditor();
+  const errors = [];
+  rows.forEach((row, index) => {
+    const rowElement = elements.dhTableEditor.querySelector(`[data-dh-row="${index}"]`);
+    const numericFields = ["theta_offset_deg", "d_mm", "a_mm", "alpha_deg", "min_deg", "max_deg", "zero_offset_deg"];
+    const badNumber = numericFields.some((field) => !Number.isFinite(Number(row[field])));
+    const badRange = Number(row.min_deg) >= Number(row.max_deg);
+    const badDirection = ![-1, 1].includes(Number(row.direction_sign));
+    const bad = badNumber || badRange || badDirection;
+    rowElement?.classList.toggle("invalid", bad);
+    if (badNumber) errors.push(`J${index + 1} has a non-numeric value`);
+    if (badRange) errors.push(`J${index + 1} min must be below max`);
+    if (badDirection) errors.push(`J${index + 1} direction must be +1 or -1`);
+  });
+  if (elements.dhTableStatus) {
+    elements.dhTableStatus.textContent = errors.length
+      ? errors.join("; ")
+      : "Derived model is valid. Save to use it for FK and IK.";
+  }
+  return { ok: errors.length === 0, rows, errors };
+}
+
+function previewDhDraft() {
+  const validation = validateDhDraft();
+  if (!validation.ok) return;
+  const draftConfig = clonePlain(state.config);
+  draftConfig.links_mm = {
+    ...(draftConfig.links_mm || {}),
+    ...readLinkPayload(),
+    dh_rows: validation.rows,
+  };
+  state.view.setConfig(draftConfig);
+  state.view.setAngles(state.robotState?.reported_angles_deg || state.view.angles);
+  if (elements.dhTableStatus) elements.dhTableStatus.textContent = "Model draft is shown in the viewport. Backend FK/IK changes after Save.";
+}
+
+function renderDerivedModelSummary(links, preset = {}) {
+  if (!elements.linkCalibration) return;
+  const dimensions = preset.dimensions_mm || {};
+  const signs = preset.signs || {};
+  const length = (name) => Number(dimensions[name] || 0);
+  const sign = (name) => (Number(signs[name] ?? 1) === -1 ? -1 : 1);
+  elements.linkCalibration.innerHTML = `
+    <div class="log-line"><span>d1</span><code>${format(links.base_height, 2)} mm = L1 + L3</code></div>
+    <div class="log-line"><span>L2</span><code>${format(length("L_2"), 2)} mm recorded, not yet in active DH table</code></div>
+    <div class="log-line"><span>d2 / a2</span><code>${format(sign("s4") * length("L_4"), 2)} mm = s4*L4, ${format(links.upper_arm, 2)} mm = L5</code></div>
+    <div class="log-line"><span>d3 / a3</span><code>${format(sign("s6") * length("L_6"), 2)} mm = s6*L6, ${format(links.forearm, 2)} mm = L7</code></div>
+    <div class="log-line"><span>d4 / a4</span><code>${format(sign("s8") * length("L_8"), 2)} mm = s8*L8, ${format(links.wrist, 2)} mm = L9</code></div>
+  `;
+}
+
+function renderDhRows(rows) {
+  if (!elements.dhTableEditor) return;
+  elements.dhTableEditor.innerHTML = `
+    <div class="dh-table-wrap">
+      <table class="dh-grid dh-grid-readonly">
+        <thead>
+          <tr>
+            <th>Joint</th>
+            <th>Theta offset deg</th>
+            <th>d mm</th>
+            <th>a mm</th>
+            <th>Alpha deg</th>
+            <th>Min deg</th>
+            <th>Max deg</th>
+            <th>Zero deg</th>
+            <th>Dir</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((row, index) => `
+            <tr data-dh-row="${index}">
+              <td><strong>J${index + 1}</strong></td>
+              <td><code>${format(row.theta_offset_deg, 2)}</code></td>
+              <td><code>${format(row.d_mm, 2)}</code></td>
+              <td><code>${format(row.a_mm, 2)}</code></td>
+              <td><code>${format(row.alpha_deg, 2)}</code></td>
+              <td><code>${format(row.min_deg, 1)}</code></td>
+              <td><code>${format(row.max_deg, 1)}</code></td>
+              <td><code>${format(row.zero_offset_deg, 2)}</code></td>
+              <td><code>${Number(row.direction_sign) === -1 ? "-1" : "+1"}</code></td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function refreshDerivedModelDraft() {
+  const draft = geometryDraft();
+  state.linkDraft = draft.links;
+  state.dhDraftRows = draft.dhRows;
+  renderDerivedModelSummary(draft.links, draft.preset);
+  renderDhRows(draft.dhRows);
+  return validateDhDraft();
+}
+
+function applyGeometryPresetToDhDraft() {
+  const validation = refreshDerivedModelDraft();
+  if (validation.ok) previewDhDraft();
+  if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry model draft is previewed. Save to persist.";
+}
+
+function buildCalibrationEditors() {
+  buildGeometryPresetEditor();
+  refreshDerivedModelDraft();
 
   elements.jointCalibration.innerHTML = "";
   state.config.joints.forEach((joint, index) => {
@@ -289,31 +569,6 @@ function buildCalibrationEditors() {
     `;
     elements.jointCalibration.appendChild(row);
   });
-
-  if (elements.dhTableEditor) {
-    elements.dhTableEditor.innerHTML = "";
-    (state.config.kinematics?.dh_rows || []).forEach((row, index) => {
-      const item = document.createElement("div");
-      item.className = "dh-row";
-      item.innerHTML = `
-        <strong>J${index + 1}</strong>
-        <label>Theta offset <input data-dh-index="${index}" data-dh-field="theta_offset_deg" type="number" step="0.1" value="${format(row.theta_offset_deg, 1)}" /></label>
-        <label>d mm <input data-dh-index="${index}" data-dh-field="d_mm" type="number" step="0.1" value="${format(row.d_mm, 1)}" /></label>
-        <label>a mm <input data-dh-index="${index}" data-dh-field="a_mm" type="number" step="0.1" value="${format(row.a_mm, 1)}" /></label>
-        <label>alpha <input data-dh-index="${index}" data-dh-field="alpha_deg" type="number" step="0.1" value="${format(row.alpha_deg, 1)}" /></label>
-        <label>Min <input data-dh-index="${index}" data-dh-field="min_deg" type="number" step="0.1" value="${format(row.min_deg ?? state.config.joints[index]?.min_deg ?? -180, 1)}" /></label>
-        <label>Max <input data-dh-index="${index}" data-dh-field="max_deg" type="number" step="0.1" value="${format(row.max_deg ?? state.config.joints[index]?.max_deg ?? 180, 1)}" /></label>
-        <label>Zero <input data-dh-index="${index}" data-dh-field="zero_offset_deg" type="number" step="0.1" value="${format(row.zero_offset_deg ?? 0, 1)}" /></label>
-        <label>Dir
-          <select data-dh-index="${index}" data-dh-field="direction_sign">
-            <option value="1" ${(row.direction_sign ?? 1) === 1 ? "selected" : ""}>+1</option>
-            <option value="-1" ${(row.direction_sign ?? 1) === -1 ? "selected" : ""}>-1</option>
-          </select>
-        </label>
-      `;
-      elements.dhTableEditor.appendChild(item);
-    });
-  }
 
   if (elements.toolCalibration) {
     const tools = state.config.tools || {};
@@ -908,6 +1163,30 @@ function liveRealEnabled() {
   return Boolean(elements.liveRealToggle.checked && state.robotState?.live_motion_enabled);
 }
 
+async function setCurrentPoseKnown() {
+  const angles = (
+    state.draftAngles ||
+    state.robotState?.target_angles_deg ||
+    state.robotState?.reported_angles_deg ||
+    state.config?.joints?.map((joint) => joint.home_deg) ||
+    []
+  ).map(Number);
+  if (angles.length !== 4 || angles.some((angle) => !Number.isFinite(angle))) {
+    showLocalError("Cannot set pose: joint angles are incomplete.");
+    return;
+  }
+  elements.statusPill.textContent = "Setting known pose...";
+  const payload = await postJson("/api/hardware/setpose", { angles_deg: angles });
+  if (payload.state) renderState(payload.state);
+  if (payload.ok) {
+    state.draftAngles = null;
+    state.commandedAngles = null;
+    state.pendingAngles = null;
+    clearViewPreview();
+    elements.statusPill.textContent = "Pose marked known.";
+  }
+}
+
 function updateDisabledState() {
   const enabled = isMoveEnabled();
   elements.jointControls.querySelectorAll("input").forEach((input) => {
@@ -916,6 +1195,7 @@ function updateDisabledState() {
   elements.applyJointPreviewBtn.disabled = !enabled || !state.draftAngles;
   elements.resetJointPreviewBtn.disabled = !state.draftAngles && !state.commandedAngles;
   elements.homeBtn.disabled = !enabled;
+  elements.setPoseBtn.disabled = !state.robotState || (!state.robotState.connected && !state.robotState.simulation);
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
   elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
@@ -1221,12 +1501,7 @@ function readHardwarePatch(index, actuator) {
 }
 
 function readCalibrationPayload() {
-  const links = Object.fromEntries(
-    [...elements.linkCalibration.querySelectorAll("[data-link-key]")].map((input) => [
-      input.dataset.linkKey,
-      readNumber(input, 0),
-    ]),
-  );
+  const links = readLinkPayload();
   const joints = state.config.joints.map((joint, index) => {
     const minInput = $(`[data-joint-index="${index}"][data-calib-limit="min"]`);
     const maxInput = $(`[data-joint-index="${index}"][data-calib-limit="max"]`);
@@ -1245,19 +1520,15 @@ function readCalibrationPayload() {
     patch.max_accel_deg_s2 = readNumber($(`.joint-accel-limit[data-index="${index}"]`), joint.max_accel_deg_s2);
     return patch;
   });
-  const dhRows = (state.config.kinematics?.dh_rows || []).map((row, index) => {
-    const patch = { joint: index + 1, joint_type: row.joint_type || "revolute" };
-    document.querySelectorAll(`[data-dh-index="${index}"][data-dh-field]`).forEach((input) => {
-      patch[input.dataset.dhField] = readNumber(input, row[input.dataset.dhField] || 0);
-    });
-    return patch;
-  });
+  const dhValidation = validateDhDraft();
+  if (!dhValidation.ok) return null;
   return {
     links_mm: links,
     kinematics: {
       ...(state.config.kinematics || {}),
-      dh_rows: dhRows,
+      dh_rows: dhValidation.rows,
     },
+    geometry: readGeometryPayload(),
     joints,
     motion: {
       command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
@@ -1269,7 +1540,12 @@ function readCalibrationPayload() {
 async function saveCalibration(options = {}) {
   const showStatus = options.showStatus !== false;
   if (showStatus) elements.calibrationStatus.textContent = "Saving calibration...";
-  const payload = await postJson("/api/config/calibration", readCalibrationPayload());
+  const calibrationPayload = readCalibrationPayload();
+  if (!calibrationPayload) {
+    if (showStatus) elements.calibrationStatus.textContent = "Fix invalid DH values before saving.";
+    return { ok: false, error: "invalid DH draft" };
+  }
+  const payload = await postJson("/api/config/calibration", calibrationPayload);
   if (payload.ok) {
     state.hardwareDraftDirty = false;
     applyConfig(payload.config);
@@ -1288,6 +1564,8 @@ async function saveCalibration(options = {}) {
 
 function applyConfig(config) {
   state.config = config;
+  state.linkDraft = null;
+  state.dhDraftRows = null;
   state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
   elements.commandRate.textContent = `${format(state.config.motion.command_rate_limit_hz, 0)} Hz command limit`;
@@ -1540,6 +1818,7 @@ function bindActions() {
   elements.connectSelectedSerialBtn.addEventListener("click", connectSelectedSerial);
   elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
   elements.homeBtn.addEventListener("click", () => postJson("/api/home"));
+  elements.setPoseBtn.addEventListener("click", setCurrentPoseKnown);
   elements.stopBtn.addEventListener("click", () => postJson("/api/stop"));
   elements.diagnosticsBtn.addEventListener("click", async () => {
     elements.diagnosticsDrawer.hidden = false;
@@ -1551,6 +1830,22 @@ function bindActions() {
   elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
   elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
   elements.hardwareIo.addEventListener("change", markHardwareDraftDirty);
+  elements.geometryPresetEditor?.addEventListener("input", () => {
+    refreshDerivedModelDraft();
+    if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry draft updated. Save to persist.";
+  });
+  elements.geometryPresetEditor?.addEventListener("change", (event) => {
+    if (event.target?.id === "geometryPresetSelect") {
+      state.linkDraft = null;
+      state.dhDraftRows = null;
+      buildGeometryPresetEditor();
+    }
+    refreshDerivedModelDraft();
+    if (elements.calibrationStatus) elements.calibrationStatus.textContent = "Geometry draft updated. Save to persist.";
+  });
+  elements.geometryPresetEditor?.addEventListener("click", (event) => {
+    if (event.target?.id === "applyGeometryPresetBtn") applyGeometryPresetToDhDraft();
+  });
   elements.syncHardwareBtn.addEventListener("click", async () => {
     elements.calibrationStatus.textContent = "Saving Hardware IO draft...";
     const savePayload = await saveCalibration({ showStatus: false, clearPreview: false });

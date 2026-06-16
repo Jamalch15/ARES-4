@@ -44,7 +44,7 @@ class RobotState:
     tool_type: str = "servo_gripper"
     tool_state: str = "unknown"
     tool_value: float | None = None
-    fk: dict[str, float] = field(default_factory=dict)
+    fk: dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time)
 
     def to_dict(self) -> dict[str, Any]:

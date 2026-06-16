@@ -193,15 +193,6 @@
                   <div id="sliderRangeControls" class="form-grid ranges"></div>
                 </section>
 
-                <section class="panel-section">
-                  <div class="section-header">
-                    <div>
-                      <h2>Standard DH Table</h2>
-                      <p class="hint">theta offset, d, a, alpha</p>
-                    </div>
-                  </div>
-                  <div id="dhTableEditor" class="dh-table"></div>
-                </section>
               </section>
 
               <section id="programTab" class="app-tab">
@@ -249,8 +240,12 @@
                     </div>
                     <button id="saveCalibrationBtn" class="primary" type="button">Save</button>
                   </div>
-                  <h3>Links</h3>
-                  <div id="linkCalibration" class="form-grid links"></div>
+                  <h3>Measured Geometry</h3>
+                  <div id="geometryPresetEditor" class="geometry-preset"></div>
+                  <h3>Derived Model</h3>
+                  <div id="linkCalibration" class="path-summary"></div>
+                  <div id="dhTableEditor" class="dh-table"></div>
+                  <p id="dhTableStatus" class="hint">DH rows are derived from measured geometry. Save to use the draft model for FK and IK.</p>
                   <h3>Tool Dimensions</h3>
                   <div id="toolCalibration" class="path-summary"></div>
                   <h3>Motion Defaults</h3>
@@ -373,6 +368,7 @@
             <button id="connectSerialBtn" type="button">Serial</button>
             <button id="disconnectBtn" type="button">Disconnect</button>
             <button id="homeBtn" type="button">Home</button>
+            <button id="setPoseBtn" type="button" class="ghost" title="Mark the current slider pose as the known hardware pose while disarmed">Set Pose</button>
             <button id="stopBtn" type="button" class="warn">Stop</button>
             <button id="diagnosticsBtn" type="button" class="ghost">Diagnostics</button>
             <label class="arm-toggle">

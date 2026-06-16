@@ -15,7 +15,12 @@ Standard DH kinematics with the project robot frame mapped from the DH frame:
 - Robot coordinates are mapped as robot x = DH y, robot y = -DH x, robot z = DH z.
 - At base/theta1 = 0 deg, positive planar reach points along global +Y.
 - +Z points upward from the mounting plane.
-- tool_phi_deg remains the task-space pitch angle used by the UI and planner.
+- Working assumption for the measured L convention: d1=L1+L3, d2=s4*L4,
+  a2=L5, d3=s6*L6, a3=L7, d4=s8*L8, a4=L9. L2 is recorded but is
+  not yet part of the active DH table.
+- tool_phi_deg is the first-pass pitch task angle theta2 + theta3 + theta4 after direction and zero offsets.
+- The active tool TCP offset is applied after the final DH joint transform.
+- Tool TCP +Z is treated as the tool-forward axis, which maps to local DH +X.
 """.strip()
 
 
@@ -48,25 +53,73 @@ def _signed_angle_error_deg(target: float, actual: float) -> float:
 
 
 def _dh_matrix(theta_deg: float, d_mm: float, a_mm: float, alpha_deg: float) -> np.ndarray:
+    return (
+        _rotation_z(theta_deg)
+        @ _translation(0.0, 0.0, d_mm)
+        @ _translation(a_mm, 0.0, 0.0)
+        @ _rotation_x(alpha_deg)
+    )
+
+
+def _rotation_z(theta_deg: float) -> np.ndarray:
     theta = radians(theta_deg)
-    alpha = radians(alpha_deg)
     ct = cos(theta)
     st = sin(theta)
-    ca = cos(alpha)
-    sa = sin(alpha)
     return np.array(
         [
-            [ct, -st * ca, st * sa, a_mm * ct],
-            [st, ct * ca, -ct * sa, a_mm * st],
-            [0.0, sa, ca, d_mm],
+            [ct, -st, 0.0, 0.0],
+            [st, ct, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
         dtype=float,
     )
 
 
+def _rotation_x(alpha_deg: float) -> np.ndarray:
+    alpha = radians(alpha_deg)
+    ca = cos(alpha)
+    sa = sin(alpha)
+    return np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, ca, -sa, 0.0],
+            [0.0, sa, ca, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
+def _translation(x_mm: float, y_mm: float, z_mm: float) -> np.ndarray:
+    transform = np.identity(4)
+    transform[0, 3] = x_mm
+    transform[1, 3] = y_mm
+    transform[2, 3] = z_mm
+    return transform
+
+
+def _dh_step(
+    transform: np.ndarray,
+    theta_deg: float,
+    d_mm: float,
+    a_mm: float,
+    alpha_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    after_theta = transform @ _rotation_z(theta_deg)
+    after_d = after_theta @ _translation(0.0, 0.0, d_mm)
+    after_a = after_d @ _translation(a_mm, 0.0, 0.0)
+    final = after_a @ _rotation_x(alpha_deg)
+    return final, after_d, after_a
+
+
 def _robot_point_from_dh(vector: np.ndarray) -> dict[str, float]:
     return {"x_mm": float(vector[1]), "y_mm": float(-vector[0]), "z_mm": float(vector[2])}
+
+
+def _row_theta(row: DHRowConfig, joint_angles_deg: list[float]) -> float:
+    joint_angle = float(joint_angles_deg[row.joint_index])
+    return joint_angle * row.direction_sign + row.zero_offset_deg + row.theta_offset_deg
 
 
 def dh_transforms(joint_angles_deg: list[float], links: LinkConfig) -> list[np.ndarray]:
@@ -76,9 +129,9 @@ def dh_transforms(joint_angles_deg: list[float], links: LinkConfig) -> list[np.n
     transform = np.identity(4)
     transforms.append(transform.copy())
     for row in _rows(links):
-        joint_angle = float(joint_angles_deg[row.joint_index])
-        transform = transform @ _dh_matrix(
-            joint_angle * row.direction_sign + row.zero_offset_deg + row.theta_offset_deg,
+        transform, _, _ = _dh_step(
+            transform,
+            _row_theta(row, joint_angles_deg),
             row.d_mm,
             row.a_mm,
             row.alpha_deg,
@@ -91,18 +144,105 @@ def joint_frame_points(joint_angles_deg: list[float], links: LinkConfig) -> list
     return [_robot_point_from_dh(transform[:3, 3]) for transform in dh_transforms(joint_angles_deg, links)]
 
 
-def _tool_phi_from_angles(joint_angles_deg: list[float]) -> float:
-    return _normalize_deg(90.0 - sum(joint_angles_deg[1:]))
+def _segment_label(row_index: int, kind: str) -> str:
+    labels = [
+        {"d": "L1+L3", "a": "a1"},
+        {"d": "s4*L4", "a": "L5"},
+        {"d": "s6*L6", "a": "L7"},
+        {"d": "s8*L8", "a": "L9"},
+    ]
+    if row_index < len(labels):
+        return labels[row_index].get(kind, f"{kind}{row_index + 1}")
+    return f"{kind}{row_index + 1}"
+
+
+def dh_segment_points(joint_angles_deg: list[float], links: LinkConfig) -> list[dict[str, Any]]:
+    """Return Standard DH translation segments as separate d and a offsets."""
+    if len(joint_angles_deg) != 4:
+        raise ValueError("DH segment visualization expects four joint angles")
+    transform = np.identity(4)
+    segments: list[dict[str, Any]] = []
+    for row_index, row in enumerate(_rows(links)):
+        final, after_d, after_a = _dh_step(
+            transform,
+            _row_theta(row, joint_angles_deg),
+            row.d_mm,
+            row.a_mm,
+            row.alpha_deg,
+        )
+        start = _robot_point_from_dh(transform[:3, 3])
+        d_end = _robot_point_from_dh(after_d[:3, 3])
+        a_end = _robot_point_from_dh(after_a[:3, 3])
+        if abs(row.d_mm) > 1e-9:
+            segments.append(
+                {
+                    "kind": "d",
+                    "row": row_index + 1,
+                    "joint": row.joint_index + 1,
+                    "label": _segment_label(row_index, "d"),
+                    "signed_length_mm": float(row.d_mm),
+                    "length_mm": abs(float(row.d_mm)),
+                    "start": start,
+                    "end": d_end,
+                }
+            )
+        if abs(row.a_mm) > 1e-9:
+            segments.append(
+                {
+                    "kind": "a",
+                    "row": row_index + 1,
+                    "joint": row.joint_index + 1,
+                    "label": _segment_label(row_index, "a"),
+                    "signed_length_mm": float(row.a_mm),
+                    "length_mm": abs(float(row.a_mm)),
+                    "start": d_end,
+                    "end": a_end,
+                }
+            )
+        transform = final
+    return segments
+
+
+def _tool_phi_from_angles(joint_angles_deg: list[float], links: LinkConfig) -> float:
+    rows = _rows(links)
+    pitch = 0.0
+    for row in rows:
+        if row.joint_index > 0:
+            pitch += float(joint_angles_deg[row.joint_index]) * row.direction_sign + row.zero_offset_deg
+    return _normalize_deg(pitch)
+
+
+def _tool_tcp_offset_vector(links: LinkConfig) -> np.ndarray:
+    offset = links.tool_tcp_offset_mm or {}
+    tool_x = float(offset.get("x", offset.get("x_mm", 0.0)))
+    tool_y = float(offset.get("y", offset.get("y_mm", 0.0)))
+    tool_z = float(offset.get("z", offset.get("z_mm", 0.0)))
+    # The UI/config uses tool +Z as the forward TCP axis. Standard DH link
+    # extension uses local +X, so map tool-frame offsets into the final DH frame.
+    return np.array(
+        [
+            tool_z,
+            tool_x,
+            tool_y,
+            1.0,
+        ],
+        dtype=float,
+    )
 
 
 def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict[str, Any]:
     frames = dh_transforms(joint_angles_deg, links)
-    tcp = _robot_point_from_dh(frames[-1][:3, 3])
-    phi_deg = _tool_phi_from_angles(joint_angles_deg)
+    wrist = _robot_point_from_dh(frames[-1][:3, 3])
+    tcp_vector = frames[-1] @ _tool_tcp_offset_vector(links)
+    tcp = _robot_point_from_dh(tcp_vector[:3])
+    phi_deg = _tool_phi_from_angles(joint_angles_deg, links)
     tcp["radial_mm"] = hypot(tcp["x_mm"], tcp["y_mm"])
     tcp["tool_phi_deg"] = phi_deg
     tcp["tool_pitch_deg"] = phi_deg
     tcp["dh_frames"] = joint_frame_points(joint_angles_deg, links)
+    tcp["dh_segments"] = dh_segment_points(joint_angles_deg, links)
+    tcp["wrist_frame"] = wrist
+    tcp["tool_tcp_offset_mm"] = dict(links.tool_tcp_offset_mm or {})
     return tcp
 
 
