@@ -135,10 +135,10 @@ function addMeasuredBaseSupportSegments(segments, rowIndex, startTransform, afte
   const l3 = Number(dimensions.L_3 || 0);
   const afterL1 = multiply4(afterTheta, translation4(0, 0, l1));
   const afterL2 = multiply4(afterL1, translation4(0, l2, 0));
-  const afterL3 = multiply4(afterTheta, translation4(0, 0, l1 + l3));
+  const afterL3 = multiply4(afterL2, translation4(0, 0, l3));
   addDhSegment(segments, rowIndex, "support", startTransform, afterL1, l1, "L1");
-  addDhSegment(segments, rowIndex, "support", afterL1, afterL3, l3, "L3");
   addDhSegment(segments, rowIndex, "bracket", afterL1, afterL2, l2, "L2");
+  addDhSegment(segments, rowIndex, "support", afterL2, afterL3, l3, "L3");
 }
 
 function addDhSegment(segments, rowIndex, kind, startTransform, endTransform, signedLengthMm, label = null) {

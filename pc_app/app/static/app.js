@@ -487,7 +487,7 @@ function renderDerivedModelSummary(links, preset = {}) {
   const length = (name) => Number(dimensions[name] || 0);
   const sign = (name) => (Number(signs[name] ?? 1) === -1 ? -1 : 1);
   elements.linkCalibration.innerHTML = `
-    <div class="log-line"><span>Base view</span><code>L1 ${format(length("L_1"), 2)} mm, L2 ${format(length("L_2"), 2)} mm, L3 ${format(length("L_3"), 2)} mm</code></div>
+    <div class="log-line"><span>Base view</span><code>L1 ${format(length("L_1"), 2)} mm -> L2 bend ${format(length("L_2"), 2)} mm -> L3 ${format(length("L_3"), 2)} mm</code></div>
     <div class="log-line"><span>d1</span><code>${format(links.base_height, 2)} mm = L1 + L3; L2 is visual support, not active DH</code></div>
     <div class="log-line"><span>d2 / a2</span><code>${format(sign("s4") * length("L_4"), 2)} mm = s4*L4, ${format(links.upper_arm, 2)} mm = L5</code></div>
     <div class="log-line"><span>d3 / a3</span><code>${format(sign("s6") * length("L_6"), 2)} mm = s6*L6, ${format(links.forearm, 2)} mm = L7</code></div>
