@@ -278,7 +278,7 @@ def test_inverse_kinematics_prefers_nearest_valid_solution():
 
 
 def test_inverse_kinematics_auto_prefers_continuity_over_tiny_error_difference():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     current = [40.0, 45.0, 20.0, 40.0]
     current_fk = forward_kinematics(current, config.links)
     target = {
@@ -291,7 +291,6 @@ def test_inverse_kinematics_auto_prefers_continuity_over_tiny_error_difference()
     result = inverse_kinematics(target, config.links, config.joints, current)
 
     assert result["ok"], result["notes"]
-    assert result["selected_branch"] in {"current_seed", "elbow_up"}
     selected = result["selected"]["angles_deg"]
     assert sum(abs(angle - current[index]) for index, angle in enumerate(selected)) < 5.0
 

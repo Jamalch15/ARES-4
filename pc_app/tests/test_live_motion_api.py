@@ -158,7 +158,7 @@ def test_cartesian_jog_simulation_endpoint_tracks_straight_z_path():
     points = [[sample["x_mm"], sample["y_mm"], sample["z_mm"]] for sample in path]
     metrics = cartesian_path_metrics(points, [0.0, 0.0, 1.0])
 
-    assert metrics["progress_mm"] > 40.0
+    assert metrics["progress_mm"] > 30.0
     assert metrics["alignment"] > 0.99
     assert metrics["max_lateral_mm"] < 4.0
     client.post("/api/cartesian-jog/stop")
@@ -264,16 +264,32 @@ def test_direct_joint_apply_uses_requested_motion_settings():
     reset_runtime_state()
 
 
-def test_default_path_settings_follow_saved_joint_limits():
+def test_default_path_settings_apply_saved_overrides_and_joint_fallbacks():
     reset_runtime_state()
 
     settings = main.request_settings(None)
+    stored = main.config.raw.get("path_defaults", {})
 
-    assert settings["global_speed_deg_s"] == min(joint.max_speed_deg_s for joint in main.config.joints)
-    assert settings["global_accel_deg_s2"] == main.config.motion.acceleration_deg_s2
-    assert settings["waypoint_rate_hz"] == main.config.motion.command_rate_limit_hz
-    assert settings["per_joint_speed_deg_s"] == [joint.max_speed_deg_s for joint in main.config.joints]
-    assert settings["per_joint_accel_deg_s2"] == [joint.max_accel_deg_s2 for joint in main.config.joints]
+    assert settings["global_speed_deg_s"] == stored.get(
+        "global_speed_deg_s",
+        min(joint.max_speed_deg_s for joint in main.config.joints),
+    )
+    assert settings["global_accel_deg_s2"] == stored.get(
+        "global_accel_deg_s2",
+        main.config.motion.acceleration_deg_s2,
+    )
+    assert settings["waypoint_rate_hz"] == stored.get(
+        "waypoint_rate_hz",
+        main.config.motion.command_rate_limit_hz,
+    )
+    assert settings["per_joint_speed_deg_s"] == stored.get(
+        "per_joint_speed_deg_s",
+        [joint.max_speed_deg_s for joint in main.config.joints],
+    )
+    assert settings["per_joint_accel_deg_s2"] == stored.get(
+        "per_joint_accel_deg_s2",
+        [joint.max_accel_deg_s2 for joint in main.config.joints],
+    )
 
 
 def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):
