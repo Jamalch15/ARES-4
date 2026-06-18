@@ -45,6 +45,15 @@ ARM 0
 ARM 1
 SETPOSE j1 j2 j3 j4
 MOVEJ j1 j2 j3 j4 speed accel
+JOGJ j1 j2 j3 j4 speed accel
+JOGV v1 v2 v3 v4 accel
+JOG STOP
+TRAJ BEGIN count=3 duration=1.000 speed=25.000 accel=100.000
+TRAJ POINT index=0 t=0.000 j1=0.000 j2=20.000 j3=20.000 j4=0.000
+TRAJ POINT index=1 t=0.500 j1=5.000 j2=25.000 j3=15.000 j4=0.000
+TRAJ POINT index=2 t=1.000 j1=10.000 j2=30.000 j3=10.000 j4=0.000
+TRAJ START
+TRAJ CLEAR
 STOP
 ESTOP
 HOME
@@ -67,12 +76,18 @@ Example:
 MOVEJ 0.0 25.0 -30.0 10.0 25.0 100.0
 ```
 
+`JOGV` is the preferred command for smooth live Cartesian/joint jogging. It streams joint velocities in deg/s, the full-arm controller ramps those velocities with the provided acceleration limit, and the watchdog ramps toward zero if PC updates stop. `JOGJ` remains available as an absolute jog target compatibility command, but it can be jerky for small live updates. Use `JOG STOP` when the operator releases the live jog control.
+
+`TRAJ` uploads a complete timed joint-space path before motion starts. Points must be sent in increasing `index` order, `t` is seconds from the start of the trajectory, the first point must be at `t=0`, and the last point must match the declared duration. The full-arm controller interpolates between uploaded points while the actuator loop runs; this avoids treating every Cartesian waypoint as an independent `MOVEJ`.
+
+Current implementation note: this is still open-loop target/velocity following, not final closed-loop motion control. The controller validates joint limits and clears the queue on `STOP`, `ESTOP`, `HOME`, `SETPOSE`, `MOVEJ`, disarm, and config changes. Low-level stepper pulse generation is still simple and should be validated on hardware.
+
 ## Responses
 
 Controller identity:
 
 ```text
-HELLO name=esp32s3-arm firmware=arm_controller protocol=2 config=1
+HELLO name=esp32s3-arm firmware=arm_controller protocol=3 config=1
 ```
 
 Status:
@@ -97,6 +112,13 @@ Acknowledgement:
 
 ```text
 OK command=MOVEJ
+OK command=JOGJ
+OK command=JOGV
+OK command=JOG_STOP
+OK command=TRAJ_BEGIN count=3 duration=1.000
+OK command=TRAJ_POINT index=0
+OK command=TRAJ_START count=3 duration=1.000
+OK command=TRAJ_CLEAR
 OK command=CONFIG axes=4 hw=mixed enabled=1000
 OK command=ARM armed=1
 OK command=SETPOSE
@@ -140,7 +162,7 @@ fault
 4. Test one physical axis at a time by enabling only that axis in dashboard Settings.
 5. Add homing only after switch availability and safe directions are known.
 6. Add AS5048A encoder feedback as readback/known-pose verification before attempting closed-loop correction.
-7. Add synchronized low-level motion only if PC-streamed waypoints are not good enough.
+7. Refine synchronized low-level motion after hardware tests if the current open-loop trajectory follower is not smooth enough.
 
 ## Safety Requirements For Real Firmware
 

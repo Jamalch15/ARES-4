@@ -6,14 +6,19 @@ from .config import RobotConfig
 from .demo_settings import drop_zones, named_positions, task_defaults, tool_settings
 
 
-def _cartesian_target(raw: dict[str, Any]) -> dict[str, float]:
+def _cartesian_target(raw: dict[str, Any]) -> dict[str, Any]:
     target = raw.get("target") if isinstance(raw.get("target"), dict) else raw
-    return {
+    pose: dict[str, Any] = {
         "x_mm": float(target.get("x_mm", target.get("x", 0.0))),
         "y_mm": float(target.get("y_mm", target.get("y", 0.0))),
         "z_mm": float(target.get("z_mm", target.get("z", 0.0))),
-        "phi_deg": float(target.get("phi_deg", target.get("phi", 0.0))),
     }
+    raw_phi = target.get("phi_deg", target.get("phi"))
+    if bool(target.get("phi_auto", False)) or raw_phi is None:
+        pose["phi_auto"] = True
+    else:
+        pose["phi_deg"] = float(raw_phi)
+    return pose
 
 
 def _safe_waypoint(config: RobotConfig) -> dict[str, Any]:

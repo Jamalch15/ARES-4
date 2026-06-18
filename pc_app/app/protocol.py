@@ -21,6 +21,57 @@ def format_movej(joints_deg: list[float], speed: float, accel: float) -> str:
     return f"MOVEJ {values} {speed:.3f} {accel:.3f}"
 
 
+def format_jogj(joints_deg: list[float], speed: float, accel: float) -> str:
+    if len(joints_deg) != 4:
+        raise ValueError("JOGJ requires exactly four joint angles")
+    if speed <= 0 or accel <= 0:
+        raise ValueError("JOGJ requires positive speed and acceleration")
+    values = " ".join(f"{angle:.3f}" for angle in joints_deg)
+    return f"JOGJ {values} {speed:.3f} {accel:.3f}"
+
+
+def format_jogv(joint_velocity_deg_s: list[float], accel: float) -> str:
+    if len(joint_velocity_deg_s) != 4:
+        raise ValueError("JOGV requires exactly four joint velocities")
+    if accel <= 0:
+        raise ValueError("JOGV requires positive acceleration")
+    values = " ".join(f"{velocity:.3f}" for velocity in joint_velocity_deg_s)
+    return f"JOGV {values} {accel:.3f}"
+
+
+def format_jog_stop() -> str:
+    return "JOG STOP"
+
+
+def format_traj_begin(point_count: int, duration_s: float, speed: float, accel: float) -> str:
+    if point_count < 2:
+        raise ValueError("TRAJ BEGIN requires at least two points")
+    if duration_s <= 0:
+        raise ValueError("TRAJ BEGIN requires a positive duration")
+    if speed <= 0 or accel <= 0:
+        raise ValueError("TRAJ BEGIN requires positive speed and acceleration")
+    return f"TRAJ BEGIN count={point_count} duration={duration_s:.3f} speed={speed:.3f} accel={accel:.3f}"
+
+
+def format_traj_point(index: int, time_s: float, joints_deg: list[float]) -> str:
+    if index < 0:
+        raise ValueError("TRAJ POINT index must be non-negative")
+    if time_s < 0:
+        raise ValueError("TRAJ POINT time must be non-negative")
+    if len(joints_deg) != 4:
+        raise ValueError("TRAJ POINT requires exactly four joint angles")
+    values = " ".join(f"j{joint_index}={angle:.3f}" for joint_index, angle in enumerate(joints_deg, start=1))
+    return f"TRAJ POINT index={index} t={time_s:.3f} {values}"
+
+
+def format_traj_start() -> str:
+    return "TRAJ START"
+
+
+def format_traj_clear() -> str:
+    return "TRAJ CLEAR"
+
+
 def format_stop() -> str:
     return "STOP"
 

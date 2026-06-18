@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from app.config import load_config
-from app.demo_settings import color_profiles, model_validation_warnings, named_positions, validate_named_position
+from app.demo_settings import color_profiles, drop_zones, model_validation_warnings, named_positions, validate_named_position
 from app.tasks import build_pick_and_place_sequence, build_sorting_sequence
 from app.vision import apply_planar_transform, detect_configured_colors, planar_transform_from_points
 
@@ -53,6 +53,22 @@ def test_named_position_validation_accepts_auto_phi_cartesian_target():
     )
 
     assert errors == []
+
+
+def test_drop_zones_preserve_auto_phi_targets():
+    config = load_config()
+    raw = {
+        **config.raw,
+        "drop_zones": {
+            "dropoff_a": {"x_mm": -120.0, "y_mm": 180.0, "z_mm": 45.0, "phi_auto": True},
+        },
+    }
+    patched = replace(config, raw=raw)
+
+    zones = drop_zones(patched)
+
+    assert zones["dropoff_a"]["phi_auto"] is True
+    assert "phi_deg" not in zones["dropoff_a"]
 
 
 def test_model_validation_returns_warning_list():

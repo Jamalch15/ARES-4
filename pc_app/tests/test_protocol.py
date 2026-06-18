@@ -1,12 +1,45 @@
 from app.config import load_config
 from app.demo_settings import tools_settings
-from app.protocol import format_arm, format_config_lines, format_movej, format_setpose, format_tool, parse_status
+from app.protocol import (
+    format_arm,
+    format_config_lines,
+    format_jog_stop,
+    format_jogj,
+    format_jogv,
+    format_movej,
+    format_setpose,
+    format_tool,
+    format_traj_begin,
+    format_traj_clear,
+    format_traj_point,
+    format_traj_start,
+    parse_status,
+)
 
 
 def test_format_movej_line():
     command = format_movej([1.0, 2.0, 3.0, 4.0], speed=25.0, accel=100.0)
 
     assert command == "MOVEJ 1.000 2.000 3.000 4.000 25.000 100.000"
+
+
+def test_format_jog_lines():
+    command = format_jogj([1.0, 2.0, 3.0, 4.0], speed=25.0, accel=100.0)
+
+    assert command == "JOGJ 1.000 2.000 3.000 4.000 25.000 100.000"
+    assert format_jogv([1.0, -2.0, 3.5, 0.0], accel=100.0) == "JOGV 1.000 -2.000 3.500 0.000 100.000"
+    assert format_jog_stop() == "JOG STOP"
+
+
+def test_format_trajectory_lines():
+    assert format_traj_begin(3, duration_s=1.25, speed=25.0, accel=100.0) == (
+        "TRAJ BEGIN count=3 duration=1.250 speed=25.000 accel=100.000"
+    )
+    assert format_traj_point(1, 0.5, [1.0, 2.0, 3.0, 4.0]) == (
+        "TRAJ POINT index=1 t=0.500 j1=1.000 j2=2.000 j3=3.000 j4=4.000"
+    )
+    assert format_traj_start() == "TRAJ START"
+    assert format_traj_clear() == "TRAJ CLEAR"
 
 
 def test_parse_status_line():
