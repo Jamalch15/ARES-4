@@ -7,6 +7,7 @@ from app.protocol import (
     format_jogj,
     format_jogv,
     format_movej,
+    format_servoj,
     format_setpose,
     format_tool,
     format_traj_begin,
@@ -28,6 +29,9 @@ def test_format_jog_lines():
 
     assert command == "JOGJ 1.000 2.000 3.000 4.000 25.000 100.000"
     assert format_jogv([1.0, -2.0, 3.5, 0.0], accel=100.0) == "JOGV 1.000 -2.000 3.500 0.000 100.000"
+    assert format_servoj([1.0, -2.0, 3.5, 0.0], duration_s=1.0 / 30.0) == (
+        "SERVOJ 1.000 -2.000 3.500 0.000 0.0333"
+    )
     assert format_jog_stop() == "JOG STOP"
 
 

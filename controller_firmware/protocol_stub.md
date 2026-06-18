@@ -47,6 +47,7 @@ SETPOSE j1 j2 j3 j4
 MOVEJ j1 j2 j3 j4 speed accel
 JOGJ j1 j2 j3 j4 speed accel
 JOGV v1 v2 v3 v4 accel
+SERVOJ j1 j2 j3 j4 duration_s
 JOG STOP
 TRAJ BEGIN count=3 duration=1.000 speed=25.000 accel=100.000
 TRAJ POINT index=0 t=0.000 j1=0.000 j2=20.000 j3=20.000 j4=0.000
@@ -76,7 +77,7 @@ Example:
 MOVEJ 0.0 25.0 -30.0 10.0 25.0 100.0
 ```
 
-`JOGV` is the preferred command for smooth live Cartesian/joint jogging. It streams joint velocities in deg/s, the full-arm controller ramps those velocities with the provided acceleration limit, and the watchdog ramps toward zero if PC updates stop. `JOGJ` remains available as an absolute jog target compatibility command, but it can be jerky for small live updates. Use `JOG STOP` when the operator releases the live jog control.
+`SERVOJ` is the preferred command for live Cartesian jogging. It gives all four joints one synchronized target and duration for the next short servo period. Cartesian velocity smoothing, direction preservation, singularity scaling, and joint-limit handling happen once on the PC. `JOGJ` and `JOGV` remain compatibility commands. Use `JOG STOP` when the operator releases the live jog control.
 
 `TRAJ` uploads a complete timed joint-space path before motion starts. Points must be sent in increasing `index` order, `t` is seconds from the start of the trajectory, the first point must be at `t=0`, and the last point must match the declared duration. The full-arm controller interpolates between uploaded points while the actuator loop runs; this avoids treating every Cartesian waypoint as an independent `MOVEJ`.
 
@@ -114,6 +115,7 @@ Acknowledgement:
 OK command=MOVEJ
 OK command=JOGJ
 OK command=JOGV
+OK command=SERVOJ
 OK command=JOG_STOP
 OK command=TRAJ_BEGIN count=3 duration=1.000
 OK command=TRAJ_POINT index=0

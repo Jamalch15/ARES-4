@@ -9,7 +9,7 @@ Current scope:
 - Manual Control tab for four rotary joints and active tool controls
 - Standard DH forward kinematics and Jacobian IK sandbox
 - Cartesian target preview with ghost arm, target marker, and path line
-- Task panel with camera/detection placeholders and pick/place or color-sorting preview
+- Task panel with a movable live camera popup, multi-object workspace color detection, and pick/place or color-sorting preview
 - In-memory program sandbox for multi-waypoint experiments
 - Simulation mode by default
 - Serial transport abstraction for later ESP32-S3 control
@@ -18,6 +18,8 @@ Current scope:
 - Safety checks for joint limits, known pose, stop, armed hardware mode, live-motion gating, and rate-limited motion
 - Named-position, task, tool, vision, diagnostics, and encoder-readback APIs for the demo path
 - AprilTag workspace calibration with multi-frame accumulation, camera-pose quality metrics, saved planar fallback, and 3D camera/tag overlays
+- Working inverted `DICT_4X4_50` ArUco homography integration from `vision_robot_project.zip`
+- Detector-neutral vision contract plus `/api/vision/project` for future YOLO/AI detections
 
 Not included in this iteration:
 
@@ -111,6 +113,17 @@ python -m pip install -r requirements.txt
 ## User Guide
 
 The dashboard is a sandbox for testing the arm model and motion behavior before trusting real hardware.
+
+The bottom-left build indicator verifies the running localhost instance every
+15 seconds:
+
+- `Current checkout <commit>` means the browser tab, backend process, local
+  files, local Git HEAD, and `origin/main` match.
+- `Browser outdated` means click the indicator to reload the tab.
+- `Server outdated` means source/config files changed after Uvicorn started;
+  stop and restart the localhost server.
+- `Code outdated` means this checkout is behind or different from
+  `origin/main`; pull the repository, then restart localhost.
 
 ### Layout
 
@@ -334,6 +347,7 @@ SETPOSE j1 j2 j3 j4
 MOVEJ j1 j2 j3 j4 speed accel
 JOGJ j1 j2 j3 j4 speed accel
 JOGV v1 v2 v3 v4 accel
+SERVOJ j1 j2 j3 j4 duration_s
 JOG STOP
 TRAJ BEGIN count=N duration=seconds speed=deg_per_s accel=deg_per_s2
 TRAJ POINT index=i t=seconds j1=deg j2=deg j3=deg j4=deg
@@ -357,7 +371,7 @@ Optional/newer status fields include `known=0|1`, `pose_source=<manual|setpose|e
 `e2=<deg>`, `closed_loop=<off|readback|settle_correction>`, `tool_type=<generic|servo_gripper|electromagnet>`,
 `tool=<open|closed|on|off|moving|unknown>`, and `tool_value=<0.000..1.000>`.
 
-Working assumption: the PC remains the planner. Single endpoint moves use `MOVEJ`; multi-waypoint Cartesian/program paths upload a timed `TRAJ` queue; live Cartesian jog converts each current fader velocity sample into a small local differential-IK step and streams the resulting joint velocity with `JOGV`, followed by `JOG STOP` on release. Preview-only IK target editing does not send motion. `JOGJ` remains available as an absolute jog target compatibility command. This is still open-loop target/velocity following, not final closed-loop motion control.
+Working assumption: the PC remains the planner. Single endpoint moves use `MOVEJ`; multi-waypoint Cartesian/program paths upload a timed `TRAJ` queue. Live Cartesian jog runs one fixed-rate PC servo loop: it ramps TCP velocity, solves a direction-preserving bounded differential IK problem, and streams synchronized short-duration joint position segments with `SERVOJ`, followed by `JOG STOP` on release. The firmware does not apply a second independent joint-velocity ramp to these segments. Preview-only IK target editing does not send motion. `JOGJ` and `JOGV` remain compatibility commands. This is still open-loop target following for axes without encoders, not final measured closed-loop Cartesian control.
 
 ## Bluetooth Notes
 

@@ -3,9 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="app-build-id" content="__APP_BUILD_ID__" />
     <title>Modular 4DOF Arm Control</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=20260618-settings-revamp-3" />
+    <link rel="stylesheet" href="/static/styles.css?v=__APP_BUILD_ID__" />
     <script type="importmap">
       {
         "imports": {
@@ -24,6 +25,10 @@
               <div class="panel-brand">
                 <span class="panel-brand-title">Modular 4DOF</span>
                 <span class="panel-brand-sub">Real arm sandbox</span>
+                <button id="buildStatus" class="build-status" type="button" title="Check whether localhost and this browser tab are running the newest files">
+                  <span class="build-status-dot"></span>
+                  <span id="buildStatusText">Checking build...</span>
+                </button>
               </div>
               <div class="status-strip">
                 <span id="connectionBadge" class="badge">Disconnected</span>
@@ -125,13 +130,12 @@
                   <div class="section-header">
                     <div>
                       <h2>Camera</h2>
-                      <p class="hint">Live annotated overhead view</p>
+                      <p class="hint">Refresh color detection and read detected-object coordinates.</p>
                     </div>
-                    <button id="detectVisionBtn" type="button">Refresh</button>
                   </div>
-                  <div class="camera-frame">
-                    <img id="cameraFrame" alt="Annotated camera frame" />
-                    <div id="cameraPlaceholder">No camera frame yet</div>
+                  <div class="button-row action-row">
+                    <button id="viewCameraBtn" class="primary" type="button">View Camera</button>
+                    <button id="detectVisionBtn" type="button">Refresh Detections</button>
                   </div>
                   <div id="visionProfileList" class="path-summary"></div>
                   <div id="visionSummary" class="path-summary"></div>
@@ -356,18 +360,38 @@
                   <div class="section-header">
                     <div>
                       <h2>Camera and workspace calibration</h2>
-                      <p class="hint">Logitech C270 at 1280×720. AprilTag 36h11 IDs 0–3 define workspace Z=0.</p>
+                      <p class="hint">Camera source, intrinsics, and table-tag calibration only. Object color detection lives in Tasks.</p>
                     </div>
                     <span id="aprilTagStatus" class="status-chip">Uncalibrated</span>
                   </div>
                   <div class="subsection-heading">
                     <h3>Camera model</h3>
-                    <p class="hint">Image size and pinhole intrinsics. The current C270 values are an estimated starting point.</p>
+                    <p class="hint">Image size for the planar workspace. Pinhole intrinsics are only needed for optional 3D pose.</p>
                   </div>
                   <div class="control-grid camera-intrinsics-grid">
+                    <label class="toggle-label compact-toggle">
+                      <input id="cameraEnabledInput" type="checkbox" />
+                      <span class="toggle-text">Camera enabled</span>
+                    </label>
                     <label>Camera index <input id="cameraSourceInput" type="number" min="0" step="1" /></label>
                     <label>Image width <input id="cameraWidthInput" type="number" min="1" step="1" /></label>
                     <label>Image height <input id="cameraHeightInput" type="number" min="1" step="1" /></label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="workspaceProjectionInput" type="checkbox" />
+                      <span class="toggle-text">Project live camera on workspace</span>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="workspaceArucoEnabledInput" type="checkbox" />
+                      <span class="toggle-text">Use 4x4 ArUco workspace</span>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="workspaceArucoInvertInput" type="checkbox" />
+                      <span class="toggle-text">Try inverted image first</span>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="workspaceArucoFallbackInput" type="checkbox" />
+                      <span class="toggle-text">Allow normal-image fallback</span>
+                    </label>
                     <label>Horizontal focal length (fx) <input id="cameraFxInput" type="number" min="0.01" step="0.01" /></label>
                     <label>Vertical focal length (fy) <input id="cameraFyInput" type="number" min="0.01" step="0.01" /></label>
                     <label>Principal point X (cx) <input id="cameraCxInput" type="number" step="0.01" /></label>
@@ -380,14 +404,14 @@
                     <button id="saveCameraIntrinsicsBtn" type="button">Save camera settings</button>
                   </div>
                   <div class="subsection-heading">
-                    <h3>AprilTag pose calibration</h3>
-                    <p class="hint">Collect stable frames, save the solved camera pose, then verify it against a fresh image.</p>
+                    <h3>Tag workspace calibration</h3>
+                    <p class="hint">Collect stable tag frames, save planar workspace calibration, then verify it against a fresh image.</p>
                   </div>
                   <div class="button-row calibration-actions">
                     <button id="resetAprilTagBtn" type="button" class="ghost">Reset Samples</button>
                     <button id="captureAprilTagBtn" type="button">Capture</button>
                     <button id="collectAprilTagBtn" type="button" class="primary">Collect 12</button>
-                    <button id="saveAprilTagBtn" type="button">Save Pose</button>
+                    <button id="saveAprilTagBtn" type="button">Save Calibration</button>
                     <button id="verifyAprilTagBtn" type="button">Verify</button>
                   </div>
                   <div class="camera-frame april-tag-frame">
@@ -427,6 +451,29 @@
 
         <section class="main-panel" aria-label="Robot viewport">
           <div id="robotViewport" class="viewport"></div>
+
+          <section id="cameraPopup" class="camera-popup" aria-label="Live camera" hidden>
+            <div id="cameraPopupHandle" class="camera-popup-header">
+              <div>
+                <strong>Workspace Camera</strong>
+                <span id="cameraPopupStatus">Stopped</span>
+              </div>
+              <div class="button-row camera-popup-actions">
+                <label class="live-toggle">
+                  <input id="cameraLiveToggle" type="checkbox" />
+                  <span>Live</span>
+                </label>
+                <button id="cameraPopupRefreshBtn" class="ghost" type="button">Refresh</button>
+                <button id="closeCameraPopupBtn" class="ghost" type="button">Close</button>
+              </div>
+            </div>
+            <div class="camera-popup-body">
+              <div class="camera-frame">
+                <img id="cameraFrame" alt="Annotated camera frame" />
+                <div id="cameraPlaceholder">No camera frame yet</div>
+              </div>
+            </div>
+          </section>
 
           <section class="scene-hud" id="sceneHud" aria-label="End effector HUD">
             <div class="scene-hud-header">
@@ -560,6 +607,6 @@
       </aside>
     </main>
 
-    <script type="module" src="/static/app.js?v=20260618-settings-revamp-3"></script>
+    <script type="module" src="/static/app.js?v=__APP_BUILD_ID__"></script>
   </body>
 </html>

@@ -282,6 +282,50 @@ def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict
     return tcp
 
 
+def geometric_task_jacobian(joint_angles_deg: list[float], links: LinkConfig) -> np.ndarray:
+    """Return the TCP task Jacobian in project units.
+
+    Rows are robot-frame ``[x_mm, y_mm, z_mm, tool_phi_deg]`` and columns are
+    joint velocities in degrees. The position rows therefore use mm/deg and
+    the tool-angle row uses deg/deg.
+
+    This is kept separate from the endpoint IK's numeric Jacobian so the
+    already validated endpoint solver can remain unchanged while live servoing
+    gets a deterministic DH-frame geometric Jacobian.
+    """
+    if len(joint_angles_deg) != 4:
+        raise ValueError("task Jacobian expects four joint angles")
+
+    rows = _rows(links)
+    frames = dh_transforms(joint_angles_deg, links)
+    tcp_dh = frames[-1] @ _tool_tcp_offset_vector(links)
+    tcp_origin = tcp_dh[:3]
+    # Differential vector mapping for robot x = DH y, robot y = -DH x.
+    dh_to_robot = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    jacobian = np.zeros((4, len(joint_angles_deg)), dtype=float)
+    radians_per_degree = np.pi / 180.0
+
+    for row_index, row in enumerate(rows):
+        joint_index = row.joint_index
+        frame_before_joint = frames[row_index]
+        axis_dh = frame_before_joint[:3, 2]
+        origin_dh = frame_before_joint[:3, 3]
+        linear_dh_per_rad = np.cross(axis_dh, tcp_origin - origin_dh)
+        jacobian[:3, joint_index] += (
+            dh_to_robot @ linear_dh_per_rad
+        ) * radians_per_degree * row.direction_sign
+        if joint_index > 0:
+            jacobian[3, joint_index] += row.direction_sign
+    return jacobian
+
+
 def _joint_limit_reasons(joints: list[JointConfig], angles_deg: list[float]) -> list[str]:
     reasons: list[str] = []
     for joint, angle in zip(joints, angles_deg, strict=True):

@@ -237,14 +237,30 @@ named_positions:
       phi_deg: 0.0
 
 camera:
-  enabled: false
-  source_index: 0
+  # Working setup imported from vision_robot_project.zip. Recalibrate if the
+  # camera, resolution, zoom, or work plate moves.
+  enabled: true
+  source_index: 1
   resolution:
-    width: 1280
-    height: 720
-  # Full 6-DoF AprilTag camera pose requires measured camera intrinsics.
-  # Keep source=uncalibrated until these values come from a checkerboard or
-  # the camera manufacturer's calibrated model.
+    width: 640
+    height: 480
+  detection:
+    provider: workspace_color
+    workspace_only: true
+    show_unconfigured_colors: true
+    min_object_area_px: 400
+    min_saturation: 60
+    min_value: 50
+    morph_kernel_px: 5
+    live_interval_ms: 450
+  display:
+    # When enabled, the dashboard warps each live camera frame through the
+    # saved/live workspace homography and draws it over the robot workspace.
+    project_live_view: false
+    projection_opacity: 0.72
+  # Planar workspace calibration does not require camera intrinsics. Full
+  # 6-DoF AprilTag camera pose still requires measured intrinsics from a
+  # checkerboard/ChArUco pass or the camera manufacturer's calibrated model.
   intrinsics:
     source: uncalibrated
     fx_px:
@@ -256,9 +272,50 @@ camera:
     # Legacy four-point homography fallback.
     image_points: []
     robot_points: []
+    # Current working 2D setup from vision_robot_project.zip. The inverted
+    # DICT_4X4_50 tags provide both a workspace mask and a pixel-to-robot
+    # homography. The saved pixel references are valid only at 640x480 with
+    # the same fixed camera/work-plate geometry.
+    workspace_aruco:
+      enabled: true
+      dictionary: DICT_4X4_50
+      dictionary_candidates: [DICT_4X4_50, DICT_APRILTAG_36H11]
+      required_ids: [0, 1, 2, 3]
+      invert_first: true
+      allow_normal_fallback: true
+      tag_centers_robot_mm:
+        "0": [111.5, -218.5]
+        "1": [111.5, 218.5]
+        "2": [383.5, -218.5]
+        "3": [383.5, 218.5]
+      # OpenCV corner order: top-left, top-right, bottom-right, bottom-left.
+      tag_box_corner_index:
+        "0": 2
+        "1": 3
+        "2": 0
+        "3": 1
+      reference_points_px:
+        "0": [99.0, 88.75]
+        "1": [545.25, 94.0]
+        "2": [96.0, 367.0]
+        "3": [541.75, 374.0]
+      reference_resolution: {width: 640, height: 480}
+      # Working assumption derived from the inner corners of 40 mm tags.
+      workspace_polygon_robot_mm:
+        - [131.5, -198.5]
+        - [131.5, 198.5]
+        - [363.5, 198.5]
+        - [363.5, -198.5]
+      projection_pixels_per_mm: 2.0
+      projection_alpha: 220
+    # Optional higher-accuracy 6-DoF path. It remains independent from the
+    # working ArUco homography and requires real camera intrinsics.
     apriltag:
       enabled: true
       dictionary: DICT_APRILTAG_36H11
+      dictionary_candidates: [DICT_APRILTAG_36H11]
+      invert_first: false
+      allow_normal_fallback: true
       tag_size_mm: 40.0
       required_ids: [0, 1, 2, 3]
       min_tags_for_pose: 2
@@ -313,6 +370,10 @@ task_defaults:
 path_defaults:
   global_speed_deg_s: 25.0
   global_accel_deg_s2: 120.0
+  # Live Cartesian servo acceleration. These are working assumptions and
+  # should be reduced for first physical tests if the arm feels abrupt.
+  tcp_accel_mm_s2: 360.0
+  phi_accel_deg_s2: 240.0
   waypoint_rate_hz: 12.0
   cartesian_step_mm: 10.0
   planner_type: s_curve

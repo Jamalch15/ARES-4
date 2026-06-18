@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -94,6 +95,23 @@ def test_detect_apriltags_finds_generated_dictionary_markers():
     detections = detect_apriltags(image, settings)
 
     assert sorted(detection.tag_id for detection in detections) == [0, 1, 2, 3]
+
+
+def test_detect_apriltags_handles_inverted_marker_images():
+    camera = calibrated_camera()
+    settings = {
+        **april_tag_settings(camera),
+        "invert_first": True,
+        "allow_normal_fallback": False,
+    }
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+    marker = cv2.aruco.generateImageMarker(dictionary, 0, 180)
+    image = np.full((320, 320, 3), 0, dtype=np.uint8)
+    image[70:250, 70:250] = cv2.cvtColor(255 - marker, cv2.COLOR_GRAY2BGR)
+
+    detections = detect_apriltags(image, settings)
+
+    assert [detection.tag_id for detection in detections] == [0]
 
 
 def test_camera_pose_recovers_synthetic_overhead_camera():
@@ -262,6 +280,45 @@ def test_apriltag_capture_api_accumulates_synthetic_frames():
         status = client.get("/api/vision/apriltag/status").json()
         assert status["ok"]
         assert status["session"]["tag_ids"] == [0, 1, 2, 3]
+    finally:
+        main.config = original_config
+        main.april_tag_session.configure(camera_settings(original_config), preserve_frames=False)
+
+
+def test_apriltag_save_accepts_planar_calibration_without_intrinsics(tmp_path, monkeypatch):
+    original_config = main.config
+    temp_config = tmp_path / "robot.local.yaml"
+    shutil.copyfile(original_config.source_path, temp_config)
+    monkeypatch.setattr(main, "ensure_local_config", lambda: temp_config)
+    monkeypatch.setattr(main, "reload_runtime_config", lambda: None)
+    camera = calibrated_camera()
+    camera["intrinsics"] = {
+        "source": "uncalibrated_workspace_homography",
+        "fx_px": None,
+        "fy_px": None,
+        "cx_px": None,
+        "cy_px": None,
+        "camera_matrix": None,
+        "distortion_coefficients": [0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    main.config = replace(original_config, raw={**original_config.raw, "camera": camera})
+    main.april_tag_session.configure(camera, preserve_frames=False)
+    client = TestClient(main.app)
+    image_b64 = encode_image_b64(synthetic_tag_image(camera), ".png")
+    try:
+        for _ in range(12):
+            response = client.post(
+                "/api/vision/apriltag/capture",
+                json={"image_b64": image_b64, "sample_count": 1, "accumulate": True},
+            )
+            assert response.json()["ok"]
+
+        payload = client.post("/api/vision/apriltag/save", json={"require_all_tags": True}).json()
+
+        assert payload["ok"]
+        assert payload["result"]["accepted"] is False
+        assert payload["result"]["planar"]["ok"]
+        assert payload["result"]["saved_projection"] == "planar_homography"
     finally:
         main.config = original_config
         main.april_tag_session.configure(camera_settings(original_config), preserve_frames=False)

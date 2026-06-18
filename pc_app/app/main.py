@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import subprocess
 import shutil
 import tempfile
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -22,6 +25,7 @@ from .apriltag_calibration import (
     detect_apriltags,
     estimate_camera_pose,
 )
+from .cartesian_servo import CartesianServo, CartesianServoLimits
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
     camera_settings,
@@ -39,7 +43,7 @@ from .demo_settings import (
     validate_named_position,
 )
 from .event_log import EventLog
-from .kinematics import COORDINATE_FRAME, differential_ik_step, forward_kinematics, inverse_kinematics
+from .kinematics import COORDINATE_FRAME, forward_kinematics, inverse_kinematics
 from .motion import (
     RateLimitedMotion,
     build_joint_trajectory,
@@ -57,6 +61,7 @@ from .protocol import (
     format_jogj,
     format_jogv,
     format_movej,
+    format_servoj,
     format_setpose,
     format_status,
     format_stop,
@@ -71,13 +76,76 @@ from .safety import validate_can_move, validate_joint_targets
 from .serial_client import SerialClient, SerialClientError
 from .simulator import apply_simulation_step
 from .tasks import build_batch_sorting_sequence, build_pick_and_place_sequence, build_sorting_sequence
-from .vision import annotated_detection_frame, decode_image_b64, detect_configured_colors, encode_image_b64
+from .vision import CameraCapture, VisionPipeline, decode_image_b64, encode_image_b64
 
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+PROJECT_DIR = APP_DIR.parent
+
+
+def _git_revision() -> dict[str, Any]:
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=PROJECT_DIR,
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=2,
+            ).stdout.strip()
+        )
+        return {"commit": commit, "dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+
+
+def _origin_main_revision() -> str | None:
+    try:
+        output = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/main"],
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=4,
+        ).stdout.strip()
+        return output.split()[0][:12] if output else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _source_files() -> list[Path]:
+    files = [
+        path
+        for path in APP_DIR.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".py", ".js", ".css", ".html"}
+    ]
+    if config.source_path.exists():
+        files.append(config.source_path)
+    return sorted(set(files), key=lambda path: str(path).lower())
+
+
+def source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for path in _source_files():
+        digest.update(str(path.relative_to(PROJECT_DIR)).replace("\\", "/").encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
 
 config: RobotConfig = load_config()
+RUNNING_BUILD_ID = source_fingerprint()
+RUNNING_BUILD_STARTED_AT = datetime.now(timezone.utc).isoformat()
+RUNNING_GIT = _git_revision()
 state = RobotState(
     joint_names=config.joint_names,
     target_angles_deg=config.home_pose,
@@ -100,22 +168,29 @@ path_task: asyncio.Task[None] | None = None
 path_task_source: str | None = None
 live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
+cartesian_jog_task: asyncio.Task[None] | None = None
 event_log = EventLog()
 active_motion_run_id: str | None = None
 simulation_trajectory_active = False
 MAX_TRAJECTORY_UPLOAD_POINTS = 220
 CARTESIAN_JOG_STALE_S = 0.35
-CARTESIAN_JOG_MIN_DT_S = 0.01
-CARTESIAN_JOG_MAX_DT_S = 0.08
+cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
     "active": False,
-    "last_update": 0.0,
+    "last_input": 0.0,
     "last_status_poll": 0.0,
-    "seed_deg": None,
+    "last_broadcast": 0.0,
+    "command_velocity": [0.0, 0.0, 0.0, 0.0],
     "joint_velocity_deg_s": [0.0, 0.0, 0.0, 0.0],
     "run_id": None,
+    "settings": None,
+    "last_result": None,
+    "stop_requested": False,
+    "stop_reason": None,
 }
 april_tag_session = AprilTagCalibrationSession(camera_settings(config))
+camera_capture = CameraCapture()
+vision_pipeline = VisionPipeline()
 
 app = FastAPI(title="4DOF Robot Arm Control Dashboard")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -160,6 +235,8 @@ class PathSettingsRequest(BaseModel):
     blend_percent: float | None = None
     per_joint_speed_deg_s: list[float] | None = None
     per_joint_accel_deg_s2: list[float] | None = None
+    tcp_accel_mm_s2: float | None = None
+    phi_accel_deg_s2: float | None = None
 
 
 class IkSolveRequest(BaseModel):
@@ -253,6 +330,10 @@ class VisionDetectRequest(BaseModel):
     profile_names: list[str] | None = None
 
 
+class VisionProjectRequest(BaseModel):
+    detections: list[dict[str, Any]]
+
+
 class AprilTagCaptureRequest(BaseModel):
     image_b64: str | None = None
     sample_count: int = 1
@@ -280,6 +361,7 @@ class TaskExecuteRequest(BaseModel):
 
 def public_config() -> dict[str, Any]:
     return {
+        "app_version": running_version_payload(),
         "joints": [asdict(joint) for joint in config.joints],
         "links_mm": asdict(config.links),
         "kinematics": asdict(config.kinematics),
@@ -304,6 +386,45 @@ def public_config() -> dict[str, Any]:
             "model_warnings": model_validation_warnings(config),
             "named_position_errors": named_position_errors(config),
         },
+    }
+
+
+def running_version_payload() -> dict[str, Any]:
+    disk_build_id = source_fingerprint()
+    current_git = _git_revision()
+    origin_main_commit = _origin_main_revision()
+    checkout_changed = bool(
+        RUNNING_GIT["commit"]
+        and current_git["commit"]
+        and RUNNING_GIT["commit"] != current_git["commit"]
+    )
+    source_changed = disk_build_id != RUNNING_BUILD_ID
+    pull_required = bool(
+        origin_main_commit
+        and current_git["commit"]
+        and origin_main_commit != current_git["commit"]
+    )
+    restart_required = source_changed or checkout_changed
+    reasons: list[str] = []
+    if source_changed:
+        reasons.append("source or configuration files changed after the server started")
+    if checkout_changed:
+        reasons.append("the local Git checkout changed after the server started")
+    if pull_required:
+        reasons.append("the local checkout is not at origin/main")
+    return {
+        "running_build_id": RUNNING_BUILD_ID,
+        "disk_build_id": disk_build_id,
+        "restart_required": restart_required,
+        "pull_required": pull_required,
+        "reasons": reasons,
+        "started_at": RUNNING_BUILD_STARTED_AT,
+        "git_commit": RUNNING_GIT["commit"],
+        "git_dirty_at_start": RUNNING_GIT["dirty"],
+        "current_git_commit": current_git["commit"],
+        "current_git_dirty": current_git["dirty"],
+        "origin_main_commit": origin_main_commit,
+        "checkout_path": str(PROJECT_DIR),
     }
 
 
@@ -541,62 +662,38 @@ def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> d
 
 
 def reset_cartesian_jog_runtime() -> None:
+    global cartesian_jog_task
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if (
+        cartesian_jog_task is not None
+        and cartesian_jog_task is not current_task
+        and not cartesian_jog_task.done()
+    ):
+        cartesian_jog_task.cancel()
+    cartesian_jog_task = None
+    cartesian_servo.reset(state.reported_angles_deg)
     cartesian_jog_runtime.update(
         {
             "active": False,
-            "last_update": 0.0,
+            "last_input": 0.0,
             "last_status_poll": 0.0,
-            "seed_deg": None,
+            "last_broadcast": 0.0,
+            "command_velocity": [0.0, 0.0, 0.0, 0.0],
             "joint_velocity_deg_s": [0.0 for _ in config.joints],
             "run_id": None,
+            "settings": None,
+            "last_result": None,
+            "stop_requested": False,
+            "stop_reason": None,
         }
     )
 
 
 def _clamp_scalar(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
-
-
-def _cartesian_jog_dt(requested_dt_s: float | None) -> float:
-    if requested_dt_s is None:
-        now = monotonic()
-        previous = float(cartesian_jog_runtime.get("last_update") or 0.0)
-        if previous > 0.0:
-            return _clamp_scalar(now - previous, CARTESIAN_JOG_MIN_DT_S, CARTESIAN_JOG_MAX_DT_S)
-        return 1.0 / max(config.motion.command_rate_limit_hz, 20.0)
-    return _clamp_scalar(float(requested_dt_s), CARTESIAN_JOG_MIN_DT_S, CARTESIAN_JOG_MAX_DT_S)
-
-
-def _cartesian_jog_seed(now_s: float) -> list[float]:
-    seed = cartesian_jog_runtime.get("seed_deg")
-    last_update = float(cartesian_jog_runtime.get("last_update") or 0.0)
-    if not cartesian_jog_runtime.get("active") or seed is None or now_s - last_update > CARTESIAN_JOG_STALE_S:
-        cartesian_jog_runtime["joint_velocity_deg_s"] = [0.0 for _ in config.joints]
-        return [float(value) for value in state.reported_angles_deg]
-    if state.simulation:
-        return [float(value) for value in state.reported_angles_deg]
-    return [float(value) for value in seed]
-
-
-def _cartesian_jog_task_delta(
-    vx_mm_s: float,
-    vy_mm_s: float,
-    vz_mm_s: float,
-    vphi_deg_s: float,
-    dt_s: float,
-) -> dict[str, float]:
-    """Convert one velocity sample into a local resolved-rate IK step.
-
-    Do not accumulate an endpoint goal here. A rejected local step must not
-    remain hidden in the next request, otherwise reversing the fader continues
-    chasing the stale unreachable goal until the operator releases it.
-    """
-    return {
-        "x_mm": float(vx_mm_s) * dt_s,
-        "y_mm": float(vy_mm_s) * dt_s,
-        "z_mm": float(vz_mm_s) * dt_s,
-        "phi_deg": float(vphi_deg_s) * dt_s,
-    }
 
 
 def _joint_limits_from_settings(settings: dict[str, Any]) -> tuple[list[float], list[float]]:
@@ -616,53 +713,20 @@ def _joint_limits_from_settings(settings: dict[str, Any]) -> tuple[list[float], 
     return speed_limits, accel_limits
 
 
-def _limit_cartesian_jog_target(
-    seed_deg: list[float],
-    requested_target_deg: list[float],
-    dt_s: float,
-    speed_limits_deg_s: list[float],
-    accel_limits_deg_s2: list[float],
-) -> tuple[list[float], list[float], list[str]]:
-    previous_velocity = [
-        float(value)
-        for value in (cartesian_jog_runtime.get("joint_velocity_deg_s") or [0.0 for _ in config.joints])
-    ]
-    desired_velocity = [
-        (float(requested) - float(seed)) / max(dt_s, 1e-6)
-        for seed, requested in zip(seed_deg, requested_target_deg, strict=True)
-    ]
-    speed_scale = 1.0
-    for velocity, limit in zip(desired_velocity, speed_limits_deg_s, strict=True):
-        if abs(velocity) > limit:
-            speed_scale = min(speed_scale, limit / max(abs(velocity), 1e-9))
-    desired_velocity = [velocity * speed_scale for velocity in desired_velocity]
+def _cartesian_servo_period_s() -> float:
+    rate_hz = _clamp_scalar(float(config.motion.update_rate_hz), 20.0, 40.0)
+    return 1.0 / rate_hz
 
-    velocity_delta = [
-        desired - previous
-        for desired, previous in zip(desired_velocity, previous_velocity, strict=True)
-    ]
-    accel_scale = 1.0
-    for delta_v, limit in zip(velocity_delta, accel_limits_deg_s2, strict=True):
-        max_velocity_delta = limit * dt_s
-        if abs(delta_v) > max_velocity_delta:
-            accel_scale = min(accel_scale, max_velocity_delta / max(abs(delta_v), 1e-9))
-    limited_velocity = [
-        previous + delta_v * accel_scale
-        for previous, delta_v in zip(previous_velocity, velocity_delta, strict=True)
-    ]
 
-    target: list[float] = []
-    velocities: list[float] = []
-    notes: list[str] = []
-    for index, (seed, velocity, joint) in enumerate(zip(seed_deg, limited_velocity, config.joints, strict=True)):
-        next_angle = float(seed) + velocity * dt_s
-        clamped = _clamp_scalar(next_angle, joint.min_deg, joint.max_deg)
-        if abs(clamped - next_angle) > 1e-6:
-            velocity = (clamped - float(seed)) / max(dt_s, 1e-6)
-            notes.append(f"{joint.name} limit")
-        target.append(clamped)
-        velocities.append(velocity)
-    return target, velocities, notes
+def _cartesian_servo_limits(settings: dict[str, Any]) -> CartesianServoLimits:
+    speed_limits, _ = _joint_limits_from_settings(settings)
+    tcp_accel = float(settings.get("tcp_accel_mm_s2") or 360.0)
+    phi_accel = float(settings.get("phi_accel_deg_s2") or 240.0)
+    return CartesianServoLimits(
+        joint_speed_deg_s=speed_limits,
+        tcp_accel_mm_s2=max(1.0, tcp_accel),
+        phi_accel_deg_s2=max(1.0, phi_accel),
+    )
 
 
 def cancel_task(task: asyncio.Task[None] | None) -> None:
@@ -671,10 +735,12 @@ def cancel_task(task: asyncio.Task[None] | None) -> None:
 
 
 def cancel_motion_tasks() -> None:
+    global active_motion_run_id
     cancel_task(path_task)
     cancel_task(live_task)
     cancel_task(task_task)
     reset_cartesian_jog_runtime()
+    active_motion_run_id = None
 
 
 def disable_live_motion(command: str | None = None) -> None:
@@ -926,6 +992,16 @@ def send_jogv_and_read_response(command: str) -> str:
     serial_client.clear_input()
     serial_client.send_line(command)
     response = read_serial_until_any(("OK command=JOGV", "ERR"), timeout_s=0.75)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def send_servoj_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=SERVOJ", "ERR"), timeout_s=0.75)
     state.last_controller_response = response
     if response.startswith("ERR"):
         raise SerialClientError(response)
@@ -1828,12 +1904,16 @@ def reload_runtime_config() -> None:
     config = load_config()
     limiter.config = config
     serial_client.config = config.serial
+    cartesian_servo.reconfigure(config.links, config.joints)
+    cartesian_servo.reset(state.reported_angles_deg)
     state.joint_names = config.joint_names
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
     state.active_tool = str(tools_settings(config).get("active", "gripper"))
     state.tool_type = str(tool_settings(config).get("type", "servo_gripper"))
     state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
-    april_tag_session.configure(camera_settings(config), preserve_frames=True)
+    camera = camera_settings(config)
+    april_tag_session.configure(camera, preserve_frames=True)
+    vision_pipeline.configure(camera)
     if not state.simulation:
         apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
     else:
@@ -1905,8 +1985,21 @@ async def startup() -> None:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+async def index() -> HTMLResponse:
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("__APP_BUILD_ID__", RUNNING_BUILD_ID)
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/api/version")
+async def get_version() -> dict[str, Any]:
+    return {"ok": True, **running_version_payload()}
 
 
 @app.get("/api/config")
@@ -2037,33 +2130,18 @@ async def get_vision_config() -> dict[str, Any]:
         "camera": camera_settings(config),
         "color_profiles": color_profiles(config),
         "drop_zones": drop_zones(config),
+        "detection_contract": {
+            "required": ["id", "label", "confidence", "center_px", "bbox_px", "timestamp"],
+            "optional": ["robot", "coordinate_source", "projection_quality", "drop_zone"],
+            "providers": ["workspace_color", "configured_hsv", "external_ai"],
+        },
     }
 
 
-def open_camera(camera: dict[str, Any]) -> Any:
-    import cv2
-
-    capture = cv2.VideoCapture(int(camera.get("source_index", 0)))
-    resolution = camera.get("resolution") if isinstance(camera.get("resolution"), dict) else {}
-    width = int(resolution.get("width", 0) or 0)
-    height = int(resolution.get("height", 0) or 0)
-    if width > 0:
-        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    if height > 0:
-        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if not capture.isOpened():
-        capture.release()
-        raise RuntimeError("could not open camera")
-    return capture
-
-
 def capture_camera_frame(camera: dict[str, Any]) -> Any:
-    capture = open_camera(camera)
-    ok, image = capture.read()
-    capture.release()
-    if not ok:
-        raise RuntimeError("could not read camera frame")
-    return image
+    if not bool(camera.get("enabled", False)):
+        raise RuntimeError("camera is disabled in Settings")
+    return camera_capture.read(camera)
 
 
 def april_tag_status_payload() -> dict[str, Any]:
@@ -2118,18 +2196,14 @@ async def capture_apriltag_sample(request: AprilTagCaptureRequest) -> dict[str, 
             sample_count = 1
             images = [decode_image_b64(request.image_b64)]
         else:
-            images = []
-            capture = open_camera(camera)
-            try:
-                for index in range(sample_count):
-                    ok, image = capture.read()
-                    if not ok:
-                        raise RuntimeError("could not read camera frame")
-                    images.append(image)
-                    if index + 1 < sample_count and interval_s:
-                        await asyncio.sleep(interval_s)
-            finally:
-                capture.release()
+            if not bool(camera.get("enabled", False)):
+                raise RuntimeError("camera is disabled in Settings")
+            images = await asyncio.to_thread(
+                camera_capture.read_many,
+                camera,
+                sample_count,
+                interval_s,
+            )
         for image in images:
             detections = detect_apriltags(image, april_tag_session.settings)
             if request.accumulate:
@@ -2174,6 +2248,9 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
     camera = camera_settings(config)
     april_tag_session.configure(camera, preserve_frames=True)
     result = april_tag_session.solve()
+    planar = result.get("planar") if isinstance(result.get("planar"), dict) else {}
+    planar_ok = bool(planar.get("ok"))
+    pose_accepted = bool(result.get("accepted"))
     summary = april_tag_session.summary()
     required_ids = {int(value) for value in april_tag_session.settings.get("required_ids", [])}
     visible_ids = set(summary.get("tag_ids", []))
@@ -2196,7 +2273,7 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
                 for tag_id in sorted(required_ids)
             )
         )
-    if not result.get("accepted"):
+    if not pose_accepted and not planar_ok:
         errors.append(result.get("error") or "camera pose did not pass quality checks")
     if errors:
         return {"ok": False, "error": "; ".join(errors), "result": result, **april_tag_status_payload()}
@@ -2204,6 +2281,12 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
     updated_camera = camera_settings(config)
     calibration = updated_camera.setdefault("calibration", {})
     april_tag = calibration.setdefault("apriltag", {})
+    if planar_ok and not pose_accepted:
+        result = {
+            **result,
+            "saved_projection": "planar_homography",
+            "save_note": "Saved planar image-to-robot homography. Camera intrinsics are only required for 3D pose.",
+        }
     april_tag["result"] = result
     april_tag["saved_at"] = time()
     try:
@@ -2219,6 +2302,7 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
         pose_id=result.get("id"),
         tags=result.get("tags_used", []),
         confidence=(result.get("metrics") or {}).get("confidence"),
+        planar_only=planar_ok and not pose_accepted,
     )
     await broadcast_state()
     return {"ok": True, "result": result, "config": public_config(), **april_tag_status_payload()}
@@ -2228,27 +2312,45 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
 async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[str, Any]:
     camera = camera_settings(config)
     saved = april_tag_settings(camera).get("result")
-    if not isinstance(saved, dict) or not saved.get("accepted"):
-        return {"ok": False, "error": "no accepted AprilTag camera pose has been saved"}
+    saved_planar = saved.get("planar") if isinstance(saved, dict) and isinstance(saved.get("planar"), dict) else {}
+    saved_has_planar = bool(saved_planar.get("ok"))
+    if not isinstance(saved, dict) or not (saved.get("accepted") or saved_has_planar):
+        return {"ok": False, "error": "no AprilTag pose or planar workspace calibration has been saved"}
     try:
-        image = decode_image_b64(request.image_b64) if request.image_b64 else capture_camera_frame(camera)
+        image = (
+            decode_image_b64(request.image_b64)
+            if request.image_b64
+            else await asyncio.to_thread(capture_camera_frame, camera)
+        )
         detections = detect_apriltags(image, april_tag_settings(camera))
         live = estimate_camera_pose(detections, camera)
-        if not live.get("ok"):
-            raise RuntimeError(live.get("error", "could not estimate live camera pose"))
-        import cv2
-        import numpy as np
+        if saved.get("accepted"):
+            if not live.get("ok"):
+                raise RuntimeError(live.get("error", "could not estimate live camera pose"))
+            import cv2
+            import numpy as np
 
-        saved_position = np.asarray(saved["camera_to_robot"]["position_mm"], dtype=np.float64)
-        live_position = np.asarray(live["camera_to_robot"]["position_mm"], dtype=np.float64)
-        saved_rotation = np.asarray(saved["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
-        live_rotation = np.asarray(live["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
-        delta_rotation = saved_rotation.T @ live_rotation
-        delta_rvec, _ = cv2.Rodrigues(delta_rotation)
-        comparison = {
-            "position_delta_mm": float(np.linalg.norm(live_position - saved_position)),
-            "orientation_delta_deg": float(np.linalg.norm(delta_rvec) * 180.0 / np.pi),
-        }
+            saved_position = np.asarray(saved["camera_to_robot"]["position_mm"], dtype=np.float64)
+            live_position = np.asarray(live["camera_to_robot"]["position_mm"], dtype=np.float64)
+            saved_rotation = np.asarray(saved["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
+            live_rotation = np.asarray(live["camera_to_robot"]["rotation_matrix"], dtype=np.float64)
+            delta_rotation = saved_rotation.T @ live_rotation
+            delta_rvec, _ = cv2.Rodrigues(delta_rotation)
+            comparison = {
+                "mode": "camera_pose",
+                "position_delta_mm": float(np.linalg.norm(live_position - saved_position)),
+                "orientation_delta_deg": float(np.linalg.norm(delta_rvec) * 180.0 / np.pi),
+            }
+        else:
+            live_planar = live.get("planar") if isinstance(live.get("planar"), dict) else {}
+            if not live_planar.get("ok"):
+                raise RuntimeError(live.get("error") or live_planar.get("error") or "could not estimate planar homography")
+            comparison = {
+                "mode": "planar_homography",
+                "planar_rmse_mm": float(live_planar.get("rmse_mm", 0.0)),
+                "planar_max_error_mm": float(live_planar.get("max_error_mm", 0.0)),
+                "tags_used": live_planar.get("tags_used", []),
+            }
         annotated = annotate_apriltag_frame(image, detections, camera, live)
     except Exception as exc:
         return {"ok": False, "error": f"AprilTag verification failed: {exc}"}
@@ -2268,34 +2370,78 @@ async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[s
 @app.post("/api/vision/detect")
 async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
     profiles = color_profiles(config)
-    if request.profile_names:
-        profiles = {name: profile for name, profile in profiles.items() if name in set(request.profile_names)}
     try:
         if request.image_b64:
             image = decode_image_b64(request.image_b64)
         else:
             camera = camera_settings(config)
-            image = capture_camera_frame(camera)
-        detections = detect_configured_colors(image, profiles, camera_settings(config).get("calibration", {}))
+            image = await asyncio.to_thread(capture_camera_frame, camera)
+        result = vision_pipeline.process(
+            image,
+            camera_settings(config),
+            profiles,
+            request.profile_names,
+        )
     except Exception as exc:
         state.set_error(f"vision detection failed: {exc}")
         log_event("vision", "detection failed", error=str(exc))
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    log_event("vision", "detection complete", detections=detections)
-    return {"ok": True, "detections": detections}
+    log_event(
+        "vision",
+        "detection complete",
+        count=len(result["detections"]),
+        provider=result["provider"],
+        calibration_source=result["calibration_source"],
+    )
+    return {
+        "ok": True,
+        "detections": result["detections"],
+        "workspace": result["workspace"],
+        "provider": result["provider"],
+        "calibration_source": result["calibration_source"],
+    }
 
 
 @app.get("/api/vision/frame")
-async def get_vision_frame() -> dict[str, Any]:
+async def get_vision_frame(project_workspace: bool = False) -> dict[str, Any]:
     try:
         camera = camera_settings(config)
-        image = capture_camera_frame(camera)
-        detections = detect_configured_colors(image, color_profiles(config), camera.get("calibration", {}))
-        annotated = annotated_detection_frame(image, detections)
-        return {"ok": True, "image_b64": encode_image_b64(annotated), "detections": detections}
+        image = await asyncio.to_thread(capture_camera_frame, camera)
+        result = vision_pipeline.process(
+            image,
+            camera,
+            color_profiles(config),
+            include_workspace_projection=project_workspace,
+        )
+        return {
+            "ok": True,
+            "image_b64": encode_image_b64(result["annotated"]),
+            "detections": result["detections"],
+            "workspace": result["workspace"],
+            "workspace_projection": result.get("workspace_projection"),
+            "provider": result["provider"],
+            "calibration_source": result["calibration_source"],
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "detections": []}
+
+
+@app.post("/api/vision/project")
+async def project_external_vision(request: VisionProjectRequest) -> dict[str, Any]:
+    """Projection adapter for future YOLO/AI inference output."""
+    try:
+        detections = vision_pipeline.project_external_detections(
+            request.detections,
+            camera_settings(config),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"could not project external detections: {exc}"}
+    return {
+        "ok": True,
+        "provider": "external_ai",
+        "detections": detections,
+    }
 
 
 @app.post("/api/hardware-arm")
@@ -2715,22 +2861,14 @@ def _cartesian_jog_can_run() -> tuple[bool, str]:
     return True, ""
 
 
-def _apply_cartesian_jog_target(
+async def _apply_cartesian_servo_target(
     target_deg: list[float],
     joint_velocity_deg_s: list[float],
-    accel_deg_s2: float,
+    period_s: float,
 ) -> str:
     state.target_angles_deg = [float(value) for value in target_deg]
     has_commanded_velocity = any(abs(float(value)) > 0.001 for value in joint_velocity_deg_s)
-    had_hardware_velocity = (
-        not state.simulation
-        and cartesian_jog_runtime.get("active")
-        and any(
-            abs(float(value)) > 0.001
-            for value in (cartesian_jog_runtime.get("joint_velocity_deg_s") or [])
-        )
-    )
-    state.motion_state = MotionState.MOVING if has_commanded_velocity or had_hardware_velocity else MotionState.IDLE
+    state.motion_state = MotionState.MOVING if has_commanded_velocity else MotionState.IDLE
     state.motion_execution_state = "cartesian_jog"
     state.clear_error()
     if state.simulation:
@@ -2740,53 +2878,148 @@ def _apply_cartesian_jog_target(
         state.last_controller_response = "SIMULATION"
         state.last_command = "CARTESIAN_JOG_SIM"
         return state.last_controller_response
-    limiter.set_target(state.target_angles_deg)
     if not serial_client.is_connected:
-        state.last_controller_response = "SIMULATION"
-        state.last_command = "CARTESIAN_JOG_SIM"
-        return state.last_controller_response
+        raise SerialClientError("Cartesian servo lost the hardware connection")
 
-    command = format_jogv(joint_velocity_deg_s, accel_deg_s2)
+    # Each command is a finite synchronized position segment. The controller
+    # does not independently smooth joint velocities, so the PC remains the
+    # single authoritative servo loop.
+    command = format_servoj(target_deg, period_s)
     state.last_command = command
-    response = send_jogv_and_read_response(command)
+    response = await asyncio.to_thread(send_servoj_and_read_response, command)
     now = monotonic()
     if now - float(cartesian_jog_runtime.get("last_status_poll") or 0.0) >= 0.25:
         try:
-            refresh_serial_status()
+            await asyncio.to_thread(refresh_serial_status)
             cartesian_jog_runtime["last_status_poll"] = now
         except SerialClientError:
-            # Keep jog commands responsive; the next normal status poll/stop can surface the connection issue.
+            # The next segment or explicit stop will surface a hard transport
+            # failure; a delayed status response must not jitter the servo.
             pass
     return response
 
 
+async def _run_cartesian_servo() -> None:
+    global cartesian_jog_task
+    period_s = _cartesian_servo_period_s()
+    next_tick = monotonic()
+    run_id = str(cartesian_jog_runtime.get("run_id") or "")
+    try:
+        while cartesian_jog_runtime.get("active"):
+            now = monotonic()
+            command_velocity = [
+                float(value)
+                for value in (cartesian_jog_runtime.get("command_velocity") or [0.0, 0.0, 0.0, 0.0])
+            ]
+            last_input = float(cartesian_jog_runtime.get("last_input") or 0.0)
+            if (
+                any(abs(value) > 1e-6 for value in command_velocity)
+                and last_input > 0.0
+                and now - last_input > CARTESIAN_JOG_STALE_S
+            ):
+                command_velocity = [0.0, 0.0, 0.0, 0.0]
+                cartesian_jog_runtime["command_velocity"] = command_velocity
+                cartesian_jog_runtime["stop_requested"] = True
+                cartesian_jog_runtime["stop_reason"] = "Cartesian jog input watchdog expired"
+                cartesian_servo.set_command(command_velocity)
+
+            settings = cartesian_jog_runtime.get("settings")
+            if not isinstance(settings, dict):
+                settings = request_settings(None)
+            result = cartesian_servo.step(period_s, _cartesian_servo_limits(settings))
+            try:
+                response = await _apply_cartesian_servo_target(
+                    [float(value) for value in result["target_angles_deg"]],
+                    [float(value) for value in result["joint_velocity_deg_s"]],
+                    period_s,
+                )
+            except SerialClientError as exc:
+                state.set_error(str(exc), fault=True)
+                if run_id:
+                    finish_motion_diagnostics("failed", str(exc), run_id)
+                break
+
+            result = {**result, "controller_response": response, "period_s": period_s}
+            cartesian_jog_runtime["last_result"] = result
+            cartesian_jog_runtime["joint_velocity_deg_s"] = result["joint_velocity_deg_s"]
+            if run_id:
+                update_motion_diagnostics(
+                    run_id,
+                    execution_state="cartesian_jog",
+                    result="executing",
+                    requested_target_deg=result["target_angles_deg"],
+                    active_target_deg=result["target_angles_deg"],
+                    cartesian_command={
+                        "target_velocity": result["target_task_velocity"],
+                        "applied_velocity": result["applied_task_velocity"],
+                        "velocity_scale": result["velocity_scale"],
+                        "period_s": period_s,
+                    },
+                )
+                record_motion_sample(run_id)
+
+            state.updated_at = time()
+            if now - float(cartesian_jog_runtime.get("last_broadcast") or 0.0) >= 0.1:
+                cartesian_jog_runtime["last_broadcast"] = now
+                await broadcast_state()
+
+            if cartesian_servo.is_stopped():
+                break
+            next_tick += period_s
+            await asyncio.sleep(max(0.0, next_tick - monotonic()))
+    except asyncio.CancelledError:
+        raise
+    finally:
+        cartesian_jog_runtime["active"] = False
+        cartesian_jog_runtime["command_velocity"] = [0.0, 0.0, 0.0, 0.0]
+        cartesian_jog_runtime["joint_velocity_deg_s"] = [0.0 for _ in config.joints]
+        cartesian_servo.set_command([0.0, 0.0, 0.0, 0.0])
+        if state.motion_state != MotionState.FAULT:
+            state.motion_state = MotionState.IDLE if state.simulation else MotionState.STOPPED
+        state.motion_execution_state = "idle"
+        if not state.simulation and serial_client.is_connected:
+            try:
+                await asyncio.to_thread(send_jog_stop_and_read_response)
+            except SerialClientError as exc:
+                state.set_error(str(exc), fault=True)
+        stop_reason = str(cartesian_jog_runtime.get("stop_reason") or "Cartesian jog stopped")
+        if run_id and state.motion_state != MotionState.FAULT:
+            finish_motion_diagnostics("stopped", stop_reason, run_id)
+        if cartesian_jog_task is asyncio.current_task():
+            cartesian_jog_task = None
+        await broadcast_state()
+
+
 async def stop_cartesian_jog_internal(reason: str = "cartesian jog stopped") -> dict[str, Any]:
-    run_id = cartesian_jog_runtime.get("run_id")
-    cartesian_jog_runtime["active"] = False
-    cartesian_jog_runtime["seed_deg"] = None
-    cartesian_jog_runtime["joint_velocity_deg_s"] = [0.0 for _ in config.joints]
-    state.target_angles_deg = state.reported_angles_deg.copy()
-    limiter.set_target(state.target_angles_deg)
-    if state.motion_state == MotionState.MOVING:
-        state.motion_state = MotionState.IDLE if state.simulation else MotionState.STOPPED
-    if not state.simulation and serial_client.is_connected:
+    cartesian_jog_runtime["stop_requested"] = True
+    cartesian_jog_runtime["stop_reason"] = reason
+    cartesian_jog_runtime["last_input"] = monotonic()
+    cartesian_jog_runtime["command_velocity"] = [0.0, 0.0, 0.0, 0.0]
+    cartesian_servo.set_command([0.0, 0.0, 0.0, 0.0])
+    task = cartesian_jog_task
+    if task is not None and not task.done() and task is not asyncio.current_task():
         try:
-            send_jog_stop_and_read_response()
-            refresh_serial_status()
-        except SerialClientError as exc:
-            state.set_error(str(exc), fault=True)
-            finish_motion_diagnostics("failed", str(exc), str(run_id) if run_id else None)
-            await broadcast_state()
-            return {"ok": False, "error": str(exc), "state": state.to_dict()}
-    if run_id:
-        finish_motion_diagnostics("stopped", reason, str(run_id))
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+        except TimeoutError:
+            task.cancel()
+    elif not cartesian_jog_runtime.get("active"):
+        state.motion_state = MotionState.IDLE if state.simulation else MotionState.STOPPED
+        state.motion_execution_state = "idle"
+        if not state.simulation and serial_client.is_connected:
+            try:
+                await asyncio.to_thread(send_jog_stop_and_read_response)
+            except SerialClientError as exc:
+                state.set_error(str(exc), fault=True)
+                await broadcast_state()
+                return {"ok": False, "error": str(exc), "state": state.to_dict()}
     state.last_command = "CARTESIAN_JOG_STOP"
     await broadcast_state()
-    return {"ok": True, "state": state.to_dict()}
+    return {"ok": state.motion_state != MotionState.FAULT, "state": state.to_dict()}
 
 
 @app.post("/api/cartesian-jog")
 async def cartesian_jog(request: CartesianJogRequest) -> dict[str, Any]:
+    global active_motion_run_id, cartesian_jog_task
     ok, reason = _cartesian_jog_can_run()
     if not ok:
         state.set_error(reason)
@@ -2805,7 +3038,6 @@ async def cartesian_jog(request: CartesianJogRequest) -> dict[str, Any]:
         return await stop_cartesian_jog_internal("zero Cartesian jog command")
 
     settings = request_settings(request.settings)
-    dt_s = _cartesian_jog_dt(request.dt_s)
     tcp_limit = max(1.0, float(request.tcp_speed_mm_s or settings.get("tcp_speed_mm_s") or 60.0))
     phi_limit = max(1.0, float(request.phi_speed_deg_s or settings.get("phi_speed_deg_s") or 45.0))
     tcp_speed = (vx * vx + vy * vy + vz * vz) ** 0.5
@@ -2821,103 +3053,98 @@ async def cartesian_jog(request: CartesianJogRequest) -> dict[str, Any]:
         clamp_notes.append("phi speed clamped")
 
     now = monotonic()
-    seed = _cartesian_jog_seed(now)
-    speed_limits, accel_limits = _joint_limits_from_settings(settings)
-    max_joint_step = max(speed_limits) * dt_s
-    task_delta = _cartesian_jog_task_delta(vx, vy, vz, vphi, dt_s)
-    ik_step = differential_ik_step(
-        seed,
-        task_delta,
-        config.links,
-        config.joints,
-        damping=float(config.kinematics.damping),
-        max_joint_step_deg=max_joint_step,
-    )
-    if not ik_step["ok"]:
-        state.set_error(str(ik_step.get("error", "Cartesian jog IK failed")))
-        await broadcast_state()
-        return {"ok": False, "error": state.last_error, "jog": ik_step, "state": state.to_dict()}
-
-    if ik_step.get("blocked"):
-        # A blocked sample is a rejected velocity command, not a new target.
-        # Send zero joint velocity so hardware decelerates, keep the accepted
-        # seed unchanged, and let the next valid/reverse sample solve cleanly.
-        target_deg = seed.copy()
-        joint_velocity = [0.0 for _ in config.joints]
-        joint_notes: list[str] = []
-    else:
-        target_deg, joint_velocity, joint_notes = _limit_cartesian_jog_target(
-            seed,
-            [float(value) for value in ik_step["target_angles_deg"]],
-            dt_s,
-            speed_limits,
-            accel_limits,
-        )
-    validation = validate_joint_targets(config, target_deg)
-    if not validation.ok:
-        state.set_error(validation.reason)
-        await broadcast_state()
-        return {"ok": False, "error": validation.reason, "jog": ik_step, "state": state.to_dict()}
-
     run_id = cartesian_jog_runtime.get("run_id")
     if not cartesian_jog_runtime.get("active") or not run_id:
+        cartesian_servo.reset(state.reported_angles_deg)
         run_id = start_motion_diagnostics(
             source="cartesian_jog",
             mode="cartesian_jog",
-            target_deg=target_deg,
+            target_deg=state.reported_angles_deg,
             expected_duration_s=0.0,
             waypoint_count=0,
         )
         cartesian_jog_runtime["run_id"] = run_id
-    update_motion_diagnostics(
-        str(run_id),
-        execution_state="cartesian_jog",
-        result="executing",
-        requested_target_deg=target_deg,
-        active_target_deg=target_deg,
-        cartesian_command={
-            "vx_mm_s": vx,
-            "vy_mm_s": vy,
-            "vz_mm_s": vz,
-            "vphi_deg_s": vphi,
-            "dt_s": dt_s,
-        },
-    )
 
-    try:
-        response = _apply_cartesian_jog_target(
-            target_deg,
-            joint_velocity,
-            accel_deg_s2=max(accel_limits),
+    command_velocity = [vx, vy, vz, vphi]
+    cartesian_servo.set_command(command_velocity)
+    if request.dt_s is not None:
+        period_s = _clamp_scalar(float(request.dt_s), 0.005, 0.1)
+        result = cartesian_servo.step(period_s, _cartesian_servo_limits(settings))
+        try:
+            response = await _apply_cartesian_servo_target(
+                [float(value) for value in result["target_angles_deg"]],
+                [float(value) for value in result["joint_velocity_deg_s"]],
+                period_s,
+            )
+        except SerialClientError as exc:
+            state.set_error(str(exc), fault=True)
+            finish_motion_diagnostics("failed", str(exc), str(run_id))
+            await broadcast_state()
+            return {"ok": False, "error": str(exc), "state": state.to_dict()}
+        result = {
+            **result,
+            "controller_response": response,
+            "period_s": period_s,
+            "notes": [*result.get("notes", []), *clamp_notes],
+        }
+        cartesian_jog_runtime.update(
+            {
+                "active": False,
+                "last_input": now,
+                "command_velocity": [0.0, 0.0, 0.0, 0.0],
+                "joint_velocity_deg_s": result["joint_velocity_deg_s"],
+                "run_id": run_id,
+                "settings": settings,
+                "last_result": result,
+                "stop_requested": False,
+                "stop_reason": None,
+            }
         )
-    except SerialClientError as exc:
-        state.set_error(str(exc), fault=True)
-        finish_motion_diagnostics("failed", str(exc), str(run_id))
+        cartesian_servo.set_command([0.0, 0.0, 0.0, 0.0])
+        update_motion_diagnostics(
+            str(run_id),
+            execution_state="cartesian_jog",
+            result="executing",
+            requested_target_deg=result["target_angles_deg"],
+            active_target_deg=result["target_angles_deg"],
+            cartesian_command={
+                "target_velocity": result["target_task_velocity"],
+                "applied_velocity": result["applied_task_velocity"],
+                "velocity_scale": result["velocity_scale"],
+                "period_s": period_s,
+            },
+        )
+        record_motion_sample(str(run_id))
+        active_motion_run_id = None
+        state.updated_at = time()
         await broadcast_state()
-        return {"ok": False, "error": str(exc), "jog": ik_step, "state": state.to_dict()}
+        return {"ok": True, "jog": result, "state": state.to_dict()}
 
     cartesian_jog_runtime.update(
         {
             "active": True,
-            "last_update": now,
-            "seed_deg": target_deg,
-            "joint_velocity_deg_s": joint_velocity,
+            "last_input": now,
+            "command_velocity": command_velocity,
             "run_id": run_id,
+            "settings": settings,
+            "stop_requested": False,
+            "stop_reason": None,
         }
     )
-    record_motion_sample(str(run_id))
+    if cartesian_jog_task is None or cartesian_jog_task.done():
+        cartesian_jog_task = asyncio.create_task(_run_cartesian_servo())
+    await asyncio.sleep(0)
     state.updated_at = time()
-    jog_result = {
-        **ik_step,
-        "target_angles_deg": target_deg,
-        "joint_velocity_deg_s": joint_velocity,
-        "dt_s": dt_s,
-        "blocked": bool(ik_step.get("blocked")) or bool(joint_notes),
-        "notes": [*ik_step.get("notes", []), *clamp_notes, *joint_notes],
-        "failure_code": ik_step.get("failure_code") or ("joint_limit" if joint_notes else None),
-        "failure_reason": ik_step.get("failure_reason") or (joint_notes[0] if joint_notes else None),
-        "controller_response": response,
+    jog_result = cartesian_jog_runtime.get("last_result") or {
+        "ok": True,
+        "blocked": False,
+        "target_task_velocity": command_velocity,
+        "applied_task_velocity": [0.0, 0.0, 0.0, 0.0],
+        "target_angles_deg": cartesian_servo.commanded_joints_deg.tolist(),
+        "joint_velocity_deg_s": [0.0 for _ in config.joints],
+        "notes": [],
     }
+    jog_result = {**jog_result, "notes": [*jog_result.get("notes", []), *clamp_notes]}
     await broadcast_state()
     return {"ok": True, "jog": jog_result, "state": state.to_dict()}
 

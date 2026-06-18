@@ -67,11 +67,25 @@ def named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
 
 def camera_settings(config: RobotConfig) -> dict[str, Any]:
     defaults = {
-        "source_index": 0,
+        "source_index": 1,
         "enabled": False,
         "resolution": {
-            "width": 1280,
-            "height": 720,
+            "width": 640,
+            "height": 480,
+        },
+        "detection": {
+            "provider": "workspace_color",
+            "workspace_only": True,
+            "show_unconfigured_colors": True,
+            "min_object_area_px": 400,
+            "min_saturation": 60,
+            "min_value": 50,
+            "morph_kernel_px": 5,
+            "live_interval_ms": 450,
+        },
+        "display": {
+            "project_live_view": False,
+            "projection_opacity": 0.72,
         },
         "intrinsics": {
             "source": "uncalibrated",
@@ -84,9 +98,50 @@ def camera_settings(config: RobotConfig) -> dict[str, Any]:
         "calibration": {
             "image_points": [],
             "robot_points": [],
+            "workspace_aruco": {
+                "enabled": True,
+                "dictionary": "DICT_4X4_50",
+                "dictionary_candidates": ["DICT_4X4_50", "DICT_APRILTAG_36H11"],
+                "required_ids": [0, 1, 2, 3],
+                "invert_first": True,
+                "allow_normal_fallback": True,
+                "tag_centers_robot_mm": {
+                    "0": [111.5, -218.5],
+                    "1": [111.5, 218.5],
+                    "2": [383.5, -218.5],
+                    "3": [383.5, 218.5],
+                },
+                "tag_box_corner_index": {
+                    "0": 2,
+                    "1": 3,
+                    "2": 0,
+                    "3": 1,
+                },
+                "reference_points_px": {
+                    "0": [99.0, 88.75],
+                    "1": [545.25, 94.0],
+                    "2": [96.0, 367.0],
+                    "3": [541.75, 374.0],
+                },
+                "reference_resolution": {
+                    "width": 640,
+                    "height": 480,
+                },
+                "workspace_polygon_robot_mm": [
+                    [131.5, -198.5],
+                    [131.5, 198.5],
+                    [363.5, 198.5],
+                    [363.5, -198.5],
+                ],
+                "projection_pixels_per_mm": 2.0,
+                "projection_alpha": 220,
+            },
             "apriltag": {
                 "enabled": True,
                 "dictionary": "DICT_APRILTAG_36H11",
+                "dictionary_candidates": ["DICT_APRILTAG_36H11"],
+                "invert_first": False,
+                "allow_normal_fallback": True,
                 "tag_size_mm": 40.0,
                 "required_ids": [0, 1, 2, 3],
                 "min_tags_for_pose": 2,
@@ -122,21 +177,15 @@ def camera_settings(config: RobotConfig) -> dict[str, Any]:
     }
     raw = config.raw.get("camera")
     if isinstance(raw, dict):
+        def merge_mapping(target: dict[str, Any], source: dict[str, Any]) -> None:
+            for key, value in source.items():
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge_mapping(target[key], value)
+                else:
+                    target[key] = deepcopy(value)
+
         merged = deepcopy(defaults)
-        for key, value in raw.items():
-            if key not in {"resolution", "intrinsics", "calibration"} or not isinstance(value, dict):
-                merged[key] = deepcopy(value)
-        if isinstance(raw.get("resolution"), dict):
-            merged["resolution"].update(deepcopy(raw["resolution"]))
-        if isinstance(raw.get("intrinsics"), dict):
-            merged["intrinsics"].update(deepcopy(raw["intrinsics"]))
-        if isinstance(raw.get("calibration"), dict):
-            calibration = raw["calibration"]
-            for key, value in calibration.items():
-                if key != "apriltag" or not isinstance(value, dict):
-                    merged["calibration"][key] = deepcopy(value)
-            if isinstance(calibration.get("apriltag"), dict):
-                merged["calibration"]["apriltag"].update(deepcopy(calibration["apriltag"]))
+        merge_mapping(merged, raw)
         return merged
     return defaults
 

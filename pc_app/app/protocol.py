@@ -39,6 +39,15 @@ def format_jogv(joint_velocity_deg_s: list[float], accel: float) -> str:
     return f"JOGV {values} {accel:.3f}"
 
 
+def format_servoj(joints_deg: list[float], duration_s: float) -> str:
+    if len(joints_deg) != 4:
+        raise ValueError("SERVOJ requires exactly four joint angles")
+    if duration_s <= 0:
+        raise ValueError("SERVOJ requires a positive duration")
+    values = " ".join(f"{angle:.3f}" for angle in joints_deg)
+    return f"SERVOJ {values} {duration_s:.4f}"
+
+
 def format_jog_stop() -> str:
     return "JOG STOP"
 

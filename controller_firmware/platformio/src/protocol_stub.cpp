@@ -187,6 +187,34 @@ void handleJog(const String& upperCommand, const char* buffer) {
     return;
   }
 
+  if (upperCommand.startsWith("SERVOJ")) {
+    float requested[4] = {};
+    float durationS = 0.0f;
+    const int parsed =
+        sscanf(buffer, "%*s %f %f %f %f %f", &requested[0], &requested[1], &requested[2], &requested[3], &durationS);
+    if (parsed != 5) {
+      printError("USAGE", "SERVOJ_requires_j1_j2_j3_j4_duration");
+      return;
+    }
+    if (durationS < 0.005f || durationS > 0.250f) {
+      printError("LIMIT", "SERVOJ_duration_out_of_range");
+      return;
+    }
+    if (!validateJoints(requested)) {
+      return;
+    }
+    clearTrajectory();
+    clearJogMotion(false);
+    for (int i = 0; i < 4; i++) {
+      targetJointsDeg[i] = requested[i];
+      currentJointsDeg[i] = requested[i];
+    }
+    controllerState = ControllerState::Idle;
+    clearFaultText();
+    ARM_SERIAL.println("OK command=SERVOJ hw=simulated");
+    return;
+  }
+
   if (upperCommand.startsWith("JOGV")) {
     float velocity[4] = {};
     float accel = 0.0f;
@@ -543,7 +571,8 @@ void handleCommand(String rawCommand) {
     handleConfig(upperCommand);
   } else if (strcasecmp(command, "MOVEJ") == 0) {
     handleMoveJ(buffer);
-  } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 || strcasecmp(command, "JOG") == 0) {
+  } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 ||
+             strcasecmp(command, "SERVOJ") == 0 || strcasecmp(command, "JOG") == 0) {
     handleJog(upperCommand, buffer);
   } else if (strcasecmp(command, "TRAJ") == 0) {
     handleTrajectory(rawCommand, upperCommand);

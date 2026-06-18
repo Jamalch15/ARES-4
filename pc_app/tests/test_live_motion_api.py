@@ -1,4 +1,5 @@
 from dataclasses import replace
+from time import sleep
 
 from pytest import approx
 from fastapi.testclient import TestClient
@@ -105,28 +106,29 @@ def test_live_target_accepts_simulation_joint_target_when_enabled():
 
 def test_cartesian_jog_accepts_simulation_velocity_step():
     reset_runtime_state()
-    client = TestClient(main.app)
     start_x = main.state.fk.get("x_mm", 0.0)
 
-    response = client.post(
-        "/api/cartesian-jog",
-        json={
-            "vx_mm_s": 0.0,
-            "vy_mm_s": 20.0,
-            "vz_mm_s": 0.0,
-            "vphi_deg_s": 0.0,
-            "dt_s": 0.05,
-            "tcp_speed_mm_s": 60.0,
-        },
-    )
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/cartesian-jog",
+            json={
+                "vx_mm_s": 0.0,
+                "vy_mm_s": 20.0,
+                "vz_mm_s": 0.0,
+                "vphi_deg_s": 0.0,
+                "dt_s": 0.05,
+                "tcp_speed_mm_s": 60.0,
+            },
+        )
 
-    payload = response.json()
-    assert payload["ok"], payload
-    assert payload["jog"]["target_angles_deg"] != main.config.home_pose
-    assert payload["jog"]["requested_delta"]["y_mm"] > 0
-    assert main.state.target_angles_deg == payload["jog"]["target_angles_deg"]
-    assert main.state.motion_execution_state == "cartesian_jog"
-    assert main.state.fk.get("x_mm", 0.0) == approx(start_x, abs=1e-3)
+        payload = response.json()
+        assert payload["ok"], payload
+        assert payload["jog"]["target_angles_deg"] != main.config.home_pose
+        assert payload["jog"]["requested_delta"]["y_mm"] > 0
+        assert main.state.target_angles_deg == payload["jog"]["target_angles_deg"]
+        assert main.state.motion_execution_state == "cartesian_jog"
+        assert main.state.fk.get("x_mm", 0.0) == approx(start_x, abs=1e-3)
+        client.post("/api/cartesian-jog/stop")
     reset_runtime_state()
 
 
@@ -137,31 +139,31 @@ def test_cartesian_jog_simulation_endpoint_tracks_straight_z_path():
     main.state.target_angles_deg = start.copy()
     main.state.fk = forward_kinematics(start, main.config.links)
     main.limiter.reset(start)
-    client = TestClient(main.app)
+    with TestClient(main.app) as client:
+        for _ in range(12):
+            response = client.post(
+                "/api/cartesian-jog",
+                json={
+                    "vx_mm_s": 0.0,
+                    "vy_mm_s": 0.0,
+                    "vz_mm_s": 40.0,
+                    "vphi_deg_s": 0.0,
+                    "tcp_speed_mm_s": 60.0,
+                },
+            )
+            payload = response.json()
+            assert payload["ok"], payload
+            sleep(0.08)
 
-    for _ in range(20):
-        response = client.post(
-            "/api/cartesian-jog",
-            json={
-                "vx_mm_s": 0.0,
-                "vy_mm_s": 0.0,
-                "vz_mm_s": 40.0,
-                "vphi_deg_s": 0.0,
-                "dt_s": 1.0 / 12.0,
-                "tcp_speed_mm_s": 60.0,
-            },
-        )
-        payload = response.json()
-        assert payload["ok"], payload
+        path = main.state.motion_diagnostics.get("actual_tcp_path", [])
+        points = [[sample["x_mm"], sample["y_mm"], sample["z_mm"]] for sample in path]
+        metrics = cartesian_path_metrics(points, [0.0, 0.0, 1.0])
 
-    path = main.state.motion_diagnostics.get("actual_tcp_path", [])
-    points = [[sample["x_mm"], sample["y_mm"], sample["z_mm"]] for sample in path]
-    metrics = cartesian_path_metrics(points, [0.0, 0.0, 1.0])
-
-    assert metrics["progress_mm"] > 30.0
-    assert metrics["alignment"] > 0.99
-    assert metrics["max_lateral_mm"] < 4.0
-    client.post("/api/cartesian-jog/stop")
+        assert metrics["progress_mm"] > 25.0
+        assert metrics["alignment"] > 0.999
+        assert metrics["max_lateral_mm"] < 0.1
+        assert metrics["backward_steps"] == 0
+        client.post("/api/cartesian-jog/stop")
     reset_runtime_state()
 
 
@@ -172,66 +174,70 @@ def test_cartesian_jog_rejects_stale_blocked_goal_and_allows_immediate_reverse()
     main.state.target_angles_deg = start.copy()
     main.state.fk = forward_kinematics(start, main.config.links)
     main.limiter.reset(start)
-    client = TestClient(main.app)
+    with TestClient(main.app) as client:
+        blocked_payload = None
+        for _ in range(30):
+            payload = client.post(
+                "/api/cartesian-jog",
+                json={"vz_mm_s": 40.0},
+            ).json()
+            assert payload["ok"], payload
+            sleep(0.08)
+            latest = main.cartesian_jog_runtime.get("last_result")
+            if latest and latest.get("blocked"):
+                blocked_payload = latest
+                break
 
-    blocked_payload = None
-    for _ in range(40):
-        payload = client.post(
+        assert blocked_payload is not None
+        assert blocked_payload["failure_code"] == "direction_unavailable"
+        assert blocked_payload["achieved_delta"] == {
+            "x_mm": 0.0,
+            "y_mm": 0.0,
+            "z_mm": 0.0,
+            "phi_deg": 0.0,
+        }
+        blocked_pose = main.state.reported_angles_deg.copy()
+
+        reverse = client.post(
             "/api/cartesian-jog",
-            json={"vz_mm_s": 40.0, "dt_s": 0.08},
+            json={"vz_mm_s": -20.0},
         ).json()
-        assert payload["ok"], payload
-        if payload["jog"]["blocked"]:
-            blocked_payload = payload
-            break
-
-    assert blocked_payload is not None
-    assert blocked_payload["jog"]["failure_code"] in {"local_step_unreachable", "excessive_lateral_drift"}
-    assert blocked_payload["jog"]["achieved_delta"] == {
-        "x_mm": 0.0,
-        "y_mm": 0.0,
-        "z_mm": 0.0,
-        "phi_deg": 0.0,
-    }
-    assert blocked_payload["state"]["motion_state"] == "idle"
-    blocked_pose = main.state.reported_angles_deg.copy()
-
-    reverse = client.post(
-        "/api/cartesian-jog",
-        json={"vz_mm_s": -20.0, "dt_s": 0.08},
-    ).json()
-
-    assert reverse["ok"], reverse
-    assert not reverse["jog"]["blocked"], reverse["jog"]
-    assert reverse["jog"]["requested_delta"]["z_mm"] < 0.0
-    assert reverse["jog"]["achieved_delta"]["z_mm"] < 0.0
-    assert reverse["jog"]["target_angles_deg"] != blocked_pose
-    client.post("/api/cartesian-jog/stop")
+        assert reverse["ok"], reverse
+        sleep(0.2)
+        reverse_result = main.cartesian_jog_runtime.get("last_result")
+        assert reverse_result and not reverse_result["blocked"], reverse_result
+        assert reverse_result["requested_delta"]["z_mm"] < 0.0
+        assert reverse_result["achieved_delta"]["z_mm"] < 0.0
+        assert reverse_result["target_angles_deg"] != blocked_pose
+        client.post("/api/cartesian-jog/stop")
     reset_runtime_state()
 
 
-def test_cartesian_jog_hardware_uses_jogv_protocol(monkeypatch):
+def test_cartesian_jog_hardware_uses_servoj_protocol(monkeypatch):
     reset_runtime_state()
     main.state.simulation = False
     main.state.hardware_armed = True
     main.state.live_motion_enabled = True
     main.state.config_sync_status = "synced"
-    fake = FakeSerial(["OK command=JOGV hw=mixed"])
+    fake = FakeSerial(
+        ["OK command=SERVOJ hw=mixed"] * 20
+        + ["OK command=JOG_STOP"]
+    )
     monkeypatch.setattr(main, "serial_client", fake)
     monkeypatch.setattr(main, "hardware_ready_for_motion", lambda: (True, ""))
     monkeypatch.setattr(main, "refresh_serial_status", lambda: None)
-    client = TestClient(main.app)
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/cartesian-jog",
+            json={"vx_mm_s": 0.0, "vy_mm_s": 20.0, "vz_mm_s": 0.0, "vphi_deg_s": 0.0},
+        )
 
-    response = client.post(
-        "/api/cartesian-jog",
-        json={"vx_mm_s": 0.0, "vy_mm_s": 20.0, "vz_mm_s": 0.0, "vphi_deg_s": 0.0, "dt_s": 0.05},
-    )
-
-    payload = response.json()
-    assert payload["ok"], payload
-    assert fake.sent[0].startswith("JOGV")
-    assert not fake.sent[0].startswith("JOGJ")
-    assert not any(line.startswith("MOVEJ") for line in fake.sent)
+        payload = response.json()
+        assert payload["ok"], payload
+        assert fake.sent[0].startswith("SERVOJ")
+        assert not any(line.startswith("JOGV") for line in fake.sent)
+        assert not any(line.startswith("MOVEJ") for line in fake.sent)
+        client.post("/api/cartesian-jog/stop")
     reset_runtime_state()
 
 

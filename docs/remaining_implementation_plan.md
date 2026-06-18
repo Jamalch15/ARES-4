@@ -29,7 +29,7 @@ Currently present at a rough level:
 - The backend has basic color/blob vision helpers and task sequence builders.
 - Firmware/backend protocol parsing includes some newer status fields.
 - Firmware/backend now have a timed `TRAJ` upload/start path for multi-waypoint motion, replacing repeated hardware `MOVEJ` waypoint streaming for linear/program paths.
-- The viewport faders have a first-pass Cartesian live jog mode using differential IK and `JOGV` firmware velocity updates.
+- The viewport faders use a fixed-rate, direction-constrained Cartesian servo and synchronized `SERVOJ` firmware position segments.
 - Encoder readback fields exist in software, but are not a real hardware workflow yet.
 - Analytic IK seed generation exists as a backend first pass and has regression tests.
 - Backend unit tests currently pass, and the protocol stub plus full-arm controller firmware targets build.
@@ -48,7 +48,8 @@ Still missing or not production-ready:
 - Tool controls switch by selected tool, and unsupported tool commands are rejected in software; real unsafe/hardware states still need physical validation.
 - Tool TCP offsets drive the backend active TCP model as a first pass; visible 3D tool geometry and physical calibration still need work.
 - Tool pins can be edited from Settings. Encoder pins cannot be properly edited from Settings yet.
-- Camera preview should move out of the side panel into a movable popup.
+- Camera preview now uses a movable/resizable popup; live behavior still needs
+  verification with the physical USB camera.
 - DH editing needs an editable table workflow; the current table is derived/read-only.
 - FK and analytic seeding have been partially reconciled with the MATLAB prototype, but the Jacobian implementation still needs to be reconciled with the DH-frame cross-product model.
 - The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
@@ -60,7 +61,9 @@ Still missing or not production-ready:
 - End-effector speed/acceleration limits in `mm/s` and `mm/s^2` are not first-class motion settings yet.
 - Settings should show encoders only for base and shoulder. Elbow and wrist are servos for now.
 - AS5048A encoder configuration is not truly PC-app driven yet.
-- Vision and task workflows are placeholders, not operator-ready workflows.
+- The imported ArUco/color pipeline now feeds a normalized detection contract
+  and task previews, but physical camera validation and operator workflow polish
+  are still required.
 - Diagnostics and tests need to be organized around real failure modes.
 
 ## MATLAB Prototype Summary
@@ -268,9 +271,11 @@ Acceptance:
 
 ### SHELL-02: Camera Popup Instead Of Side-Panel Preview
 
-Status: missing.
+Status: implemented as a frontend first pass; needs physical camera/browser validation.
 
-Reality note: source review still shows the camera frame rendered inline in the Tasks side panel.
+Reality note: the Tasks panel now has compact camera controls. The annotated
+frame is rendered in a movable, resizable viewport popup with refresh and live
+polling. Closing the popup does not clear detections or stop live polling.
 
 Work:
 
@@ -767,7 +772,7 @@ Goal: dragging X/Y/Z/Phi controls should make the TCP move smoothly along Cartes
 
 Working assumption: this should be implemented as resolved-rate Cartesian jogging / differential IK. The current full IK preview path is still useful for "go to this point", but it is too heavy and too stop-start for live slider control.
 
-Reality note: the viewport faders now have an explicit `Cart Jog` mode with TCP and Phi speed limits. With that mode off they are preview-only; `Live Real` alone does not turn an IK target preview into Cartesian jogging. The backend exposes `/api/cartesian-jog` and `/api/cartesian-jog/stop`, computes one bounded local resolved-rate step per velocity sample with damped least-squares differential IK, seeds simulation jogs from the reported/current pose, vector-scales joint steps/velocity limits so the joint direction is not distorted, and uses `JOGV`/`JOG STOP` for hardware. Rejected samples are not accumulated as a hidden Cartesian endpoint, so a smaller or reverse command is evaluated immediately from the last accepted seed. Frontend jog and stop requests are serialized so an old response cannot overwrite a newer drag. Translation-only jogs do not silently constrain Phi; Phi is included when the Phi jog command is non-zero. Firmware and the no-motor stub accept `JOGV`; the full controller integrates streamed joint velocities with acceleration limiting and has a watchdog that ramps velocity toward zero if updates stop. Locally constrained or near-singular directions report whether the local step is unreachable, would cause excessive lateral drift, or hit a joint limit. A repeatable simulation/debug harness exists at `pc_app/tools/debug_cartesian_jog.py` to sweep known poses and classify paths before testing on hardware. This has unit-test coverage, but live hardware smoothness still needs physical validation.
+Reality note: the viewport faders have an explicit `Cart Jog` mode with TCP and Phi speed limits. With that mode off they are preview-only. The backend now owns one fixed 20-40 Hz Cartesian servo state independent of browser request timing. It ramps the Cartesian command before IK, uses a DH geometric Jacobian, solves `J*qdot = scale*command` with exact zero lateral velocity and bounded joint speed/position, integrates one authoritative commanded pose, and sends synchronized `SERVOJ` position segments. The firmware follows each segment over one common duration and does not independently acceleration-limit each joint. This removes the former predicted-pose drift and double-smoothing path in `JOGV`. Translation-only jogs leave Phi unconstrained but use a deterministic joint-centering null-space preference. At an exact singular extension, a bounded nearby endpoint-IK step can establish motion in a valid inward direction before the differential solver takes over. Unavailable directions stop instead of moving sideways. Regression coverage checks all six XYZ directions, opposite-direction authority, no backtracking during a held command, Jacobian agreement, singularity escape, reversal behavior, API behavior, and both firmware builds. Physical hardware validation is still required after flashing the updated controller.
 
 Work:
 
@@ -797,7 +802,7 @@ Work:
   - clamp joint velocity, joint acceleration, joint limits, TCP speed, and TCP acceleration,
   - stream short joint targets or mini timed `TRAJ` updates at a safe fixed rate,
   - stop cleanly when input stops or target is reached.
-  Status: implemented with `/api/cartesian-jog`, differential IK, command throttling, speed/accel clamping, and `JOGV`.
+  Status: implemented with `/api/cartesian-jog`, a fixed-rate direction-constrained Cartesian servo, task-space acceleration limiting, and synchronized `SERVOJ` segments.
 - Add singularity and limit handling:
   - damped least-squares fallback near singular Jacobians,
   - reject or slow commands that require excessive joint velocity,
@@ -813,7 +818,7 @@ Work:
   - a live jog/servo mode with watchdog timeout,
   - queued mini-trajectories that replace smoothly,
   - no uncontrolled motion if PC updates stop.
-  Status: `JOGV` live jog with acceleration ramping and watchdog deceleration is implemented. Queued mini-trajectory replacement remains a possible refinement if hardware tests show velocity jog is still not smooth enough.
+  Status: synchronized finite-duration `SERVOJ` segments are implemented. Loss of PC updates cannot continue indefinite motion because each segment ends at a finite target; `JOG STOP` freezes the active segment.
 - Add optional plane constraints:
   - XY plane at fixed Z,
   - XZ plane at fixed Y,
@@ -1058,9 +1063,17 @@ Future work:
 
 ### VISION-01: Live Annotated Camera Popup
 
-Status: missing.
+Status: implemented as a first pass; needs physical camera validation.
 
-Reality note: detection refresh and annotated frame plumbing exist, but the UI still renders the camera inline in the Tasks side panel.
+Reality note: the popup shows the imported workspace mask, ArUco markers,
+multi-object annotations, pixel coordinates, calibrated robot coordinates, and
+calibration source. Live polling uses one shared persistent camera handle. The
+workspace tag detector tries the configured `DICT_4X4_50` table tags plus
+`DICT_APRILTAG_36H11` as a fallback because the physical table tags may come
+from either setup. During temporary physical setup, the tags may be absent; the
+task detector should still operate from the saved ZIP homography and saved
+workspace bounds, and the UI should label that as saved calibration rather than
+a vision failure.
 
 Work:
 
@@ -1084,7 +1097,7 @@ Status: partial or missing.
 
 Work:
 
-- Add editable color profiles.
+- Add editable color profiles under Tasks, not under calibration Settings.
 - Use HSV thresholds for first pass.
 - Save profiles to `robot.local.yaml`.
 - Support enabling/disabling colors per task.
@@ -1097,7 +1110,13 @@ Acceptance:
 
 ### VISION-03: Camera-To-Robot Calibration
 
-Status: backend helper exists, UI missing.
+Status: partial.
+
+Reality note: the known-working `DICT_4X4_50` reference points and robot
+coordinates from `vision_robot_project.zip` are integrated as a saved homography
+with live-marker recalculation and resolution/aspect validation. The settings UI
+can enable the pipeline and its inverted/normal detection behavior. A guided
+four-point capture/editor workflow is still missing.
 
 Work:
 
@@ -1115,7 +1134,12 @@ Acceptance:
 
 ### VISION-04: Detection State Contract
 
-Status: missing.
+Status: implemented as a first pass.
+
+Reality note: color and external AI detections now share `id`, `label`,
+`confidence`, image geometry, optional robot coordinates, coordinate source,
+timestamp, task eligibility, and projection diagnostics. `/api/vision/project`
+is the model-independent adapter for future YOLO output.
 
 Work:
 
@@ -1139,7 +1163,7 @@ Status: implemented as a first pass for the fixed workspace.
 
 Working assumption: `DICT_APRILTAG_36H11` tags 0-3 are 40 mm squares placed inside the workspace. The configured coordinates are the four 478 x 315 mm workspace corners, not tag centers. Tag 0's bottom-left, tag 1's bottom-right, tag 2's top-right, and tag 3's top-left corner coincide with those workspace corners. Each printed top edge points toward robot +Y. The Logitech C270 currently uses a clearly labeled 55-degree-diagonal-FOV intrinsic estimate; per-camera checkerboard calibration remains required for accurate distortion and millimeter projection.
 
-Reality note: `app/apriltag_calibration.py` now owns tag detection, world-corner generation, robust PnP solving/refinement, planar homography fallback, camera-pose inversion, reprojection/tilt/inlier/confidence metrics, frame accumulation, distortion-aware workspace-plane ray projection, and invalidation when camera pixel geometry changes. FastAPI exposes reset, capture/accumulate, status, save, and verify endpoints. Settings provides intrinsics entry, collection, save, verification, annotated frames, and metrics. `tools/calibrate_apriltags.py` provides the same fixed-camera workflow outside the GUI. Saving requires every configured tag to reach the minimum observation count and an accepted 6-DoF pose.
+Reality note: `app/apriltag_calibration.py` now owns tag detection, world-corner generation, robust PnP solving/refinement, planar homography fallback, camera-pose inversion, reprojection/tilt/inlier/confidence metrics, frame accumulation, distortion-aware workspace-plane ray projection, and invalidation when camera pixel geometry changes. FastAPI exposes reset, capture/accumulate, status, save, and verify endpoints. Settings provides collection, save, verification, annotated frames, and metrics. `tools/calibrate_apriltags.py` provides the same fixed-camera workflow outside the GUI. Saving requires every configured tag to reach the minimum observation count; with no measured intrinsics it saves a planar homography, while a full accepted 6-DoF pose remains the optional higher-detail path.
 
 Work:
 

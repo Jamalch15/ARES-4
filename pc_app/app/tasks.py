@@ -102,10 +102,15 @@ def build_sorting_sequence(
     detection: dict[str, Any],
     color_profiles: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    color = str(detection.get("color", ""))
+    color = str(detection.get("label", detection.get("color", "")))
     if color not in color_profiles:
         return {"ok": False, "errors": [f"unknown color profile {color}"], "steps": [], "waypoints": []}
+    if color_profiles[color].get("enabled", True) is False:
+        return {"ok": False, "errors": [f"color profile {color} is disabled"], "steps": [], "waypoints": []}
     robot = detection.get("robot") or detection.get("target") or detection
+    if not isinstance(robot, dict) or robot.get("x_mm") is None or robot.get("y_mm") is None:
+        reason = detection.get("projection_error") or "detection has no calibrated robot coordinates"
+        return {"ok": False, "errors": [str(reason)], "steps": [], "waypoints": []}
     profile = color_profiles[color]
     drop_zone = profile.get("drop_zone")
     sequence = build_pick_and_place_sequence(config, robot, drop_zone)
@@ -119,11 +124,26 @@ def build_batch_sorting_sequence(
     detections: list[dict[str, Any]],
     color_profiles: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    valid = [detection for detection in detections if detection.get("ok") and detection.get("color")]
+    valid = [
+        detection
+        for detection in detections
+        if detection.get("ok")
+        and str(detection.get("label", detection.get("color", ""))) in color_profiles
+        and color_profiles[str(detection.get("label", detection.get("color", "")))].get("enabled", True)
+        and isinstance(detection.get("robot"), dict)
+    ]
     if not valid:
-        return {"ok": False, "errors": ["no sortable detections"], "steps": [], "waypoints": []}
+        return {
+            "ok": False,
+            "errors": ["no calibrated detections match an enabled color profile"],
+            "steps": [],
+            "waypoints": [],
+        }
 
-    grouped = sorted(valid, key=lambda detection: str(detection.get("color", "")))
+    grouped = sorted(
+        valid,
+        key=lambda detection: str(detection.get("label", detection.get("color", ""))),
+    )
     all_steps: list[dict[str, Any]] = []
     all_waypoints: list[dict[str, Any]] = []
     objects: list[dict[str, Any]] = []

@@ -1,5 +1,30 @@
 # Camera Settings Display Code Analysis
 
+## 2026-06-18 Vision Integration Update
+
+Follow-up correction: the working table pipeline is now planar-first. Camera
+intrinsics are not required for the fixed-workspace homography imported from
+`vision_robot_project.zip` or for saving a planar tag calibration. They are
+only required for the optional full 6-DoF AprilTag camera pose path.
+
+This file originally described the earlier camera-settings path. The current
+implementation now also includes:
+
+- A movable/resizable camera popup instead of an inline Tasks preview.
+- A shared persistent backend camera handle.
+- The `vision_robot_project.zip` inverted `DICT_4X4_50` workspace homography.
+- Workspace-masked multi-object color detection.
+- A detector-neutral object contract and `/api/vision/project` adapter for
+  future YOLO/AI detections.
+- Editable camera enable, intrinsics, and workspace-tag calibration controls.
+  Color/object detection is surfaced from the Tasks panel, not Settings.
+
+The ZIP assumes camera index `1`, but hardware enumeration on 2026-06-18 found
+the 640x480 workspace camera at index `2`; index `1` is EOS Webcam Utility at
+1280x720, and index `0` is a disabled/blocked camera placeholder. The active
+ignored `robot.local.yaml` uses index `2`. The saved homography remains
+setup-specific and must be recaptured if the camera or work plate moves.
+
 ## Summary
 Camera settings are **fully implemented** in the codebase and should be displaying correctly. The system follows this flow:
 1. **Backend** sends camera settings via `camera_settings()` function in `app/demo_settings.py`
@@ -48,17 +73,17 @@ The camera settings are displayed in a dedicated settings section:
     <button id="saveCameraIntrinsicsBtn" type="button">Save camera settings</button>
   </div>
 
-  <!-- AprilTag calibration section -->
+  <!-- Tag workspace calibration section -->
   <div class="subsection-heading">
-    <h3>AprilTag pose calibration</h3>
-    <p class="hint">Collect stable frames, save the solved camera pose, then verify it against a fresh image.</p>
+    <h3>Tag workspace calibration</h3>
+    <p class="hint">Collect stable tag frames, save planar workspace calibration, then verify it against a fresh image.</p>
   </div>
   
   <div class="button-row calibration-actions">
     <button id="resetAprilTagBtn" type="button" class="ghost">Reset Samples</button>
     <button id="captureAprilTagBtn" type="button">Capture</button>
     <button id="collectAprilTagBtn" type="button" class="primary">Collect 12</button>
-    <button id="saveAprilTagBtn" type="button">Save Pose</button>
+    <button id="saveAprilTagBtn" type="button">Save Calibration</button>
     <button id="verifyAprilTagBtn" type="button">Verify</button>
   </div>
   
@@ -436,7 +461,7 @@ If camera settings **aren't showing**, check these:
 2. **Expected to see:**
    - "Camera and workspace calibration" heading
    - Camera model subsection with 8 input fields
-   - AprilTag pose calibration subsection with 5 buttons
+   - Tag workspace calibration subsection with 5 buttons
    - Camera frame display area
    
 3. **Check browser console:**

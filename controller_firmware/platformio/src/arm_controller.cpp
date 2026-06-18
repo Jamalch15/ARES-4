@@ -175,6 +175,14 @@ struct TrajectoryRuntime {
   float durationS = 0.0f;
 };
 
+struct PositionStreamRuntime {
+  bool active = false;
+  unsigned long startUs = 0;
+  float durationS = 0.0f;
+  float startDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float targetDeg[kJointCount] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
 ControllerState controllerState = ControllerState::Idle;
 JointConfig joints[kJointCount];
 JointConfig draftJoints[kJointCount];
@@ -184,6 +192,7 @@ StepperRuntime stepperRuntime[kJointCount];
 ServoRuntime servoRuntime[kJointCount];
 ToolRuntime toolRuntime;
 TrajectoryRuntime trajectoryRuntime;
+PositionStreamRuntime positionStreamRuntime;
 float currentJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
 float targetJointsDeg[kJointCount] = {kDefaultHome[0], kDefaultHome[1], kDefaultHome[2], kDefaultHome[3]};
 float lastSpeedDegS = 25.0f;
@@ -362,6 +371,9 @@ void clearTrajectory() {
 }
 
 void clearJogMotion(bool freezeTarget = false) {
+  positionStreamRuntime.active = false;
+  positionStreamRuntime.startUs = 0;
+  positionStreamRuntime.durationS = 0.0f;
   jogActive = false;
   jogVelocityMode = false;
   jogStopRequested = false;
@@ -781,7 +793,7 @@ bool validateJointLimits(const float requested[kJointCount]) {
 }
 
 bool hasHardwareMotionPending() {
-  if (trajectoryRuntime.active) {
+  if (trajectoryRuntime.active || positionStreamRuntime.active) {
     return true;
   }
   for (int i = 0; i < kJointCount; i++) {
@@ -928,6 +940,59 @@ void updateTrajectoryFollower(unsigned long nowUs) {
     trajectoryRuntime.ready = false;
     setTargetPose(requested);
   }
+}
+
+void updatePositionStream(unsigned long nowUs) {
+  if (!positionStreamRuntime.active) {
+    return;
+  }
+  if (!armed || controllerState == ControllerState::Estop || controllerState == ControllerState::Stopped ||
+      controllerState == ControllerState::Fault) {
+    clearJogMotion(true);
+    return;
+  }
+
+  const float durationS = max(0.005f, positionStreamRuntime.durationS);
+  const float elapsedS = static_cast<float>(nowUs - positionStreamRuntime.startUs) / 1000000.0f;
+  const float progress = clampFloat(elapsedS / durationS, 0.0f, 1.0f);
+  bool hardwarePending = false;
+
+  for (int i = 0; i < kJointCount; i++) {
+    const float desired =
+        positionStreamRuntime.startDeg[i] +
+        (positionStreamRuntime.targetDeg[i] - positionStreamRuntime.startDeg[i]) * progress;
+    targetJointsDeg[i] = desired;
+    if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].targetSteps = jointDegToSteps(i, desired);
+      hardwarePending = hardwarePending || stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps;
+    } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
+      currentJointsDeg[i] = desired;
+      if (servoRuntime[i].attached && nowUs - servoRuntime[i].lastUpdateUs >= 20000UL) {
+        servoRuntime[i].lastUpdateUs = nowUs;
+        servoRuntime[i].velocityDegS = 0.0f;
+        servoRuntime[i].pulseUs = servoPulseForJoint(i, desired);
+        writeServoPwm(i, true);
+      }
+    } else {
+      currentJointsDeg[i] = desired;
+    }
+  }
+
+  if (progress >= 1.0f) {
+    positionStreamRuntime.active = false;
+    for (int i = 0; i < kJointCount; i++) {
+      targetJointsDeg[i] = positionStreamRuntime.targetDeg[i];
+      if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+        stepperRuntime[i].targetSteps = jointDegToSteps(i, targetJointsDeg[i]);
+        hardwarePending = hardwarePending || stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps;
+      } else {
+        currentJointsDeg[i] = targetJointsDeg[i];
+      }
+    }
+  }
+
+  controllerState = positionStreamRuntime.active || hardwarePending ? ControllerState::Moving : ControllerState::Idle;
+  clearFaultText();
 }
 
 bool anyJogVelocityPending() {
@@ -1323,7 +1388,11 @@ void handleMoveJ(const char* buffer) {
 void handleJog(const String& rawCommand, const String& upperCommand, const char* buffer) {
   (void)rawCommand;
   if (upperCommand.startsWith("JOG STOP")) {
-    requestJogVelocityStop();
+    if (positionStreamRuntime.active) {
+      clearJogMotion(true);
+    } else {
+      requestJogVelocityStop();
+    }
     ARM_SERIAL.println("OK command=JOG_STOP");
     printStatus();
     return;
@@ -1342,6 +1411,41 @@ void handleJog(const String& rawCommand, const String& upperCommand, const char*
   }
   if (trajectoryRuntime.active || trajectoryRuntime.receiving) {
     printError("STATE", "trajectory_active");
+    return;
+  }
+
+  if (upperCommand.startsWith("SERVOJ")) {
+    float requested[kJointCount] = {};
+    float durationS = 0.0f;
+    const int parsed =
+        sscanf(buffer, "%*s %f %f %f %f %f", &requested[0], &requested[1], &requested[2], &requested[3], &durationS);
+    if (parsed != 5) {
+      printError("USAGE", "SERVOJ_requires_j1_j2_j3_j4_duration");
+      return;
+    }
+    if (durationS < 0.005f || durationS > 0.250f) {
+      printError("LIMIT", "SERVOJ_duration_out_of_range");
+      return;
+    }
+    if (!validateJointLimits(requested)) {
+      return;
+    }
+
+    clearTrajectory();
+    clearJogMotion(false);
+    positionStreamRuntime.active = true;
+    positionStreamRuntime.startUs = micros();
+    positionStreamRuntime.durationS = durationS;
+    lastSpeedDegS = 0.1f;
+    for (int i = 0; i < kJointCount; i++) {
+      positionStreamRuntime.startDeg[i] = currentJointsDeg[i];
+      positionStreamRuntime.targetDeg[i] = requested[i];
+      const float requiredSpeed = fabsf(requested[i] - currentJointsDeg[i]) / durationS;
+      lastSpeedDegS = max(lastSpeedDegS, requiredSpeed);
+    }
+    controllerState = ControllerState::Moving;
+    clearFaultText();
+    ARM_SERIAL.printf("OK command=SERVOJ hw=%s\r\n", hardwareMode().c_str());
     return;
   }
 
@@ -1703,7 +1807,7 @@ void updateSteppers(unsigned long nowUs) {
 }
 
 void updateServoPwm(unsigned long nowUs) {
-  if (jogActive && jogVelocityMode) {
+  if ((jogActive && jogVelocityMode) || positionStreamRuntime.active) {
     return;
   }
   if (!armed || controllerState == ControllerState::Estop || controllerState == ControllerState::Stopped ||
@@ -1808,7 +1912,8 @@ void handleCommand(String rawCommand) {
     handleSetPose(buffer);
   } else if (strcasecmp(command, "MOVEJ") == 0) {
     handleMoveJ(buffer);
-  } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 || strcasecmp(command, "JOG") == 0) {
+  } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 ||
+             strcasecmp(command, "SERVOJ") == 0 || strcasecmp(command, "JOG") == 0) {
     handleJog(rawCommand, upperCommand, buffer);
   } else if (strcasecmp(command, "TRAJ") == 0) {
     handleTrajectory(rawCommand, upperCommand);
@@ -1881,6 +1986,7 @@ void loop() {
   updateJogWatchdog(nowMs);
   updateJogVelocity(nowUs);
   updateTrajectoryFollower(nowUs);
+  updatePositionStream(nowUs);
   updateSteppers(nowUs);
   updateServoPwm(nowUs);
 

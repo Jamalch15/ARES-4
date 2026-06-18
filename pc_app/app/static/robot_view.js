@@ -642,6 +642,66 @@ function activeGeometryPreset(config) {
   return activeName && presets[activeName] ? presets[activeName] : {};
 }
 
+function clamp01(value, fallback = 1) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(1, Math.max(0, numeric));
+}
+
+function makeWorkspaceCameraProjectionMesh(texture, projection, opacity) {
+  const bounds = projection?.robot_bounds_mm || {};
+  const minX = Number(bounds.min_x);
+  const maxX = Number(bounds.max_x);
+  const minY = Number(bounds.min_y);
+  const maxY = Number(bounds.max_y);
+  const z = Number(bounds.z ?? 1.2);
+  if (![minX, maxX, minY, maxY, z].every(Number.isFinite) || maxX <= minX || maxY <= minY) {
+    return null;
+  }
+
+  const corners = [
+    robotToScene({ x: minX, y: maxY, z }),
+    robotToScene({ x: maxX, y: maxY, z }),
+    robotToScene({ x: maxX, y: minY, z }),
+    robotToScene({ x: minX, y: minY, z }),
+  ];
+  const positions = [];
+  corners.forEach((corner) => positions.push(corner.x, corner.y, corner.z));
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute(
+    "uv",
+    new THREE.Float32BufferAttribute(
+      [
+        0, 1,
+        1, 1,
+        1, 0,
+        0, 0,
+      ],
+      2
+    )
+  );
+  geometry.setIndex([0, 1, 2, 0, 2, 3]);
+  geometry.computeVertexNormals();
+
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    opacity: clamp01(opacity, 0.72),
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  material.userData.disposeWithObject = true;
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.renderOrder = 3;
+  mesh.userData.kind = "workspaceCameraProjection";
+  return mesh;
+}
+
 export class RobotView {
   constructor(container) {
     this.container = container;
@@ -655,6 +715,7 @@ export class RobotView {
     this.previewAngles = null;
     this.lastRenderedAngles = null;
     this.lastConfigSignature = "";
+    this.cameraProjectionLoadId = 0;
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x171f2d);
 
@@ -694,14 +755,17 @@ export class RobotView {
     this.overlayGroup = new THREE.Group();
     this.objectGroup = new THREE.Group();
     this.calibrationGroup = new THREE.Group();
+    this.cameraProjectionGroup = new THREE.Group();
     this.workPlateGroup = makeWorkPlate();
     this.scene.add(this.workPlateGroup);
+    this.scene.add(this.cameraProjectionGroup);
     this.scene.add(this.armGroup);
     this.scene.add(this.previewGroup);
     this.scene.add(this.overlayGroup);
     this.scene.add(this.objectGroup);
     this.scene.add(this.calibrationGroup);
     this.container.dataset.workPlate = `${WORK_PLATE.widthXMm}x${WORK_PLATE.depthYMm}@y${WORK_PLATE.centerYMm}`;
+    this.container.dataset.workspaceCameraProjection = "off";
 
     const ambient = new THREE.AmbientLight(0xffffff, 0.8);
     const key = new THREE.DirectionalLight(0xffffff, 1.3);
@@ -811,6 +875,9 @@ export class RobotView {
     this.previewAngles = null;
     this.renderRobot();
     this.setAprilTagCalibration(this.config.camera?.calibration?.apriltag || null);
+    if (!this.config.camera?.display?.project_live_view) {
+      this.setWorkspaceCameraProjection(null, false);
+    }
   }
 
   setAngles(angles) {
@@ -940,6 +1007,54 @@ export class RobotView {
     });
     this.container.dataset.objectMarkerCount = String(count);
     this.render();
+  }
+
+  setWorkspaceCameraProjection(projection, enabled = true) {
+    this.cameraProjectionLoadId += 1;
+    clearGroup(this.cameraProjectionGroup);
+    if (!enabled) {
+      this.container.dataset.workspaceCameraProjection = "off";
+      this.render();
+      return;
+    }
+    if (!projection?.ok || !projection.image_b64 || !projection.robot_bounds_mm) {
+      this.container.dataset.workspaceCameraProjection = "unavailable";
+      this.render();
+      return;
+    }
+
+    const loadId = this.cameraProjectionLoadId;
+    this.container.dataset.workspaceCameraProjection = "loading";
+    new THREE.TextureLoader().load(
+      projection.image_b64,
+      (texture) => {
+        if (loadId !== this.cameraProjectionLoadId) {
+          texture.dispose();
+          return;
+        }
+        texture.colorSpace = THREE.SRGBColorSpace;
+        const opacity = this.config.camera?.display?.projection_opacity ?? 0.72;
+        const mesh = makeWorkspaceCameraProjectionMesh(texture, projection, opacity);
+        if (!mesh) {
+          texture.dispose();
+          this.container.dataset.workspaceCameraProjection = "invalid-bounds";
+          this.render();
+          return;
+        }
+        this.cameraProjectionGroup.add(mesh);
+        const size = projection.texture_size_px || {};
+        const source = projection.homography_source || "unknown";
+        this.container.dataset.workspaceCameraProjection = `${source}|${size.width || 0}x${size.height || 0}`;
+        this.render();
+      },
+      undefined,
+      () => {
+        if (loadId === this.cameraProjectionLoadId) {
+          this.container.dataset.workspaceCameraProjection = "load-failed";
+          this.render();
+        }
+      }
+    );
   }
 
   setAprilTagCalibration(calibration) {

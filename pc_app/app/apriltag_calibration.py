@@ -10,6 +10,8 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from .workspace_calibration import detect_fiducials
+
 
 APRILTAG_DICTIONARIES = {
     "DICT_APRILTAG_16H5": cv2.aruco.DICT_APRILTAG_16H5,
@@ -53,6 +55,9 @@ def april_tag_settings(camera: dict[str, Any]) -> dict[str, Any]:
     defaults = {
         "enabled": True,
         "dictionary": "DICT_APRILTAG_36H11",
+        "dictionary_candidates": ["DICT_APRILTAG_36H11"],
+        "invert_first": False,
+        "allow_normal_fallback": True,
         "tag_size_mm": 40.0,
         "required_ids": [0, 1, 2, 3],
         "min_tags_for_pose": 2,
@@ -129,19 +134,12 @@ def camera_intrinsics(camera: dict[str, Any]) -> tuple[np.ndarray | None, np.nda
 
 
 def detect_apriltags(image_bgr: np.ndarray, settings: dict[str, Any]) -> list[AprilTagDetection]:
-    dictionary_name = str(settings.get("dictionary", "DICT_APRILTAG_36H11")).upper()
-    dictionary_id = APRILTAG_DICTIONARIES.get(dictionary_name)
-    if dictionary_id is None:
-        raise ValueError(f"unsupported AprilTag dictionary: {dictionary_name}")
-    parameters = cv2.aruco.DetectorParameters()
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
-    detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dictionary_id), parameters)
-    corners, ids, _rejected = detector.detectMarkers(image_bgr)
-    if ids is None:
+    detection = detect_fiducials(image_bgr, settings)
+    if detection.ids is None:
         return []
     return [
         AprilTagDetection(int(tag_id), np.asarray(tag_corners, dtype=np.float64).reshape(4, 2))
-        for tag_corners, tag_id in zip(corners, ids.reshape(-1), strict=True)
+        for tag_corners, tag_id in zip(detection.corners, detection.ids.reshape(-1), strict=True)
     ]
 
 
@@ -296,7 +294,11 @@ def estimate_camera_pose(
         "planar": planar,
     }
     if camera_matrix is None:
-        base["error"] = "; ".join(intrinsic_errors)
+        base["planar_only"] = bool(planar.get("ok"))
+        base["error"] = (
+            "; ".join(intrinsic_errors)
+            + ("; planar homography is available without camera intrinsics" if planar.get("ok") else "")
+        )
         return base
     min_tags = max(1, int(settings.get("min_tags_for_pose", 2)))
     if len(tags_used) < min_tags:
@@ -634,13 +636,22 @@ def annotate_apriltag_frame(
             )
     status = "No pose"
     if result:
-        metrics = result.get("metrics") or {}
-        status = (
-            f"{'ACCEPTED' if result.get('accepted') else 'REJECTED'} "
-            f"tags={len(result.get('tags_used', []))} "
-            f"rmse={metrics.get('reprojection_rmse_px', 0):.2f}px "
-            f"conf={metrics.get('confidence', 0):.2f}"
-        )
+        if result.get("ok"):
+            metrics = result.get("metrics") or {}
+            status = (
+                f"{'ACCEPTED' if result.get('accepted') else 'REJECTED'} "
+                f"tags={len(result.get('tags_used', []))} "
+                f"rmse={metrics.get('reprojection_rmse_px', 0):.2f}px "
+                f"conf={metrics.get('confidence', 0):.2f}"
+            )
+        elif (result.get("planar") or {}).get("ok"):
+            planar = result.get("planar") or {}
+            status = (
+                f"PLANAR tags={len(planar.get('tags_used', []))} "
+                f"rmse={planar.get('rmse_mm', 0):.2f}mm"
+            )
+        elif result.get("error"):
+            status = str(result["error"])[:80]
     cv2.rectangle(annotated, (8, 8), (min(annotated.shape[1] - 8, 620), 40), (12, 16, 24), -1)
     cv2.putText(annotated, status, (16, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (235, 240, 248), 2, cv2.LINE_AA)
     return annotated

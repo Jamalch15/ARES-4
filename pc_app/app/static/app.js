@@ -1,4 +1,4 @@
-import { RobotView } from "/static/robot_view.js?v=20260618-settings-revamp-3";
+import { RobotView } from "/static/robot_view.js?v=20260618-workspace-projection";
 
 const state = {
   config: null,
@@ -33,6 +33,8 @@ const state = {
   selectedSerialPort: null,
   latestDetections: [],
   cameraTimer: null,
+  cameraInFlight: false,
+  cameraLive: false,
   linkDraft: null,
   dhDraftRows: null,
   toolSliderDraftValue: null,
@@ -53,7 +55,10 @@ const state = {
   cartesianJogStopInFlight: false,
   aprilTagBusy: false,
   aprilTagStatus: null,
+  versionTimer: null,
 };
+
+const PAGE_BUILD_ID = document.querySelector('meta[name="app-build-id"]')?.content || "unknown";
 
 const geometryDimensionFields = [
   ["L_1", "L1", "Base vertical section"],
@@ -84,6 +89,7 @@ const $ = (selector) => document.querySelector(selector);
 
 const elements = {
   appLayout: $("#appLayout"),
+  mainPanel: document.querySelector(".main-panel"),
   appTabs: document.querySelectorAll("[data-app-tab]"),
   appTabPanels: {
     joint: $("#jointTab"),
@@ -140,6 +146,8 @@ const elements = {
   cartesianJogSpeedInput: $("#cartesianJogSpeedInput"),
   cartesianJogPhiSpeedInput: $("#cartesianJogPhiSpeedInput"),
   cartesianJogStatus: $("#cartesianJogStatus"),
+  buildStatus: $("#buildStatus"),
+  buildStatusText: $("#buildStatusText"),
   applyJointPreviewBtn: $("#applyJointPreviewBtn"),
   resetJointPreviewBtn: $("#resetJointPreviewBtn"),
   hardwareArmToggle: $("#hardwareArmToggle"),
@@ -202,7 +210,14 @@ const elements = {
   executeTaskBtn: $("#executeTaskBtn"),
   taskStatus: $("#taskStatus"),
   taskSummary: $("#taskSummary"),
+  viewCameraBtn: $("#viewCameraBtn"),
   detectVisionBtn: $("#detectVisionBtn"),
+  cameraPopup: $("#cameraPopup"),
+  cameraPopupHandle: $("#cameraPopupHandle"),
+  cameraPopupStatus: $("#cameraPopupStatus"),
+  cameraPopupRefreshBtn: $("#cameraPopupRefreshBtn"),
+  cameraLiveToggle: $("#cameraLiveToggle"),
+  closeCameraPopupBtn: $("#closeCameraPopupBtn"),
   cameraFrame: $("#cameraFrame"),
   cameraPlaceholder: $("#cameraPlaceholder"),
   detectionList: $("#detectionList"),
@@ -214,9 +229,14 @@ const elements = {
   toolCalibration: $("#toolCalibration"),
   encoderCalibration: $("#encoderCalibration"),
   aprilTagStatus: $("#aprilTagStatus"),
+  cameraEnabledInput: $("#cameraEnabledInput"),
   cameraSourceInput: $("#cameraSourceInput"),
   cameraWidthInput: $("#cameraWidthInput"),
   cameraHeightInput: $("#cameraHeightInput"),
+  workspaceProjectionInput: $("#workspaceProjectionInput"),
+  workspaceArucoEnabledInput: $("#workspaceArucoEnabledInput"),
+  workspaceArucoInvertInput: $("#workspaceArucoInvertInput"),
+  workspaceArucoFallbackInput: $("#workspaceArucoFallbackInput"),
   cameraFxInput: $("#cameraFxInput"),
   cameraFyInput: $("#cameraFyInput"),
   cameraCxInput: $("#cameraCxInput"),
@@ -233,6 +253,53 @@ const elements = {
   aprilTagMetrics: $("#aprilTagMetrics"),
   aprilTagDetections: $("#aprilTagDetections"),
 };
+
+function renderBuildStatus(version) {
+  if (!elements.buildStatus || !elements.buildStatusText) return;
+  const browserStale = Boolean(version?.running_build_id && PAGE_BUILD_ID !== version.running_build_id);
+  const serverStale = Boolean(version?.restart_required);
+  const checkoutStale = Boolean(version?.pull_required);
+  elements.buildStatus.classList.toggle("stale", browserStale || serverStale || checkoutStale);
+  elements.buildStatus.classList.toggle("current", !browserStale && !serverStale && !checkoutStale);
+  elements.buildStatus.dataset.action = browserStale
+    ? "reload"
+    : checkoutStale
+      ? "pull"
+      : serverStale
+        ? "restart"
+        : "current";
+  if (browserStale) {
+    elements.buildStatusText.textContent = "Browser outdated - click to reload";
+  } else if (checkoutStale) {
+    elements.buildStatusText.textContent = "Code outdated - pull origin/main";
+  } else if (serverStale) {
+    elements.buildStatusText.textContent = "Server outdated - restart localhost";
+  } else {
+    const commit = version?.git_commit ? ` ${version.git_commit.slice(0, 7)}` : "";
+    elements.buildStatusText.textContent = `Current checkout${commit}`;
+  }
+  elements.buildStatus.title = [
+    ...(version?.reasons || []),
+    `Browser build: ${PAGE_BUILD_ID}`,
+    `Server build: ${version?.running_build_id || "unknown"}`,
+    `Files on disk: ${version?.disk_build_id || "unknown"}`,
+    `Server commit: ${version?.git_commit || "unknown"}`,
+    `Local HEAD: ${version?.current_git_commit || "unknown"}`,
+    `origin/main: ${version?.origin_main_commit || "unavailable"}`,
+    version?.checkout_path ? `Checkout: ${version.checkout_path}` : "",
+    version?.started_at ? `Server started: ${version.started_at}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+async function checkAppVersion() {
+  try {
+    const response = await fetch(`/api/version?t=${Date.now()}`, { cache: "no-store" });
+    renderBuildStatus(await response.json());
+  } catch {
+    if (elements.buildStatusText) elements.buildStatusText.textContent = "Version check unavailable";
+    elements.buildStatus?.classList.add("stale");
+  }
+}
 
 function format(value, decimals = 1) {
   return Number(value || 0).toFixed(decimals);
@@ -1015,6 +1082,17 @@ function renderOperatorPanels() {
 
   if (elements.sortColorSelect) elements.sortColorSelect.innerHTML = "";
   if (elements.visionProfileList) elements.visionProfileList.innerHTML = "";
+  if (elements.visionProfileList) {
+    const camera = state.config.camera || {};
+    const workspace = camera.calibration?.workspace_aruco || {};
+    const line = document.createElement("div");
+    line.className = "log-line";
+    const dictionaries = workspace.dictionary_candidates?.length
+      ? workspace.dictionary_candidates.join(", ")
+      : workspace.dictionary || "no workspace tags";
+    line.innerHTML = `<span>Task vision</span><code>${camera.detection?.provider || "workspace_color"} | tags ${dictionaries}</code>`;
+    elements.visionProfileList.appendChild(line);
+  }
   Object.entries(state.config.color_profiles || {}).forEach(([name, profile]) => {
     if (elements.sortColorSelect) {
       const option = document.createElement("option");
@@ -1351,32 +1429,133 @@ async function executeTask() {
   await refreshDiagnostics();
 }
 
+function setCameraPopupVisible(visible) {
+  if (!elements.cameraPopup) return;
+  elements.cameraPopup.hidden = !visible;
+  if (visible) {
+    elements.cameraPopupStatus.textContent = state.cameraLive ? "Live detection active" : "Ready";
+  }
+}
+
+function cameraLiveIntervalMs() {
+  return clamp(Number(state.config?.camera?.detection?.live_interval_ms || 450), 150, 5000);
+}
+
+function scheduleCameraFrame(delayMs = cameraLiveIntervalMs()) {
+  window.clearTimeout(state.cameraTimer);
+  state.cameraTimer = null;
+  if (!state.cameraLive) return;
+  state.cameraTimer = window.setTimeout(detectVision, Math.max(0, delayMs));
+}
+
+function setCameraLive(enabled) {
+  state.cameraLive = Boolean(enabled);
+  if (elements.cameraLiveToggle) elements.cameraLiveToggle.checked = state.cameraLive;
+  if (state.cameraLive) {
+    scheduleCameraFrame(0);
+  } else {
+    window.clearTimeout(state.cameraTimer);
+    state.cameraTimer = null;
+    if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = "Stopped";
+  }
+}
+
+function workspaceProjectionEnabled() {
+  return Boolean(elements.workspaceProjectionInput?.checked);
+}
+
 async function detectVision() {
+  if (state.cameraInFlight) return;
+  state.cameraInFlight = true;
+  if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = "Detecting...";
   elements.visionSummary.innerHTML = `<div class="log-line"><span>Status</span><code>Detecting...</code></div>`;
-  const payload = await fetch("/api/vision/frame").then((response) => response.json());
-  elements.visionSummary.innerHTML = "";
-  if (!payload.ok) {
-    elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
-    if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = false;
-    return;
+  try {
+    const projectWorkspace = workspaceProjectionEnabled();
+    const query = new URLSearchParams({
+      t: String(Date.now()),
+      project_workspace: projectWorkspace ? "1" : "0",
+    });
+    const payload = await fetch(`/api/vision/frame?${query}`, { cache: "no-store" }).then((response) => response.json());
+    elements.visionSummary.innerHTML = "";
+    if (!payload.ok) {
+      elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
+      if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = false;
+      if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = payload.error || "Detection failed";
+      return;
+    }
+    state.latestDetections = (payload.detections || []).filter((detection) => detection.ok);
+    if (payload.image_b64 && elements.cameraFrame) {
+      elements.cameraFrame.src = payload.image_b64;
+      elements.cameraFrame.hidden = false;
+      if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = true;
+    }
+    renderDetectionList(payload.detections || []);
+    if (state.view) {
+      state.view.setObjectDetections(state.latestDetections);
+      state.view.setWorkspaceCameraProjection(payload.workspace_projection, projectWorkspace);
+    }
+    const workspace = payload.workspace || {};
+    const visibleTags = (workspace.visible_ids || []).join(", ") || "none";
+    const missingTags = (workspace.missing_ids || []).join(", ") || "none";
+    const frameSize = workspace.image_size_px ? ` | ${workspace.image_size_px.width}x${workspace.image_size_px.height}` : "";
+    const dictionary = workspace.dictionary || workspace.configured_dictionary || "no dictionary";
+    const mode = workspace.detection_mode || "none";
+    const tagsLine = document.createElement("div");
+    tagsLine.className = "log-line";
+    tagsLine.innerHTML = `<span>Reference tags</span><code>${dictionary} | ${mode} | visible ${visibleTags} | missing ${missingTags}${frameSize}</code>`;
+    elements.visionSummary.appendChild(tagsLine);
+    const calibrationLine = document.createElement("div");
+    calibrationLine.className = "log-line";
+    calibrationLine.innerHTML = `<span>Calibration</span><code>${workspace.message || workspace.error || payload.calibration_source || "unavailable"}</code>`;
+    elements.visionSummary.appendChild(calibrationLine);
+    if (workspace.workspace_polygon_source) {
+      const workspaceLine = document.createElement("div");
+      workspaceLine.className = "log-line";
+      const detectionSource = workspace.detection_source ? ` | detection ${workspace.detection_source}` : "";
+      workspaceLine.innerHTML = `<span>Workspace</span><code>${workspace.workspace_polygon_source}${detectionSource}</code>`;
+      elements.visionSummary.appendChild(workspaceLine);
+    }
+    if (projectWorkspace) {
+      const projection = payload.workspace_projection || {};
+      const projectionLine = document.createElement("div");
+      projectionLine.className = "log-line";
+      const texture = projection.texture_size_px
+        ? `${projection.texture_size_px.width}x${projection.texture_size_px.height}`
+        : "unavailable";
+      const source = projection.homography_source || workspace.homography_source || "no homography";
+      projectionLine.innerHTML = `<span>Workspace camera</span><code>${texture} | ${source}</code>`;
+      elements.visionSummary.appendChild(projectionLine);
+    }
+    if (workspace.warning) {
+      const warningLine = document.createElement("div");
+      warningLine.className = "log-line";
+      warningLine.innerHTML = `<span>Warning</span><code>${workspace.warning}</code>`;
+      elements.visionSummary.appendChild(warningLine);
+    }
+    (payload.detections || []).forEach((detection) => {
+      const line = document.createElement("div");
+      line.className = "log-line";
+      const center = detection.center_px ? `px ${format(detection.center_px.x, 0)}, ${format(detection.center_px.y, 0)}` : detection.reason || "-";
+      const robot = detection.robot
+        ? ` | x ${format(detection.robot.x_mm)} mm, y ${format(detection.robot.y_mm)} mm, z ${format(detection.robot.z_mm)} mm`
+        : detection.projection_error ? ` | ${detection.projection_error}` : "";
+      line.innerHTML = `<span>${detection.label || detection.color}</span><code>${detection.ok ? center + robot : detection.reason}</code>`;
+      elements.visionSummary.appendChild(line);
+    });
+    if (elements.cameraPopupStatus) {
+      const mode = state.cameraLive ? "Live" : "Frame";
+      const calibrationStatus = workspace.status || payload.calibration_source || "uncalibrated";
+      elements.cameraPopupStatus.textContent = `${mode} | ${state.latestDetections.length} object(s) | ${calibrationStatus}`;
+    }
+    await refreshDiagnostics();
+  } catch (error) {
+    const message = error?.message || String(error);
+    elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${message}</code></div>`;
+    if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = message;
+  } finally {
+    state.cameraInFlight = false;
+    scheduleCameraFrame();
   }
-  state.latestDetections = (payload.detections || []).filter((detection) => detection.ok);
-  if (payload.image_b64 && elements.cameraFrame) {
-    elements.cameraFrame.src = payload.image_b64;
-    elements.cameraFrame.hidden = false;
-    if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = true;
-  }
-  renderDetectionList(payload.detections || []);
-  if (state.view) state.view.setObjectDetections(state.latestDetections);
-  (payload.detections || []).forEach((detection) => {
-    const line = document.createElement("div");
-    line.className = "log-line";
-    const center = detection.center_px ? `px ${format(detection.center_px.x, 0)}, ${format(detection.center_px.y, 0)}` : detection.reason || "-";
-    const robot = detection.robot ? ` robot ${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}` : "";
-    line.innerHTML = `<span>${detection.color}</span><code>${detection.ok ? center + robot : detection.reason}</code>`;
-    elements.visionSummary.appendChild(line);
-  });
-  await refreshDiagnostics();
 }
 
 function setAprilTagBusy(busy, status = null) {
@@ -1397,9 +1576,20 @@ function setAprilTagBusy(busy, status = null) {
 function renderCameraIntrinsics(camera = state.config?.camera || {}) {
   const resolution = camera.resolution || {};
   const intrinsics = camera.intrinsics || {};
+  const display = camera.display || {};
+  const workspaceAruco = camera.calibration?.workspace_aruco || {};
+  if (elements.cameraEnabledInput) elements.cameraEnabledInput.checked = Boolean(camera.enabled);
   if (elements.cameraSourceInput) elements.cameraSourceInput.value = String(camera.source_index ?? 0);
   if (elements.cameraWidthInput) elements.cameraWidthInput.value = String(resolution.width ?? 1280);
   if (elements.cameraHeightInput) elements.cameraHeightInput.value = String(resolution.height ?? 720);
+  if (elements.workspaceProjectionInput) {
+    elements.workspaceProjectionInput.checked = Boolean(display.project_live_view);
+  }
+  if (elements.workspaceArucoEnabledInput) elements.workspaceArucoEnabledInput.checked = workspaceAruco.enabled !== false;
+  if (elements.workspaceArucoInvertInput) elements.workspaceArucoInvertInput.checked = workspaceAruco.invert_first !== false;
+  if (elements.workspaceArucoFallbackInput) {
+    elements.workspaceArucoFallbackInput.checked = workspaceAruco.allow_normal_fallback !== false;
+  }
   if (elements.cameraFxInput) elements.cameraFxInput.value = intrinsics.fx_px ?? "";
   if (elements.cameraFyInput) elements.cameraFyInput.value = intrinsics.fy_px ?? "";
   if (elements.cameraCxInput) elements.cameraCxInput.value = intrinsics.cx_px ?? "";
@@ -1415,41 +1605,60 @@ function cameraSettingsDraft() {
     .split(",")
     .map((value) => Number(value.trim()))
     .filter((value) => Number.isFinite(value));
+  const intrinsicInputs = [
+    elements.cameraFxInput,
+    elements.cameraFyInput,
+    elements.cameraCxInput,
+    elements.cameraCyInput,
+  ];
+  const hasAnyIntrinsics = intrinsicInputs.some((input) => String(input?.value || "").trim() !== "");
   const fx = readNumber(elements.cameraFxInput, NaN);
   const fy = readNumber(elements.cameraFyInput, NaN);
   const cx = readNumber(elements.cameraCxInput, NaN);
   const cy = readNumber(elements.cameraCyInput, NaN);
-  if (![fx, fy, cx, cy].every(Number.isFinite) || fx <= 0 || fy <= 0) {
-    throw new Error("Enter valid positive fx/fy and finite cx/cy camera intrinsics.");
+  if (hasAnyIntrinsics && (![fx, fy, cx, cy].every(Number.isFinite) || fx <= 0 || fy <= 0)) {
+    throw new Error("Enter all four camera intrinsics, with positive fx/fy, or leave all four blank.");
   }
   if (![4, 5, 8, 12, 14].includes(distortion.length)) {
     throw new Error("Distortion must contain 4, 5, 8, 12, or 14 comma-separated values.");
   }
+  camera.enabled = Boolean(elements.cameraEnabledInput?.checked);
   camera.source_index = Math.max(0, Math.round(readNumber(elements.cameraSourceInput, 0)));
   camera.resolution = {
     width: Math.max(1, Math.round(readNumber(elements.cameraWidthInput, 1280))),
     height: Math.max(1, Math.round(readNumber(elements.cameraHeightInput, 720))),
   };
+  camera.display = {
+    ...(camera.display || {}),
+    project_live_view: Boolean(elements.workspaceProjectionInput?.checked),
+  };
+  camera.calibration = camera.calibration || {};
+  camera.calibration.workspace_aruco = {
+    ...(camera.calibration.workspace_aruco || {}),
+    enabled: Boolean(elements.workspaceArucoEnabledInput?.checked),
+    invert_first: Boolean(elements.workspaceArucoInvertInput?.checked),
+    allow_normal_fallback: Boolean(elements.workspaceArucoFallbackInput?.checked),
+  };
   camera.intrinsics = {
     ...(camera.intrinsics || {}),
-    source: "manual",
-    fx_px: fx,
-    fy_px: fy,
-    cx_px: cx,
-    cy_px: cy,
-    camera_matrix: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+    source: hasAnyIntrinsics ? "manual" : "uncalibrated_workspace_homography",
+    fx_px: hasAnyIntrinsics ? fx : null,
+    fy_px: hasAnyIntrinsics ? fy : null,
+    cx_px: hasAnyIntrinsics ? cx : null,
+    cy_px: hasAnyIntrinsics ? cy : null,
+    camera_matrix: hasAnyIntrinsics ? [[fx, 0, cx], [0, fy, cy], [0, 0, 1]] : null,
     distortion_coefficients: distortion,
   };
   return camera;
 }
 
 async function saveCameraIntrinsics() {
-  setAprilTagBusy(true, "Saving intrinsics...");
+  setAprilTagBusy(true, "Saving camera settings...");
   try {
     const payload = await postJson("/api/vision/settings", { camera: cameraSettingsDraft() });
     if (payload.ok && payload.config) {
       applyConfig(payload.config);
-      elements.aprilTagStatus.textContent = "Intrinsics saved";
+      elements.aprilTagStatus.textContent = "Camera settings saved";
       clearSettingsDirty("camera");
     } else if (elements.aprilTagStatus) {
       elements.aprilTagStatus.textContent = payload.error || "Could not save intrinsics";
@@ -1498,17 +1707,27 @@ function renderAprilTagCalibration(payload = {}) {
   const enoughRequiredTagSamples = !sessionResult || result?.required_tag_samples_met !== false;
   const saveReady = accepted && enoughSamples && enoughRequiredTagSamples;
   const planarOnly = Boolean(result?.planar?.ok && !result?.ok);
+  const planarReady = planarOnly && enoughSamples && enoughRequiredTagSamples;
   if (elements.aprilTagStatus) {
     elements.aprilTagStatus.textContent = payload.comparison && accepted
       ? `Verified ${format(metrics.confidence, 2)}`
+      : payload.comparison && planarOnly
+        ? "Verified planar"
       : saveReady
         ? `Ready ${format(metrics.confidence, 2)}`
-        : accepted
-          ? "Pose good; collect all samples"
+      : planarReady
+        ? "Ready planar"
+      : accepted
+        ? "Pose good; collect all samples"
       : planarOnly
         ? "Planar only"
         : result?.error || "Uncalibrated";
   }
+  const verifyDelta = comparison.position_delta_mm != null
+    ? `${format(comparison.position_delta_mm, 1)} mm / ${format(comparison.orientation_delta_deg, 2)} deg`
+    : comparison.planar_rmse_mm != null
+      ? `planar ${format(comparison.planar_rmse_mm, 2)} mm RMSE`
+      : "-";
   if (elements.aprilTagMetrics) {
     elements.aprilTagMetrics.innerHTML = `
       <div class="log-line"><span>Samples</span><code>${session.frame_count || result?.frames_used || 0} / ${session.minimum_samples || 0}</code></div>
@@ -1517,8 +1736,8 @@ function renderAprilTagCalibration(payload = {}) {
       <div class="log-line"><span>Reprojection</span><code>${result?.ok ? `${format(metrics.reprojection_rmse_px, 2)} px RMSE` : "-"}</code></div>
       <div class="log-line"><span>Camera XYZ</span><code>${position.length ? position.map((value) => format(value, 1)).join(", ") + " mm" : "-"}</code></div>
       <div class="log-line"><span>Tilt</span><code>${result?.ok ? `${format(metrics.tilt_from_down_deg, 1)} deg from down` : "-"}</code></div>
-      <div class="log-line"><span>Verify delta</span><code>${comparison.position_delta_mm != null ? `${format(comparison.position_delta_mm, 1)} mm / ${format(comparison.orientation_delta_deg, 2)} deg` : "-"}</code></div>
-      <div class="log-line"><span>Message</span><code>${result?.error || (accepted ? "quality checks passed" : "collect samples and configure intrinsics")}</code></div>
+      <div class="log-line"><span>Verify delta</span><code>${verifyDelta}</code></div>
+      <div class="log-line"><span>Message</span><code>${result?.save_note || result?.error || (accepted ? "quality checks passed" : planarOnly ? "planar homography available; intrinsics only needed for 3D pose" : "collect samples")}</code></div>
     `;
   }
   if (payload.image_b64 && elements.aprilTagFrame) {
@@ -1595,17 +1814,26 @@ function renderDetectionList(detections) {
   if (!detections.length) {
     const empty = document.createElement("div");
     empty.className = "program-item";
-    empty.textContent = "No detections yet.";
+    empty.textContent = "No colored objects detected inside the workspace.";
     elements.detectionList.appendChild(empty);
     return;
   }
   detections.forEach((detection, index) => {
     const item = document.createElement("div");
     item.className = `program-item ${detection.ok ? "" : "invalid"}`;
-    const robot = detection.robot ? `robot ${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}` : "uncalibrated";
+    const label = detection.label || detection.color || "object";
+    const objectId = detection.object_id || index + 1;
+    const quality = detection.confidence == null ? "" : ` | q ${format(detection.confidence, 2)}`;
+    const pixel = detection.center_px
+      ? `px ${format(detection.center_px.x, 0)}, ${format(detection.center_px.y, 0)}`
+      : "px -";
+    const coordinates = detection.robot
+      ? `x ${format(detection.robot.x_mm)} mm, y ${format(detection.robot.y_mm)} mm, z ${format(detection.robot.z_mm)} mm`
+      : `${pixel} | ${detection.projection_error || detection.coordinate_source || "not calibrated"}`;
+    const status = detection.robot ? "robot coordinates" : detection.ok ? "image coordinates" : "ignored";
     item.innerHTML = `
-      <div class="program-title"><span>${index + 1}. ${detection.color || "object"}</span><span>${detection.ok ? "ready" : "ignored"}</span></div>
-      <code>${detection.ok ? robot : detection.reason || "not usable"}</code>
+      <div class="program-title"><span>${objectId}. ${label}</span><span>${status}</span></div>
+      <code>${detection.ok ? `${coordinates}${quality}` : detection.reason || "not usable"}</code>
     `;
     elements.detectionList.appendChild(item);
   });
@@ -2680,6 +2908,7 @@ function applyConfig(config) {
   state.view.setConfig(state.config);
   syncJointControls();
   renderCameraIntrinsics(state.config.camera);
+  if (!state.config.camera?.enabled && state.cameraLive) setCameraLive(false);
   updateSettingsSaveBar();
 }
 
@@ -2890,6 +3119,53 @@ function bindPanelChrome() {
   }
 }
 
+function bindCameraPopup() {
+  if (!elements.cameraPopup || !elements.cameraPopupHandle || !elements.mainPanel) return;
+  let dragging = false;
+  let pointerId = null;
+  let startX = 0;
+  let startY = 0;
+  let startLeft = 0;
+  let startTop = 0;
+
+  const move = (event) => {
+    if (!dragging || event.pointerId !== pointerId) return;
+    const panelRect = elements.mainPanel.getBoundingClientRect();
+    const popupRect = elements.cameraPopup.getBoundingClientRect();
+    const maximumLeft = Math.max(0, panelRect.width - popupRect.width);
+    const maximumTop = Math.max(0, panelRect.height - popupRect.height);
+    const left = clamp(startLeft + event.clientX - startX, 0, maximumLeft);
+    const top = clamp(startTop + event.clientY - startY, 0, maximumTop);
+    elements.cameraPopup.style.left = `${left}px`;
+    elements.cameraPopup.style.top = `${top}px`;
+    elements.cameraPopup.style.right = "auto";
+  };
+  const finish = (event) => {
+    if (!dragging || (event?.pointerId != null && event.pointerId !== pointerId)) return;
+    dragging = false;
+    if (pointerId != null && elements.cameraPopupHandle.hasPointerCapture(pointerId)) {
+      elements.cameraPopupHandle.releasePointerCapture(pointerId);
+    }
+    pointerId = null;
+  };
+  elements.cameraPopupHandle.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button, input, label")) return;
+    const panelRect = elements.mainPanel.getBoundingClientRect();
+    const popupRect = elements.cameraPopup.getBoundingClientRect();
+    dragging = true;
+    pointerId = event.pointerId;
+    startX = event.clientX;
+    startY = event.clientY;
+    startLeft = popupRect.left - panelRect.left;
+    startTop = popupRect.top - panelRect.top;
+    elements.cameraPopupHandle.setPointerCapture(pointerId);
+  });
+  elements.cameraPopupHandle.addEventListener("pointermove", move);
+  elements.cameraPopupHandle.addEventListener("pointerup", finish);
+  elements.cameraPopupHandle.addEventListener("pointercancel", finish);
+  elements.cameraPopupHandle.addEventListener("lostpointercapture", finish);
+}
+
 function bindActions() {
   elements.appTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -3091,9 +3367,14 @@ function bindActions() {
   elements.perJointTuning?.addEventListener("input", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
   elements.perJointTuning?.addEventListener("change", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
   [
+    elements.cameraEnabledInput,
     elements.cameraSourceInput,
     elements.cameraWidthInput,
     elements.cameraHeightInput,
+    elements.workspaceProjectionInput,
+    elements.workspaceArucoEnabledInput,
+    elements.workspaceArucoInvertInput,
+    elements.workspaceArucoFallbackInput,
     elements.cameraFxInput,
     elements.cameraFyInput,
     elements.cameraCxInput,
@@ -3102,6 +3383,13 @@ function bindActions() {
   ].forEach((input) => {
     input?.addEventListener("input", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
     input?.addEventListener("change", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
+  });
+  elements.workspaceProjectionInput?.addEventListener("change", () => {
+    if (!elements.workspaceProjectionInput.checked) {
+      state.view?.setWorkspaceCameraProjection(null, false);
+      return;
+    }
+    detectVision();
   });
   elements.settingsSectionNav?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-settings-target]");
@@ -3179,7 +3467,14 @@ function bindActions() {
   elements.toolOffBtn.addEventListener("click", () => sendTool("off"));
   elements.previewTaskBtn.addEventListener("click", previewTask);
   elements.executeTaskBtn.addEventListener("click", executeTask);
+  elements.viewCameraBtn?.addEventListener("click", () => {
+    setCameraPopupVisible(true);
+    detectVision();
+  });
   elements.detectVisionBtn.addEventListener("click", detectVision);
+  elements.cameraPopupRefreshBtn?.addEventListener("click", detectVision);
+  elements.closeCameraPopupBtn?.addEventListener("click", () => setCameraPopupVisible(false));
+  elements.cameraLiveToggle?.addEventListener("change", () => setCameraLive(elements.cameraLiveToggle.checked));
   elements.saveCameraIntrinsicsBtn?.addEventListener("click", saveCameraIntrinsics);
   elements.resetAprilTagBtn?.addEventListener("click", resetAprilTagCalibration);
   elements.captureAprilTagBtn?.addEventListener("click", () => captureAprilTags(1, true));
@@ -3239,9 +3534,17 @@ function bindActions() {
   });
 
   elements.saveCalibrationBtn.addEventListener("click", saveAllSettings);
+  elements.buildStatus?.addEventListener("click", () => {
+    if (elements.buildStatus.dataset.action === "reload") {
+      window.location.reload();
+    } else {
+      checkAppVersion();
+    }
+  });
   elements.discardSettingsBtn?.addEventListener("click", discardSettingsChanges);
   bindFaders();
   bindPanelChrome();
+  bindCameraPopup();
 }
 
 async function init() {
@@ -3249,6 +3552,8 @@ async function init() {
   await loadConfig();
   bindActions();
   await postJson("/api/live-motion", { enabled: false });
+  await checkAppVersion();
+  state.versionTimer = window.setInterval(checkAppVersion, 15000);
   connectWebSocket();
   await loadAprilTagStatus();
 }

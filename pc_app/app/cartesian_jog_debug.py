@@ -4,8 +4,9 @@ from typing import Any
 
 import numpy as np
 
+from .cartesian_servo import CartesianServo, CartesianServoLimits
 from .config import RobotConfig
-from .kinematics import differential_ik_step, forward_kinematics
+from .kinematics import forward_kinematics
 
 
 def _fk_position(joints_deg: list[float], config: RobotConfig) -> list[float]:
@@ -68,61 +69,6 @@ def cartesian_path_metrics(points: list[list[float]], direction_xyz: list[float]
     }
 
 
-def _joint_limits(config: RobotConfig) -> tuple[list[float], list[float]]:
-    return (
-        [float(joint.max_speed_deg_s) for joint in config.joints],
-        [float(joint.max_accel_deg_s2) for joint in config.joints],
-    )
-
-
-def _limit_joint_velocity(
-    config: RobotConfig,
-    seed_deg: list[float],
-    requested_target_deg: list[float],
-    previous_velocity_deg_s: list[float],
-    dt_s: float,
-) -> tuple[list[float], list[float], list[str]]:
-    speed_limits, accel_limits = _joint_limits(config)
-    desired_velocity = [
-        (float(requested) - float(seed)) / max(float(dt_s), 1e-6)
-        for seed, requested in zip(seed_deg, requested_target_deg, strict=True)
-    ]
-    speed_scale = 1.0
-    for requested_velocity, limit in zip(desired_velocity, speed_limits, strict=True):
-        if abs(requested_velocity) > limit:
-            speed_scale = min(speed_scale, limit / max(abs(requested_velocity), 1e-9))
-    desired_velocity = [requested_velocity * speed_scale for requested_velocity in desired_velocity]
-
-    velocity_delta = [
-        desired - previous
-        for desired, previous in zip(desired_velocity, previous_velocity_deg_s, strict=True)
-    ]
-    accel_scale = 1.0
-    for delta_v, limit in zip(velocity_delta, accel_limits, strict=True):
-        max_velocity_delta = limit * float(dt_s)
-        if abs(delta_v) > max_velocity_delta:
-            accel_scale = min(accel_scale, max_velocity_delta / max(abs(delta_v), 1e-9))
-    limited_velocity = [
-        previous + delta_v * accel_scale
-        for previous, delta_v in zip(previous_velocity_deg_s, velocity_delta, strict=True)
-    ]
-
-    target: list[float] = []
-    velocity: list[float] = []
-    notes: list[str] = []
-    for seed, next_velocity, joint in zip(
-        seed_deg, limited_velocity, config.joints, strict=True
-    ):
-        next_angle = float(seed) + next_velocity * float(dt_s)
-        clamped_angle = max(joint.min_deg, min(joint.max_deg, next_angle))
-        if abs(clamped_angle - next_angle) > 1e-6:
-            next_velocity = (clamped_angle - float(seed)) / max(float(dt_s), 1e-6)
-            notes.append(f"{joint.name} limit")
-        target.append(clamped_angle)
-        velocity.append(next_velocity)
-    return target, velocity, notes
-
-
 def simulate_cartesian_jog(
     config: RobotConfig,
     start_deg: list[float],
@@ -134,12 +80,13 @@ def simulate_cartesian_jog(
     damping: float | None = None,
     apply_joint_limits: bool = True,
 ) -> dict[str, Any]:
-    """Run a repeatable differential-IK jog simulation for debugging.
+    """Run the production Cartesian servo deterministically without FastAPI.
 
-    This intentionally does not depend on FastAPI state. It lets tests and local
-    scripts reproduce the exact Cartesian-jog solver behavior from a known joint
-    pose and commanded Cartesian velocity.
+    ``damping`` remains accepted for compatibility with older scripts but is no
+    longer used: the replacement solver preserves task direction exactly and
+    scales speed against explicit bounds instead of damping into lateral drift.
     """
+    del damping
     if len(start_deg) != len(config.joints):
         raise ValueError(f"expected {len(config.joints)} start joint angles")
     if len(velocity_xyz_mm_s) != 3:
@@ -149,64 +96,46 @@ def simulate_cartesian_jog(
     if dt_s <= 0.0:
         raise ValueError("dt_s must be positive")
 
-    current = [float(value) for value in start_deg]
-    joint_velocity = [0.0 for _ in config.joints]
+    servo = CartesianServo(config.links, config.joints, [float(value) for value in start_deg])
+    servo.set_command(
+        [
+            float(velocity_xyz_mm_s[0]),
+            float(velocity_xyz_mm_s[1]),
+            float(velocity_xyz_mm_s[2]),
+            float(vphi_deg_s),
+        ]
+    )
+    speed_limits = [
+        float(joint.max_speed_deg_s) if apply_joint_limits else 1e6
+        for joint in config.joints
+    ]
+    limits = CartesianServoLimits(
+        joint_speed_deg_s=speed_limits,
+        tcp_accel_mm_s2=360.0,
+        phi_accel_deg_s2=240.0,
+    )
+    current = servo.commanded_joints_deg.tolist()
     points = [_fk_position(current, config)]
     samples: list[dict[str, Any]] = []
     notes: list[str] = []
     blocked_steps = 0
-    speed_limits, _ = _joint_limits(config)
-    solve_damping = float(config.kinematics.damping if damping is None else damping)
 
     for step_index in range(steps):
-        task_delta = {
-            "x_mm": float(velocity_xyz_mm_s[0]) * dt_s,
-            "y_mm": float(velocity_xyz_mm_s[1]) * dt_s,
-            "z_mm": float(velocity_xyz_mm_s[2]) * dt_s,
-            "phi_deg": float(vphi_deg_s) * dt_s,
-        }
-        ik_step = differential_ik_step(
-            current,
-            task_delta,
-            config.links,
-            config.joints,
-            damping=solve_damping,
-            max_joint_step_deg=max(speed_limits) * dt_s,
-        )
-        if not ik_step["ok"]:
-            samples.append({"step": step_index, "ik": ik_step, "error": ik_step.get("error")})
-            notes.append(str(ik_step.get("error", "IK failed")))
-            break
-
-        if ik_step.get("blocked"):
-            next_angles = current.copy()
-            joint_velocity = [0.0 for _ in config.joints]
-            limit_notes = []
-        elif apply_joint_limits:
-            next_angles, joint_velocity, limit_notes = _limit_joint_velocity(
-                config,
-                current,
-                [float(value) for value in ik_step["target_angles_deg"]],
-                joint_velocity,
-                dt_s,
-            )
-        else:
-            next_angles = [float(value) for value in ik_step["target_angles_deg"]]
-            joint_velocity = [(next_value - current_value) / dt_s for current_value, next_value in zip(current, next_angles)]
-            limit_notes = []
-
-        step_notes = [*ik_step.get("notes", []), *limit_notes]
-        if ik_step.get("blocked") or limit_notes:
+        servo_step = servo.step(dt_s, limits)
+        current = [float(value) for value in servo_step["target_angles_deg"]]
+        step_notes = [str(note) for note in servo_step.get("notes", [])]
+        if servo_step.get("failure_reason"):
+            step_notes.append(str(servo_step["failure_reason"]))
+        if servo_step.get("blocked"):
             blocked_steps += 1
         notes.extend(str(note) for note in step_notes)
-        current = next_angles
         points.append(_fk_position(current, config))
         samples.append(
             {
                 "step": step_index,
                 "joints_deg": current,
-                "joint_velocity_deg_s": joint_velocity,
-                "ik": ik_step,
+                "joint_velocity_deg_s": servo_step["joint_velocity_deg_s"],
+                "servo": servo_step,
                 "notes": step_notes,
             }
         )
