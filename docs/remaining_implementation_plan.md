@@ -48,14 +48,15 @@ Still missing or not production-ready:
 - Tool controls switch by selected tool, and unsupported tool commands are rejected in software; real unsafe/hardware states still need physical validation.
 - Tool TCP offsets drive the backend active TCP model as a first pass; visible 3D tool geometry and physical calibration still need work.
 - Tool pins can be edited from Settings. Encoder pins cannot be properly edited from Settings yet.
-- Camera preview now uses a movable/resizable popup; live behavior still needs
-  verification with the physical USB camera.
+- Camera preview uses a movable/resizable popup and the Settings calibration
+  frame updates continuously from the physical USB camera without cropping.
 - DH editing needs an editable table workflow; the current table is derived/read-only.
 - FK and analytic seeding have been partially reconciled with the MATLAB prototype, but the Jacobian implementation still needs to be reconciled with the DH-frame cross-product model.
 - The MATLAB motion prototype has useful ideas, but it lacks motor velocity/acceleration limits for real execution.
 - Calibration is not yet a guided workflow.
 - AprilTag-based camera/world calibration is implemented as a first pass with a fixed four-tag workspace layout, multi-frame accumulation, pose-quality checks, persistence, and verification.
-- The viewport now shows configured AprilTags and a solved camera frustum in calibration/frame mode. Projecting the live camera image onto the workspace is still missing.
+- The viewport can project the live camera image onto the calibrated outer
+  workspace rectangle using the planar image-to-robot map.
 - Planned, estimated, and actual executed TCP paths are not clearly separated in the viewport.
 - Cartesian waypoint execution does not yet guarantee blended continuous motion through waypoints.
 - End-effector speed/acceleration limits in `mm/s` and `mm/s^2` are not first-class motion settings yet.
@@ -1163,7 +1164,13 @@ Status: implemented as a first pass for the fixed workspace.
 
 Working assumption: `DICT_APRILTAG_36H11` tags 0-3 are 40 mm squares placed inside the workspace. The configured coordinates are the four 478 x 315 mm workspace corners, not tag centers. Tag 0's bottom-left, tag 1's bottom-right, tag 2's top-right, and tag 3's top-left corner coincide with those workspace corners. Each printed top edge points toward robot +Y. The Logitech C270 currently uses a clearly labeled 55-degree-diagonal-FOV intrinsic estimate; per-camera checkerboard calibration remains required for accurate distortion and millimeter projection.
 
-Reality note: `app/apriltag_calibration.py` now owns tag detection, world-corner generation, robust PnP solving/refinement, planar homography fallback, camera-pose inversion, reprojection/tilt/inlier/confidence metrics, frame accumulation, distortion-aware workspace-plane ray projection, and invalidation when camera pixel geometry changes. FastAPI exposes reset, capture/accumulate, status, save, and verify endpoints. Settings provides collection, save, verification, annotated frames, and metrics. `tools/calibrate_apriltags.py` provides the same fixed-camera workflow outside the GUI. Saving requires every configured tag to reach the minimum observation count; with no measured intrinsics it saves a planar homography, while a full accepted 6-DoF pose remains the optional higher-detail path.
+Reality note: the operator workflow now uses `app/workspace_calibration.py`
+and `camera.calibration.workspace_aruco` as the single authoritative planar
+calibration. It accumulates median tag centers and the four outer workspace
+corners, solves an eight-point homography, enforces millimeter fit limits, saves
+the references used by live detection, and verifies a fresh frame against robot
+coordinates. The separate `apriltag_calibration.py` PnP/6-DoF path remains
+developer-only and is hidden from normal Settings.
 
 Work:
 
@@ -1191,9 +1198,13 @@ Acceptance:
 
 ### VISION-06: Camera-Space To Robot-Space Object Mapping
 
-Status: implemented as a first pass for objects on workspace Z=0.
+Status: implemented for objects on workspace Z=0.
 
-Reality note: color-blob centers now use a saved accepted AprilTag camera pose to cast a camera ray onto workspace Z=0. Detection output records the camera-pose ID and coordinate source. The old four-point homography remains the fallback when no accepted pose exists. Bounding/quality checks against the physical workspace and non-planar object support remain open.
+Reality note: color-blob and external-AI centers use the saved
+`workspace_aruco` image-to-robot homography. Coordinates follow the robot model:
+X sideways, Y forward, Z=0. Live visible tags can refresh the map using the same
+center-plus-inner-corner correspondences. The physical workspace polygon masks
+out detections outside the calibrated table region.
 
 Work:
 
@@ -1218,13 +1229,17 @@ Acceptance:
 
 ### VISION-07: Projected Camera Image In Robot View
 
-Status: new idea, missing.
+Status: implemented as an optional workspace visualization.
 
-This is the "camera view lies flat in the viewport" idea. It should be treated as a visualization/calibration aid first, not as a control authority.
+Reality note: the camera frame is warped directly into robot X/Y coordinates
+and rendered on the configured outer workspace polygon over the work plate.
+It uses the saved planar map and does not require intrinsics or a camera
+frustum.
 
 Work:
 
-- Use camera intrinsics, camera pose, and workspace plane to texture-map the live camera image into the 3D robot viewport.
+- Use the saved planar workspace homography to texture-map the live camera
+  image into the 3D robot viewport. Camera intrinsics remain optional.
 - Render the camera image as a plane/mesh in robot/world coordinates, aligned with the real table/workspace.
 - Add controls to show/hide:
   - raw camera popup,
@@ -1388,9 +1403,12 @@ Acceptance:
 
 ### VIEW-04: AprilTag And Camera Pose Overlay
 
-Status: implemented as a first-pass calibration overlay.
+Status: optional developer-only overlay.
 
-Reality note: the viewport renders the configured tag squares and IDs on workspace Z=0 plus a camera body/frustum colored by accepted/rejected pose state. The overlay follows the existing Frames visibility toggle. Detailed stale/unknown-tag states and a dedicated overlay toggle remain open.
+Reality note: configured 3D tags and the camera frustum are no longer shown in
+normal operation. They render only when `camera.display.show_3d_pose_overlay`
+is explicitly enabled, so they cannot be confused with the planar workspace
+projection.
 
 Work:
 
@@ -1417,12 +1435,18 @@ Acceptance:
 
 ### VIEW-05: Projected Camera Plane Layer
 
-Status: new idea, missing.
+Status: implemented.
+
+Reality note: the projected image uses the exact robot workspace polygon rather
+than a rectangular plane. Texture UVs follow robot X/Y bounds, transparent
+pixels remove everything outside the outer tag outline, and an outline makes
+the projected calibration boundary visible. The layer is controlled by
+`camera.display.project_live_view`.
 
 Work:
 
 - Add a viewport layer that displays the live camera frame projected onto the workspace plane.
-- Align the projection using camera intrinsics, estimated camera pose, and workspace plane definition.
+- Align the projection using the planar outer-corner workspace calibration.
 - Render detected objects on top of the projected image in the same robot/world coordinate frame.
 - Add opacity and visibility controls.
 - Clearly label states:

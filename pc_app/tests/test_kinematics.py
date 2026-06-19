@@ -150,7 +150,7 @@ def test_differential_ik_step_moves_tcp_in_requested_direction():
 
 
 def test_differential_ik_step_reports_low_authority_direction():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
 
     result = differential_ik_step(
         [0.0, 90.0, 0.0, 0.0],

@@ -1,4 +1,5 @@
-import { RobotView } from "/static/robot_view.js?v=20260618-workspace-projection";
+const PAGE_BUILD_ID = document.querySelector('meta[name="app-build-id"]')?.content || "unknown";
+const { RobotView } = await import(`/static/robot_view.js?v=${encodeURIComponent(PAGE_BUILD_ID)}`);
 
 const state = {
   config: null,
@@ -35,6 +36,8 @@ const state = {
   cameraTimer: null,
   cameraInFlight: false,
   cameraLive: false,
+  workspaceProjectionTimer: null,
+  workspaceProjectionInFlight: false,
   linkDraft: null,
   dhDraftRows: null,
   toolSliderDraftValue: null,
@@ -53,12 +56,10 @@ const state = {
   cartesianJogEpoch: 0,
   cartesianJogStopPending: false,
   cartesianJogStopInFlight: false,
-  aprilTagBusy: false,
-  aprilTagStatus: null,
+  workspaceCalibrationBusy: false,
+  workspaceCalibrationStatus: null,
   versionTimer: null,
 };
-
-const PAGE_BUILD_ID = document.querySelector('meta[name="app-build-id"]')?.content || "unknown";
 
 const geometryDimensionFields = [
   ["L_1", "L1", "Base vertical section"],
@@ -228,7 +229,7 @@ const elements = {
   geometryPresetEditor: $("#geometryPresetEditor"),
   toolCalibration: $("#toolCalibration"),
   encoderCalibration: $("#encoderCalibration"),
-  aprilTagStatus: $("#aprilTagStatus"),
+  workspaceCalibrationStatus: $("#workspaceCalibrationStatus"),
   cameraEnabledInput: $("#cameraEnabledInput"),
   cameraSourceInput: $("#cameraSourceInput"),
   cameraWidthInput: $("#cameraWidthInput"),
@@ -242,47 +243,64 @@ const elements = {
   cameraCxInput: $("#cameraCxInput"),
   cameraCyInput: $("#cameraCyInput"),
   cameraDistortionInput: $("#cameraDistortionInput"),
-  saveCameraIntrinsicsBtn: $("#saveCameraIntrinsicsBtn"),
-  resetAprilTagBtn: $("#resetAprilTagBtn"),
-  captureAprilTagBtn: $("#captureAprilTagBtn"),
-  collectAprilTagBtn: $("#collectAprilTagBtn"),
-  saveAprilTagBtn: $("#saveAprilTagBtn"),
-  verifyAprilTagBtn: $("#verifyAprilTagBtn"),
-  aprilTagFrame: $("#aprilTagFrame"),
-  aprilTagPlaceholder: $("#aprilTagPlaceholder"),
-  aprilTagMetrics: $("#aprilTagMetrics"),
-  aprilTagDetections: $("#aprilTagDetections"),
+  calibrateWorkspaceBtn: $("#calibrateWorkspaceBtn"),
+  verifyWorkspaceCalibrationBtn: $("#verifyWorkspaceCalibrationBtn"),
+  workspaceCalibrationFrame: $("#workspaceCalibrationFrame"),
+  workspaceCalibrationPlaceholder: $("#workspaceCalibrationPlaceholder"),
+  workspaceCalibrationMetrics: $("#workspaceCalibrationMetrics"),
+  workspaceCalibrationDetections: $("#workspaceCalibrationDetections"),
 };
 
 function renderBuildStatus(version) {
   if (!elements.buildStatus || !elements.buildStatusText) return;
-  const browserStale = Boolean(version?.running_build_id && PAGE_BUILD_ID !== version.running_build_id);
-  const serverStale = Boolean(version?.restart_required);
-  const checkoutStale = Boolean(version?.pull_required);
-  elements.buildStatus.classList.toggle("stale", browserStale || serverStale || checkoutStale);
-  elements.buildStatus.classList.toggle("current", !browserStale && !serverStale && !checkoutStale);
-  elements.buildStatus.dataset.action = browserStale
-    ? "reload"
-    : checkoutStale
-      ? "pull"
-      : serverStale
-        ? "restart"
-        : "current";
-  if (browserStale) {
-    elements.buildStatusText.textContent = "Browser outdated - click to reload";
-  } else if (checkoutStale) {
-    elements.buildStatusText.textContent = "Code outdated - pull origin/main";
+  const currentFrontendBuild = version?.frontend_build_id || version?.running_build_id;
+  const runningBackendBuild = version?.running_backend_build_id || version?.running_build_id;
+  const diskBackendBuild = version?.disk_backend_build_id || version?.disk_build_id;
+  const versionAvailable = Boolean(version?.ok && currentFrontendBuild);
+  const browserStale = Boolean(versionAvailable && PAGE_BUILD_ID !== currentFrontendBuild);
+  const serverStale = Boolean(version?.backend_restart_required ?? version?.restart_required);
+  const configStale = Boolean(version?.config_reload_required);
+  const remoteDiffers = Boolean(version?.remote_differs ?? version?.pull_required);
+  const localStale = !versionAvailable || browserStale || serverStale || configStale;
+  elements.buildStatus.classList.toggle("stale", localStale);
+  elements.buildStatus.classList.toggle("current", !localStale);
+  elements.buildStatus.dataset.action = !versionAvailable
+    ? "check"
+    : serverStale
+      ? "restart"
+      : configStale
+        ? "reload-config"
+        : browserStale
+          ? "reload"
+          : remoteDiffers
+            ? "remote"
+            : "current";
+  if (!versionAvailable) {
+    elements.buildStatusText.textContent = "Version check unavailable";
   } else if (serverStale) {
-    elements.buildStatusText.textContent = "Server outdated - restart localhost";
+    elements.buildStatusText.textContent = "Backend outdated - restart localhost";
+  } else if (configStale) {
+    elements.buildStatusText.textContent = "Settings file changed - restart localhost";
+  } else if (browserStale) {
+    elements.buildStatusText.textContent = "Browser outdated - click to reload";
   } else {
     const commit = version?.git_commit ? ` ${version.git_commit.slice(0, 7)}` : "";
-    elements.buildStatusText.textContent = `Current checkout${commit}`;
+    elements.buildStatusText.textContent = remoteDiffers
+      ? `Current localhost${commit} - remote differs`
+      : `Current localhost${commit}`;
   }
   elements.buildStatus.title = [
     ...(version?.reasons || []),
-    `Browser build: ${PAGE_BUILD_ID}`,
-    `Server build: ${version?.running_build_id || "unknown"}`,
-    `Files on disk: ${version?.disk_build_id || "unknown"}`,
+    `Local freshness: ${localStale ? "stale" : "current"}`,
+    remoteDiffers
+      ? "Remote status: local HEAD differs from origin/main"
+      : `Remote status: ${version?.origin_main_commit ? "matches origin/main" : "unavailable"}`,
+    `Browser assets: ${PAGE_BUILD_ID}`,
+    `Frontend files: ${currentFrontendBuild || "unknown"}`,
+    `Running backend: ${runningBackendBuild || "unknown"}`,
+    `Backend files: ${diskBackendBuild || "unknown"}`,
+    `Runtime config: ${version?.running_config_id || "unknown"}`,
+    `Config on disk: ${version?.disk_config_id || "unknown"}`,
     `Server commit: ${version?.git_commit || "unknown"}`,
     `Local HEAD: ${version?.current_git_commit || "unknown"}`,
     `origin/main: ${version?.origin_main_commit || "unavailable"}`,
@@ -298,6 +316,8 @@ async function checkAppVersion() {
   } catch {
     if (elements.buildStatusText) elements.buildStatusText.textContent = "Version check unavailable";
     elements.buildStatus?.classList.add("stale");
+    elements.buildStatus?.classList.remove("current");
+    if (elements.buildStatus) elements.buildStatus.dataset.action = "check";
   }
 }
 
@@ -1464,18 +1484,72 @@ function workspaceProjectionEnabled() {
   return Boolean(elements.workspaceProjectionInput?.checked);
 }
 
+function workspaceProjectionIntervalMs() {
+  return clamp(
+    Number(state.config?.camera?.display?.projection_interval_ms || 80),
+    40,
+    1000
+  );
+}
+
+function scheduleWorkspaceProjection(delayMs = workspaceProjectionIntervalMs()) {
+  window.clearTimeout(state.workspaceProjectionTimer);
+  state.workspaceProjectionTimer = null;
+  if (
+    !workspaceProjectionEnabled()
+    || state.workspaceCalibrationBusy
+    || !state.config?.camera?.enabled
+  ) {
+    return;
+  }
+  state.workspaceProjectionTimer = window.setTimeout(
+    refreshWorkspaceProjection,
+    Math.max(0, delayMs)
+  );
+}
+
+async function refreshWorkspaceProjection() {
+  if (state.workspaceProjectionInFlight) return;
+  state.workspaceProjectionInFlight = true;
+  const startedAt = performance.now();
+  try {
+    const payload = await fetch(
+      `/api/vision/workspace/live?t=${Date.now()}`,
+      { cache: "no-store" }
+    ).then((response) => response.json());
+    if (!payload.ok) {
+      state.view?.setWorkspaceCameraProjection(null, false);
+      return;
+    }
+    state.view?.setWorkspaceCameraProjection(
+      payload.workspace_projection,
+      true
+    );
+  } catch {
+    state.view?.setWorkspaceCameraProjection(null, false);
+  } finally {
+    state.workspaceProjectionInFlight = false;
+    scheduleWorkspaceProjection(
+      Math.max(0, workspaceProjectionIntervalMs() - (performance.now() - startedAt))
+    );
+  }
+}
+
+function updateCameraFrameAspect(image, imageSize) {
+  if (!image?.parentElement || !imageSize?.width || !imageSize?.height) return;
+  image.parentElement.style.aspectRatio = `${imageSize.width} / ${imageSize.height}`;
+}
+
 async function detectVision() {
   if (state.cameraInFlight) return;
   state.cameraInFlight = true;
   if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = "Detecting...";
   elements.visionSummary.innerHTML = `<div class="log-line"><span>Status</span><code>Detecting...</code></div>`;
   try {
-    const projectWorkspace = workspaceProjectionEnabled();
-    const query = new URLSearchParams({
-      t: String(Date.now()),
-      project_workspace: projectWorkspace ? "1" : "0",
-    });
-    const payload = await fetch(`/api/vision/frame?${query}`, { cache: "no-store" }).then((response) => response.json());
+    const payload = await fetch(
+      `/api/vision/frame?t=${Date.now()}`,
+      { cache: "no-store" }
+    ).then((response) => response.json());
     elements.visionSummary.innerHTML = "";
     if (!payload.ok) {
       elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${payload.error || "-"}</code></div>`;
@@ -1492,7 +1566,6 @@ async function detectVision() {
     renderDetectionList(payload.detections || []);
     if (state.view) {
       state.view.setObjectDetections(state.latestDetections);
-      state.view.setWorkspaceCameraProjection(payload.workspace_projection, projectWorkspace);
     }
     const workspace = payload.workspace || {};
     const visibleTags = (workspace.visible_ids || []).join(", ") || "none";
@@ -1515,17 +1588,6 @@ async function detectVision() {
       workspaceLine.innerHTML = `<span>Workspace</span><code>${workspace.workspace_polygon_source}${detectionSource}</code>`;
       elements.visionSummary.appendChild(workspaceLine);
     }
-    if (projectWorkspace) {
-      const projection = payload.workspace_projection || {};
-      const projectionLine = document.createElement("div");
-      projectionLine.className = "log-line";
-      const texture = projection.texture_size_px
-        ? `${projection.texture_size_px.width}x${projection.texture_size_px.height}`
-        : "unavailable";
-      const source = projection.homography_source || workspace.homography_source || "no homography";
-      projectionLine.innerHTML = `<span>Workspace camera</span><code>${texture} | ${source}</code>`;
-      elements.visionSummary.appendChild(projectionLine);
-    }
     if (workspace.warning) {
       const warningLine = document.createElement("div");
       warningLine.className = "log-line";
@@ -1547,30 +1609,33 @@ async function detectVision() {
       const calibrationStatus = workspace.status || payload.calibration_source || "uncalibrated";
       elements.cameraPopupStatus.textContent = `${mode} | ${state.latestDetections.length} object(s) | ${calibrationStatus}`;
     }
-    await refreshDiagnostics();
   } catch (error) {
     const message = error?.message || String(error);
     elements.visionSummary.innerHTML = `<div class="log-line"><span>Error</span><code>${message}</code></div>`;
     if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = message;
   } finally {
     state.cameraInFlight = false;
-    scheduleCameraFrame();
+    if (state.cameraLive) scheduleCameraFrame();
   }
 }
 
-function setAprilTagBusy(busy, status = null) {
-  state.aprilTagBusy = Boolean(busy);
+function setWorkspaceCalibrationBusy(busy, status = null) {
+  state.workspaceCalibrationBusy = Boolean(busy);
   [
-    elements.saveCameraIntrinsicsBtn,
-    elements.resetAprilTagBtn,
-    elements.captureAprilTagBtn,
-    elements.collectAprilTagBtn,
-    elements.saveAprilTagBtn,
-    elements.verifyAprilTagBtn,
+    elements.calibrateWorkspaceBtn,
+    elements.verifyWorkspaceCalibrationBtn,
   ].forEach((button) => {
-    if (button) button.disabled = state.aprilTagBusy;
+    if (button) button.disabled = state.workspaceCalibrationBusy;
   });
-  if (status && elements.aprilTagStatus) elements.aprilTagStatus.textContent = status;
+  if (status && elements.workspaceCalibrationStatus) {
+    elements.workspaceCalibrationStatus.textContent = status;
+  }
+  if (busy) {
+    window.clearTimeout(state.workspaceProjectionTimer);
+    state.workspaceProjectionTimer = null;
+  } else {
+    scheduleWorkspaceProjection(0);
+  }
 }
 
 function renderCameraIntrinsics(camera = state.config?.camera || {}) {
@@ -1632,6 +1697,7 @@ function cameraSettingsDraft() {
     ...(camera.display || {}),
     project_live_view: Boolean(elements.workspaceProjectionInput?.checked),
   };
+  delete camera.display.settings_live_preview;
   camera.calibration = camera.calibration || {};
   camera.calibration.workspace_aruco = {
     ...(camera.calibration.workspace_aruco || {}),
@@ -1652,159 +1718,157 @@ function cameraSettingsDraft() {
   return camera;
 }
 
-async function saveCameraIntrinsics() {
-  setAprilTagBusy(true, "Saving camera settings...");
-  try {
-    const payload = await postJson("/api/vision/settings", { camera: cameraSettingsDraft() });
-    if (payload.ok && payload.config) {
-      applyConfig(payload.config);
-      elements.aprilTagStatus.textContent = "Camera settings saved";
-      clearSettingsDirty("camera");
-    } else if (elements.aprilTagStatus) {
-      elements.aprilTagStatus.textContent = payload.error || "Could not save intrinsics";
-    }
-  } catch (error) {
-    showLocalError(error?.message || String(error));
-    elements.aprilTagStatus.textContent = "Invalid intrinsics";
-  } finally {
-    setAprilTagBusy(false);
-  }
-}
-
-function renderAprilTagDetections(detections = []) {
-  if (!elements.aprilTagDetections) return;
-  elements.aprilTagDetections.innerHTML = "";
+function renderWorkspaceCalibrationDetections(detections = []) {
+  if (!elements.workspaceCalibrationDetections) return;
+  elements.workspaceCalibrationDetections.innerHTML = "";
   if (!detections.length) {
     const empty = document.createElement("div");
     empty.className = "program-item";
-    empty.textContent = "No tags detected.";
-    elements.aprilTagDetections.appendChild(empty);
+    empty.textContent = "No configured workspace tags detected.";
+    elements.workspaceCalibrationDetections.appendChild(empty);
     return;
   }
   detections.forEach((detection) => {
     const item = document.createElement("div");
     item.className = `program-item ${detection.configured ? "" : "invalid"}`;
     const center = detection.center_px || {};
+    const corner = detection.workspace_corner_px || {};
+    const robot = detection.robot_center_mm || {};
+    const cornerText = Number.isFinite(corner.x) && Number.isFinite(corner.y)
+      ? ` | outer corner ${format(corner.x, 1)}, ${format(corner.y, 1)}`
+      : " | outer corner missing";
+    const robotText = Number.isFinite(robot.x) && Number.isFinite(robot.y)
+      ? `X ${format(robot.x, 1)} mm, Y ${format(robot.y, 1)} mm`
+      : "not in workspace layout";
     item.innerHTML = `
-      <div class="program-title"><span>Tag ${detection.id}</span><span>${detection.configured ? "configured" : "unknown"}</span></div>
-      <code>px ${format(center.x, 1)}, ${format(center.y, 1)} - area ${format(detection.area_px, 0)}</code>
+      <div class="program-title"><span>Tag ${detection.id}</span><span>${robotText}</span></div>
+      <code>center ${format(center.x, 1)}, ${format(center.y, 1)}${cornerText}</code>
     `;
-    elements.aprilTagDetections.appendChild(item);
+    elements.workspaceCalibrationDetections.appendChild(item);
   });
 }
 
-function renderAprilTagCalibration(payload = {}) {
-  state.aprilTagStatus = payload;
-  const result = payload.result || payload.live_result || payload.saved_result || null;
+function renderWorkspaceCalibration(payload = {}) {
+  state.workspaceCalibrationStatus = payload;
+  const result = payload.result || null;
+  const saved = payload.saved_result || null;
   const session = payload.session || {};
-  const metrics = result?.metrics || {};
-  const pose = result?.camera_to_robot || {};
-  const position = pose.position_mm || [];
   const comparison = payload.comparison || {};
-  const accepted = Boolean(result?.accepted);
-  const sessionResult = result?.frames_used != null;
-  const enoughSamples = !sessionResult || result?.minimum_samples_met !== false;
-  const enoughRequiredTagSamples = !sessionResult || result?.required_tag_samples_met !== false;
-  const saveReady = accepted && enoughSamples && enoughRequiredTagSamples;
-  const planarOnly = Boolean(result?.planar?.ok && !result?.ok);
-  const planarReady = planarOnly && enoughSamples && enoughRequiredTagSamples;
-  if (elements.aprilTagStatus) {
-    elements.aprilTagStatus.textContent = payload.comparison && accepted
-      ? `Verified ${format(metrics.confidence, 2)}`
-      : payload.comparison && planarOnly
-        ? "Verified planar"
-      : saveReady
-        ? `Ready ${format(metrics.confidence, 2)}`
-      : planarReady
-        ? "Ready planar"
-      : accepted
-        ? "Pose good; collect all samples"
-      : planarOnly
-        ? "Planar only"
-        : result?.error || "Uncalibrated";
+  const metrics = result?.metrics || saved?.metrics || {};
+  if (elements.workspaceCalibrationStatus) {
+    elements.workspaceCalibrationStatus.textContent = payload.comparison
+      ? payload.ok ? "Workspace verified" : "Verification incomplete"
+      : payload.calibrated
+        ? "Calibration saved"
+        : result?.ok
+          ? "Calibration complete"
+          : saved?.ok
+            ? "Workspace calibrated"
+            : payload.error || result?.error || "Workspace uncalibrated";
   }
-  const verifyDelta = comparison.position_delta_mm != null
-    ? `${format(comparison.position_delta_mm, 1)} mm / ${format(comparison.orientation_delta_deg, 2)} deg`
-    : comparison.planar_rmse_mm != null
-      ? `planar ${format(comparison.planar_rmse_mm, 2)} mm RMSE`
-      : "-";
-  if (elements.aprilTagMetrics) {
-    elements.aprilTagMetrics.innerHTML = `
-      <div class="log-line"><span>Samples</span><code>${session.frame_count || result?.frames_used || 0} / ${session.minimum_samples || 0}</code></div>
-      <div class="log-line"><span>Tags</span><code>${(result?.tags_used || session.tag_ids || []).join(", ") || "-"}</code></div>
-      <div class="log-line"><span>Tag samples</span><code>${Object.entries(result?.tag_observation_counts || session.tag_observation_counts || {}).map(([id, count]) => `${id}:${count}`).join(" ") || "-"}</code></div>
-      <div class="log-line"><span>Reprojection</span><code>${result?.ok ? `${format(metrics.reprojection_rmse_px, 2)} px RMSE` : "-"}</code></div>
-      <div class="log-line"><span>Camera XYZ</span><code>${position.length ? position.map((value) => format(value, 1)).join(", ") + " mm" : "-"}</code></div>
-      <div class="log-line"><span>Tilt</span><code>${result?.ok ? `${format(metrics.tilt_from_down_deg, 1)} deg from down` : "-"}</code></div>
-      <div class="log-line"><span>Verify delta</span><code>${verifyDelta}</code></div>
-      <div class="log-line"><span>Message</span><code>${result?.save_note || result?.error || (accepted ? "quality checks passed" : planarOnly ? "planar homography available; intrinsics only needed for 3D pose" : "collect samples")}</code></div>
-    `;
+  const settings = payload.settings || state.config?.camera?.calibration?.workspace_aruco || {};
+  const polygon = settings.workspace_polygon_robot_mm || [];
+  const xValues = polygon.map((point) => Number(point?.[0])).filter(Number.isFinite);
+  const yValues = polygon.map((point) => Number(point?.[1])).filter(Number.isFinite);
+  const bounds = xValues.length && yValues.length
+    ? `X ${format(Math.min(...xValues), 1)} to ${format(Math.max(...xValues), 1)} mm | Y ${format(Math.min(...yValues), 1)} to ${format(Math.max(...yValues), 1)} mm`
+    : "not configured";
+  const centerCounts = session.tag_observation_counts || {};
+  const cornerCounts = session.corner_observation_counts || {};
+  if (elements.workspaceCalibrationMetrics) {
+    const rows = [
+      [
+        "Calibration",
+        saved?.ok
+          ? "Saved map active"
+          : "No saved map",
+      ],
+      [
+        "Last run",
+        result?.frame_count
+          ? `${result.frame_count} frames | ${
+              (result.required_ids || []).map((id) => (
+                `${id}:${centerCounts[id] || 0}/${cornerCounts[id] || 0}`
+              )).join("  ")
+            }`
+          : "-",
+      ],
+      [
+        "Map quality",
+        metrics.rmse_mm != null
+          ? `${format(metrics.rmse_mm, 2)} mm RMSE | ${format(metrics.max_error_mm, 2)} mm max`
+          : saved?.ok ? "saved planar map available" : "waiting for all four tags",
+      ],
+      [
+        "Fresh verification",
+        comparison.rmse_mm != null
+          ? `${format(comparison.rmse_mm, 2)} mm RMSE | ${format(comparison.max_error_mm, 2)} mm max`
+          : "-",
+      ],
+      ["Robot workspace", bounds],
+      ["Coordinates", "Robot X is sideways; robot Y is forward; workspace Z is 0 mm"],
+      [
+        "Status",
+        payload.error
+          || result?.error
+          || (payload.calibrated
+            ? "Calibration was solved and saved."
+            : saved?.ok
+              ? "Normal operation uses this saved map."
+              : "Run workspace calibration."),
+      ],
+    ];
+    elements.workspaceCalibrationMetrics.innerHTML = rows
+      .map(([label, value]) => `<div class="log-line"><span>${label}</span><code>${value}</code></div>`)
+      .join("");
   }
-  if (payload.image_b64 && elements.aprilTagFrame) {
-    elements.aprilTagFrame.src = payload.image_b64;
-    elements.aprilTagFrame.hidden = false;
-    if (elements.aprilTagPlaceholder) elements.aprilTagPlaceholder.hidden = true;
-  }
-  renderAprilTagDetections(payload.detections || []);
-  const settings = payload.settings || state.config?.camera?.calibration?.apriltag || {};
-  if (state.view) state.view.setAprilTagCalibration({ settings, result });
-}
-
-async function loadAprilTagStatus() {
-  const response = await fetch("/api/vision/apriltag/status");
-  const payload = await response.json();
-  if (payload.ok) renderAprilTagCalibration(payload);
-}
-
-async function resetAprilTagCalibration() {
-  setAprilTagBusy(true, "Resetting...");
-  try {
-    const payload = await postJson("/api/vision/apriltag/reset");
-    if (payload.ok) renderAprilTagCalibration(payload);
-    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Reset failed";
-  } finally {
-    setAprilTagBusy(false);
-  }
-}
-
-async function captureAprilTags(sampleCount = 1, accumulate = true) {
-  setAprilTagBusy(true, sampleCount > 1 ? "Collecting..." : "Capturing...");
-  try {
-    const payload = await postJson("/api/vision/apriltag/capture", {
-      sample_count: sampleCount,
-      sample_interval_ms: 80,
-      accumulate,
-    });
-    if (payload.ok) renderAprilTagCalibration(payload);
-    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Capture failed";
-  } finally {
-    setAprilTagBusy(false);
-  }
-}
-
-async function saveAprilTagCalibration() {
-  setAprilTagBusy(true, "Saving pose...");
-  try {
-    const payload = await postJson("/api/vision/apriltag/save", { require_all_tags: true });
-    if (payload.ok) {
-      if (payload.config) applyConfig(payload.config);
-      renderAprilTagCalibration(payload);
-    } else {
-      renderAprilTagCalibration(payload);
+  if (payload.image_b64 && elements.workspaceCalibrationFrame) {
+    elements.workspaceCalibrationFrame.src = payload.image_b64;
+    elements.workspaceCalibrationFrame.hidden = false;
+    updateCameraFrameAspect(
+      elements.workspaceCalibrationFrame,
+      payload.session?.image_size_px
+        || payload.settings?.reference_resolution
+        || payload.camera?.resolution
+    );
+    if (elements.workspaceCalibrationPlaceholder) {
+      elements.workspaceCalibrationPlaceholder.hidden = true;
     }
+  }
+  renderWorkspaceCalibrationDetections(payload.detections || []);
+}
+
+async function loadWorkspaceCalibrationStatus() {
+  const response = await fetch("/api/vision/workspace/status");
+  const payload = await response.json();
+  if (payload.ok) renderWorkspaceCalibration(payload);
+}
+
+async function calibrateWorkspace() {
+  setWorkspaceCalibrationBusy(true, "Calibrating...");
+  try {
+    const saved = await saveAllSettings();
+    if (!saved) return;
+    const payload = await postJson("/api/vision/workspace/calibrate", {
+      max_frames: 36,
+      sample_interval_ms: 40,
+    });
+    if (payload.ok && payload.config) applyConfig(payload.config);
+    renderWorkspaceCalibration(payload);
   } finally {
-    setAprilTagBusy(false);
+    setWorkspaceCalibrationBusy(false);
   }
 }
 
-async function verifyAprilTagCalibration() {
-  setAprilTagBusy(true, "Verifying...");
+async function verifyWorkspaceCalibration() {
+  setWorkspaceCalibrationBusy(true, "Verifying workspace...");
   try {
-    const payload = await postJson("/api/vision/apriltag/verify", { accumulate: false });
-    if (payload.ok) renderAprilTagCalibration(payload);
-    else if (elements.aprilTagStatus) elements.aprilTagStatus.textContent = payload.error || "Verification failed";
+    const saved = await saveAllSettings();
+    if (!saved) return;
+    const payload = await postJson("/api/vision/workspace/verify", {});
+    renderWorkspaceCalibration(payload);
   } finally {
-    setAprilTagBusy(false);
+    setWorkspaceCalibrationBusy(false);
   }
 }
 
@@ -2908,7 +2972,15 @@ function applyConfig(config) {
   state.view.setConfig(state.config);
   syncJointControls();
   renderCameraIntrinsics(state.config.camera);
-  if (!state.config.camera?.enabled && state.cameraLive) setCameraLive(false);
+  if (!state.config.camera?.enabled) {
+    if (state.cameraLive) setCameraLive(false);
+    window.clearTimeout(state.workspaceProjectionTimer);
+    state.workspaceProjectionTimer = null;
+    state.view?.setWorkspaceCameraProjection(null, false);
+  } else {
+    if (state.cameraLive) scheduleCameraFrame(0);
+    scheduleWorkspaceProjection(0);
+  }
   updateSettingsSaveBar();
 }
 
@@ -3194,9 +3266,14 @@ function bindActions() {
       }
       if (target === "operate") {
         detectVision();
+      } else {
+        setCameraPopupVisible(false);
+        setCameraLive(false);
+        state.latestDetections = [];
+        state.view?.setObjectDetections([]);
       }
       if (target === "settings") {
-        loadAprilTagStatus();
+        loadWorkspaceCalibrationStatus();
         updateSettingsSaveBar();
       }
       state.view.resize();
@@ -3381,15 +3458,17 @@ function bindActions() {
     elements.cameraCyInput,
     elements.cameraDistortionInput,
   ].forEach((input) => {
-    input?.addEventListener("input", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
-    input?.addEventListener("change", () => markSettingsDirty("camera", "Camera model changed. Save all settings or use Save camera settings."));
+    input?.addEventListener("input", () => markSettingsDirty("camera", "Camera settings changed. Save all settings to persist them."));
+    input?.addEventListener("change", () => markSettingsDirty("camera", "Camera settings changed. Save all settings to persist them."));
   });
   elements.workspaceProjectionInput?.addEventListener("change", () => {
     if (!elements.workspaceProjectionInput.checked) {
+      window.clearTimeout(state.workspaceProjectionTimer);
+      state.workspaceProjectionTimer = null;
       state.view?.setWorkspaceCameraProjection(null, false);
       return;
     }
-    detectVision();
+    scheduleWorkspaceProjection(0);
   });
   elements.settingsSectionNav?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-settings-target]");
@@ -3475,12 +3554,8 @@ function bindActions() {
   elements.cameraPopupRefreshBtn?.addEventListener("click", detectVision);
   elements.closeCameraPopupBtn?.addEventListener("click", () => setCameraPopupVisible(false));
   elements.cameraLiveToggle?.addEventListener("change", () => setCameraLive(elements.cameraLiveToggle.checked));
-  elements.saveCameraIntrinsicsBtn?.addEventListener("click", saveCameraIntrinsics);
-  elements.resetAprilTagBtn?.addEventListener("click", resetAprilTagCalibration);
-  elements.captureAprilTagBtn?.addEventListener("click", () => captureAprilTags(1, true));
-  elements.collectAprilTagBtn?.addEventListener("click", () => captureAprilTags(12, true));
-  elements.saveAprilTagBtn?.addEventListener("click", saveAprilTagCalibration);
-  elements.verifyAprilTagBtn?.addEventListener("click", verifyAprilTagCalibration);
+  elements.calibrateWorkspaceBtn?.addEventListener("click", calibrateWorkspace);
+  elements.verifyWorkspaceCalibrationBtn?.addEventListener("click", verifyWorkspaceCalibration);
 
   elements.sliderRangeControls.addEventListener("input", () => {
     state.ikUserEdited = true;
@@ -3555,7 +3630,7 @@ async function init() {
   await checkAppVersion();
   state.versionTimer = window.setInterval(checkAppVersion, 15000);
   connectWebSocket();
-  await loadAprilTagStatus();
+  await loadWorkspaceCalibrationStatus();
 }
 
 init();

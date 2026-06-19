@@ -16,6 +16,8 @@ pc_app/config/robot.local.yaml
 .idea/
 test-results/
 playwright-report/
+pc_app/localhost.stdout.log
+pc_app/localhost.stderr.log
 
 # KiCad generated/transient files
 *.lck

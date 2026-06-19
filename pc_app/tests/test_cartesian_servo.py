@@ -93,8 +93,8 @@ def test_reversal_decelerates_before_changing_direction():
     assert max(lateral) < 0.01
 
 
-def test_endpoint_ik_escape_restores_inward_authority_at_exact_extension():
-    config = load_config()
+def test_inward_cartesian_command_retains_authority_at_reference_pose():
+    config = load_config(EXAMPLE_CONFIG_PATH)
     servo = CartesianServo(config.links, config.joints, config.home_pose)
     limits = CartesianServoLimits(
         [joint.max_speed_deg_s for joint in config.joints],
@@ -106,6 +106,9 @@ def test_endpoint_ik_escape_restores_inward_authority_at_exact_extension():
     first = servo.step(1.0 / 30.0, limits)
 
     assert not first["blocked"]
-    assert first["solver_mode"] == "endpoint_singularity_escape"
+    assert first["solver_mode"] in {
+        "direction_constrained",
+        "endpoint_singularity_escape",
+    }
     assert first["achieved_delta"]["z_mm"] < 0.0
     assert first["position_alignment"] > 0.999

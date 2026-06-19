@@ -319,6 +319,8 @@ def test_apriltag_save_accepts_planar_calibration_without_intrinsics(tmp_path, m
         assert payload["result"]["accepted"] is False
         assert payload["result"]["planar"]["ok"]
         assert payload["result"]["saved_projection"] == "planar_homography"
+        assert payload["result"]["save_note"] == "Saved planar workspace calibration for robot X/Y coordinates."
+        assert "configure fx" not in str(payload["result"].get("error", "")).lower()
     finally:
         main.config = original_config
         main.april_tag_session.configure(camera_settings(original_config), preserve_frames=False)
@@ -336,4 +338,4 @@ def test_calibration_cli_documented_invocation_loads_local_app_package():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Collect and verify the fixed workspace AprilTag camera pose." in result.stdout
+    assert "Collect and verify the fixed workspace tag map." in result.stdout

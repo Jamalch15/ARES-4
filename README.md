@@ -78,6 +78,75 @@ It is not yet decided whether each task should be a separate program, a plugin/m
 - [docs/tasks/README.md](docs/tasks/README.md): early notes on task structure
 - [docs/open_questions.md](docs/open_questions.md): unresolved decisions and design questions
 
+## Run The Local Dashboard
+
+The dashboard runs locally through the Python FastAPI server. From PowerShell:
+
+```powershell
+cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Keep that PowerShell window open, then visit:
+
+```text
+http://127.0.0.1:8000
+```
+
+If this is the first run, create the virtual environment and install the
+dependencies first:
+
+```powershell
+cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Simulation mode is the working default, so an ESP32 does not need to be
+connected just to open and inspect the dashboard.
+
+## Stop, Restart, Or Reset Localhost
+
+To stop localhost normally, select the PowerShell window running Uvicorn and
+press `Ctrl+C`.
+
+To restart it, stop the server and run:
+
+```powershell
+cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+If port 8000 is stuck after a crash, find and stop the process using it:
+
+```powershell
+$processId = (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess
+Stop-Process -Id $processId
+```
+
+Then start Uvicorn again. If the browser still shows an old page, use
+`Ctrl+F5` to perform a hard refresh.
+
+To reset the app's saved machine-specific settings, stop the server and rename
+the local config:
+
+```powershell
+cd "C:\Users\chark\Desktop\DTU\4 Semester\Mechatronics\Mechatronics Project Files\pc_app"
+Move-Item .\config\robot.local.yaml .\config\robot.local.backup.yaml
+```
+
+Start the server again. The app will fall back to the tracked,
+simulation-safe `config/robot.example.yaml`. This resets saved calibration,
+hardware IO, tool, camera, and other local settings; keep the backup if those
+values may be needed later.
+
+More startup and troubleshooting details are in
+[pc_app/README.md](pc_app/README.md).
+
 ## GitHub And Local Files
 
 The intended GitHub repository name is `modular-4dof-arm`.

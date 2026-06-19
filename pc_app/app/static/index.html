@@ -360,15 +360,15 @@
                   <div class="section-header">
                     <div>
                       <h2>Camera and workspace calibration</h2>
-                      <p class="hint">Camera source, intrinsics, and table-tag calibration only. Object color detection lives in Tasks.</p>
+                      <p class="hint">Camera source and planar table-tag calibration. Object color detection lives in Tasks.</p>
                     </div>
-                    <span id="aprilTagStatus" class="status-chip">Uncalibrated</span>
+                    <span id="workspaceCalibrationStatus" class="status-chip">Uncalibrated</span>
                   </div>
                   <div class="subsection-heading">
-                    <h3>Camera model</h3>
-                    <p class="hint">Image size for the planar workspace. Pinhole intrinsics are only needed for optional 3D pose.</p>
+                    <h3>Camera source</h3>
+                    <p class="hint">Select the camera and image size used by detection and calibration.</p>
                   </div>
-                  <div class="control-grid camera-intrinsics-grid">
+                  <div class="control-grid camera-source-grid">
                     <label class="toggle-label compact-toggle">
                       <input id="cameraEnabledInput" type="checkbox" />
                       <span class="toggle-text">Camera enabled</span>
@@ -376,13 +376,19 @@
                     <label>Camera index <input id="cameraSourceInput" type="number" min="0" step="1" /></label>
                     <label>Image width <input id="cameraWidthInput" type="number" min="1" step="1" /></label>
                     <label>Image height <input id="cameraHeightInput" type="number" min="1" step="1" /></label>
-                    <label class="toggle-label compact-toggle">
-                      <input id="workspaceProjectionInput" type="checkbox" />
-                      <span class="toggle-text">Project live camera on workspace</span>
-                    </label>
+                  </div>
+                  <div class="subsection-heading">
+                    <h3>Workspace map</h3>
+                    <p class="hint">Calibration saves one fixed robot X/Y map. The viewport uses that saved map for its live camera layer.</p>
+                  </div>
+                  <div class="control-grid workspace-camera-grid">
                     <label class="toggle-label compact-toggle">
                       <input id="workspaceArucoEnabledInput" type="checkbox" />
-                      <span class="toggle-text">Use 4x4 ArUco workspace</span>
+                      <span class="toggle-text">Planar workspace mapping</span>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="workspaceProjectionInput" type="checkbox" />
+                      <span class="toggle-text">Show live camera on workspace</span>
                     </label>
                     <label class="toggle-label compact-toggle">
                       <input id="workspaceArucoInvertInput" type="checkbox" />
@@ -392,34 +398,38 @@
                       <input id="workspaceArucoFallbackInput" type="checkbox" />
                       <span class="toggle-text">Allow normal-image fallback</span>
                     </label>
-                    <label>Horizontal focal length (fx) <input id="cameraFxInput" type="number" min="0.01" step="0.01" /></label>
-                    <label>Vertical focal length (fy) <input id="cameraFyInput" type="number" min="0.01" step="0.01" /></label>
-                    <label>Principal point X (cx) <input id="cameraCxInput" type="number" step="0.01" /></label>
-                    <label>Principal point Y (cy) <input id="cameraCyInput" type="number" step="0.01" /></label>
-                    <label>Lens distortion (k1, k2, p1, p2, k3)
-                      <input id="cameraDistortionInput" type="text" />
-                    </label>
                   </div>
-                  <div class="button-row">
-                    <button id="saveCameraIntrinsicsBtn" type="button">Save camera settings</button>
-                  </div>
-                  <div class="subsection-heading">
-                    <h3>Tag workspace calibration</h3>
-                    <p class="hint">Collect stable tag frames, save planar workspace calibration, then verify it against a fresh image.</p>
-                  </div>
+                  <details class="advanced-block" hidden>
+                    <summary>
+                      <span>Optional 3D camera pose</span>
+                      <small>Not needed for workspace X/Y coordinates</small>
+                    </summary>
+                    <div class="advanced-block-body">
+                      <div class="control-grid camera-intrinsics-grid">
+                        <label>Horizontal focal length (fx) <input id="cameraFxInput" type="number" min="0.01" step="0.01" /></label>
+                        <label>Vertical focal length (fy) <input id="cameraFyInput" type="number" min="0.01" step="0.01" /></label>
+                        <label>Principal point X (cx) <input id="cameraCxInput" type="number" step="0.01" /></label>
+                        <label>Principal point Y (cy) <input id="cameraCyInput" type="number" step="0.01" /></label>
+                        <label>Lens distortion (k1, k2, p1, p2, k3)
+                          <input id="cameraDistortionInput" type="text" />
+                        </label>
+                      </div>
+                    </div>
+                  </details>
                   <div class="button-row calibration-actions">
-                    <button id="resetAprilTagBtn" type="button" class="ghost">Reset Samples</button>
-                    <button id="captureAprilTagBtn" type="button">Capture</button>
-                    <button id="collectAprilTagBtn" type="button" class="primary">Collect 12</button>
-                    <button id="saveAprilTagBtn" type="button">Save Calibration</button>
-                    <button id="verifyAprilTagBtn" type="button">Verify</button>
+                    <button id="calibrateWorkspaceBtn" type="button" class="primary">Calibrate workspace</button>
+                    <button id="verifyWorkspaceCalibrationBtn" type="button">Verify calibration</button>
                   </div>
-                  <div class="camera-frame april-tag-frame">
-                    <img id="aprilTagFrame" alt="AprilTag calibration frame" />
-                    <div id="aprilTagPlaceholder">No AprilTag frame yet</div>
+                  <div class="workspace-calibration-layout">
+                    <div class="camera-frame workspace-calibration-frame">
+                      <img id="workspaceCalibrationFrame" alt="Workspace calibration frame" />
+                      <div id="workspaceCalibrationPlaceholder">Calibration and verification frames appear here</div>
+                    </div>
+                    <div class="workspace-calibration-results">
+                      <div id="workspaceCalibrationMetrics" class="path-summary"></div>
+                      <div id="workspaceCalibrationDetections" class="program-list compact-list"></div>
+                    </div>
                   </div>
-                  <div id="aprilTagMetrics" class="path-summary"></div>
-                  <div id="aprilTagDetections" class="program-list compact-list"></div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsHardware">

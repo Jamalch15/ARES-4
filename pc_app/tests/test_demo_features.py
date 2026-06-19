@@ -3,7 +3,7 @@ from dataclasses import replace
 import cv2
 import numpy as np
 
-from app.config import load_config
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import color_profiles, drop_zones, model_validation_warnings, named_positions, validate_named_position
 from app.tasks import build_pick_and_place_sequence, build_sorting_sequence
 from app.vision import apply_planar_transform, detect_configured_colors, planar_transform_from_points
@@ -44,7 +44,7 @@ def test_named_position_validation_reports_unreachable_cartesian_target():
 
 
 def test_named_position_validation_accepts_auto_phi_cartesian_target():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
 
     errors = validate_named_position(
         config,

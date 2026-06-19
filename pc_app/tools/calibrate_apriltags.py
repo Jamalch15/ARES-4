@@ -24,7 +24,7 @@ from app.demo_settings import camera_settings
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect and verify the fixed workspace AprilTag camera pose.")
+    parser = argparse.ArgumentParser(description="Collect and verify the fixed workspace tag map.")
     parser.add_argument("--config", type=Path, help="Optional robot YAML path. Defaults to the normal local config.")
     parser.add_argument("--source", type=int, help="Override camera source index.")
     parser.add_argument("--frames", type=int, default=20, help="Frames to accumulate.")

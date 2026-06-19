@@ -255,9 +255,10 @@ camera:
     live_interval_ms: 450
   display:
     # When enabled, the dashboard warps each live camera frame through the
-    # saved/live workspace homography and draws it over the robot workspace.
+    # saved workspace homography and draws it over the robot workspace.
     project_live_view: false
     projection_opacity: 0.72
+    projection_interval_ms: 80
   # Planar workspace calibration does not require camera intrinsics. Full
   # 6-DoF AprilTag camera pose still requires measured intrinsics from a
   # checkerboard/ChArUco pass or the camera manufacturer's calibrated model.
@@ -274,8 +275,9 @@ camera:
     robot_points: []
     # Current working 2D setup from vision_robot_project.zip. The inverted
     # DICT_4X4_50 tags provide both a workspace mask and a pixel-to-robot
-    # homography. The saved pixel references are valid only at 640x480 with
-    # the same fixed camera/work-plate geometry.
+    # homography. Robot coordinates use X sideways and Y forward. The saved
+    # pixel references are valid only at 640x480 with the same fixed camera
+    # and work-plate geometry.
     workspace_aruco:
       enabled: true
       dictionary: DICT_4X4_50
@@ -283,30 +285,50 @@ camera:
       required_ids: [0, 1, 2, 3]
       invert_first: true
       allow_normal_fallback: true
+      minimum_samples: 12
+      max_calibration_rmse_mm: 3.0
+      max_calibration_error_mm: 7.0
+      max_calibration_tag_center_error_mm: 12.0
+      max_verification_rmse_mm: 5.0
+      max_verification_error_mm: 10.0
       tag_centers_robot_mm:
-        "0": [111.5, -218.5]
-        "1": [111.5, 218.5]
-        "2": [383.5, -218.5]
-        "3": [383.5, 218.5]
+        "0": [-218.5, 111.5]
+        "1": [218.5, 111.5]
+        "2": [-218.5, 383.5]
+        "3": [218.5, 383.5]
       # OpenCV corner order: top-left, top-right, bottom-right, bottom-left.
+      # With three or more visible tags, the detector ignores marker rotation
+      # and selects the corner farthest from the four-tag center. These values
+      # are only a fallback when too few tags are visible.
       tag_box_corner_index:
-        "0": 2
-        "1": 3
-        "2": 0
-        "3": 1
+        "0": 0
+        "1": 1
+        "2": 3
+        "3": 2
       reference_points_px:
         "0": [99.0, 88.75]
         "1": [545.25, 94.0]
         "2": [96.0, 367.0]
         "3": [541.75, 374.0]
       reference_resolution: {width: 640, height: 480}
-      # Working assumption derived from the inner corners of 40 mm tags.
+      # Outer corners of the four corner tags. This is the calibrated
+      # workspace rectangle and uses robot X sideways, Y forward.
       workspace_polygon_robot_mm:
-        - [131.5, -198.5]
-        - [131.5, 198.5]
-        - [363.5, 198.5]
-        - [363.5, -198.5]
-      projection_pixels_per_mm: 2.0
+        - [-239.0, 86.5]
+        - [239.0, 86.5]
+        - [239.0, 401.5]
+        - [-239.0, 401.5]
+      # Full work-plate area shown in the live 3D projection. This includes
+      # the four tags and matches the calibrated outer polygon above.
+      projection_polygon_robot_mm:
+        - [-239.0, 86.5]
+        - [239.0, 86.5]
+        - [239.0, 401.5]
+        - [-239.0, 401.5]
+      projection_mode: workplate
+      projection_padding_mm: 0.0
+      projection_pixels_per_mm: 1.0
+      projection_jpeg_quality: 82
       projection_alpha: 220
     # Optional higher-accuracy 6-DoF path. It remains independent from the
     # working ArUco homography and requires real camera intrinsics.

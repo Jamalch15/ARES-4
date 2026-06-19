@@ -14,12 +14,7 @@ from .apriltag_calibration import project_image_point_to_plane
 from .workspace_calibration import (
     FiducialDetection,
     apply_homography,
-    detect_fiducials,
     dictionary_candidates,
-    homography_from_marker_centers,
-    layout_diagnostics,
-    marker_box_polygon,
-    marker_centers,
     polygon_from_robot,
     saved_homography,
     solve_image_to_robot_homography,
@@ -54,8 +49,12 @@ def decode_image_b64(image_b64: str) -> np.ndarray:
     return image
 
 
-def encode_image_b64(image_bgr: np.ndarray, ext: str = ".jpg") -> str:
-    ok, encoded = cv2.imencode(ext, image_bgr)
+def encode_image_b64(
+    image_bgr: np.ndarray,
+    ext: str = ".jpg",
+    parameters: list[int] | None = None,
+) -> str:
+    ok, encoded = cv2.imencode(ext, image_bgr, parameters or [])
     if not ok:
         raise ValueError("could not encode image")
     mime = "image/png" if ext.lower() == ".png" else "image/jpeg"
@@ -220,7 +219,6 @@ def _project_center(
                 None,
             )
         if source in {
-            "workspace_aruco_live",
             "workspace_aruco_saved",
             "planar_homography",
             "apriltag_planar_homography",
@@ -345,13 +343,24 @@ def workspace_aruco_settings(camera: dict[str, Any]) -> dict[str, Any]:
         "invert_first": True,
         "allow_normal_fallback": True,
         "tag_centers_robot_mm": {},
-        "tag_box_corner_index": {"0": 2, "1": 3, "2": 0, "3": 1},
+        "tag_box_corner_index": {"0": 0, "1": 1, "2": 3, "3": 2},
         "reference_points_px": {},
+        "reference_workspace_corners_px": {},
         "reference_resolution": {"width": 640, "height": 480},
         "workspace_polygon_robot_mm": [],
-        "projection_pixels_per_mm": 2.0,
+        "projection_polygon_robot_mm": [],
+        "projection_mode": "workplate",
+        "projection_padding_mm": 0.0,
+        "projection_pixels_per_mm": 1.0,
+        "projection_jpeg_quality": 82,
         "projection_alpha": 220,
         "min_layout_vector_alignment": 0.2,
+        "minimum_samples": 12,
+        "max_calibration_rmse_mm": 3.0,
+        "max_calibration_error_mm": 7.0,
+        "max_calibration_tag_center_error_mm": 12.0,
+        "max_verification_rmse_mm": 5.0,
+        "max_verification_error_mm": 10.0,
     }
     defaults.update(raw)
     return defaults
@@ -393,7 +402,9 @@ def _workspace_mask(shape: tuple[int, int], polygon_px: np.ndarray | None) -> np
 
 
 def _workspace_robot_polygon(settings: dict[str, Any]) -> np.ndarray | None:
-    polygon = settings.get("workspace_polygon_robot_mm")
+    polygon = settings.get("projection_polygon_robot_mm")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        polygon = settings.get("workspace_polygon_robot_mm")
     if not isinstance(polygon, list) or len(polygon) < 3:
         return None
     try:
@@ -402,6 +413,21 @@ def _workspace_robot_polygon(settings: dict[str, Any]) -> np.ndarray | None:
         return None
     if not np.all(np.isfinite(points)):
         return None
+    padding = max(0.0, float(settings.get("projection_padding_mm", 0.0)))
+    if padding > 0:
+        min_x = float(np.min(points[:, 0])) - padding
+        max_x = float(np.max(points[:, 0])) + padding
+        min_y = float(np.min(points[:, 1])) - padding
+        max_y = float(np.max(points[:, 1])) + padding
+        points = np.asarray(
+            [
+                [min_x, min_y],
+                [max_x, min_y],
+                [max_x, max_y],
+                [min_x, max_y],
+            ],
+            dtype=np.float64,
+        )
     return points
 
 
@@ -424,11 +450,11 @@ def _workspace_projection_texture(
     if width_mm <= 1e-6 or height_mm <= 1e-6:
         return None
 
-    pixels_per_mm = max(0.5, min(4.0, float(settings.get("projection_pixels_per_mm", 2.0))))
-    width_px = max(32, min(1600, int(round(width_mm * pixels_per_mm))))
-    height_px = max(32, min(1600, int(round(height_mm * pixels_per_mm))))
-    scale_x = width_px / width_mm
-    scale_y = height_px / height_mm
+    pixels_per_mm = max(0.5, min(4.0, float(settings.get("projection_pixels_per_mm", 1.0))))
+    width_px = max(32, min(1600, int(round(width_mm * pixels_per_mm)) + 1))
+    height_px = max(32, min(1600, int(round(height_mm * pixels_per_mm)) + 1))
+    scale_x = (width_px - 1) / width_mm
+    scale_y = (height_px - 1) / height_mm
     robot_to_texture = np.array(
         [
             [scale_x, 0.0, -min_x * scale_x],
@@ -447,20 +473,24 @@ def _workspace_projection_texture(
         borderValue=(0, 0, 0),
     )
 
-    texture_polygon = np.column_stack(
+    texture_polygon_float = np.column_stack(
         (
             (robot_polygon[:, 0] - min_x) * scale_x,
             (max_y - robot_polygon[:, 1]) * scale_y,
         )
-    ).astype(np.int32)
-    alpha = np.zeros((height_px, width_px), dtype=np.uint8)
-    cv2.fillPoly(alpha, [texture_polygon], int(settings.get("projection_alpha", 220)))
-    warped_bgra = cv2.cvtColor(warped, cv2.COLOR_BGR2BGRA)
-    warped_bgra[:, :, 3] = alpha
+    )
+    jpeg_quality = max(
+        40,
+        min(95, int(settings.get("projection_jpeg_quality", 82))),
+    )
 
     return {
         "ok": True,
-        "image_b64": encode_image_b64(warped_bgra, ".png"),
+        "image_b64": encode_image_b64(
+            warped,
+            ".jpg",
+            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+        ),
         "homography_source": workspace.homography_source,
         "workspace_polygon_source": workspace.polygon_source,
         "robot_bounds_mm": {
@@ -471,6 +501,8 @@ def _workspace_projection_texture(
             "z": 1.2,
         },
         "robot_polygon_mm": robot_polygon.tolist(),
+        "texture_polygon_px": texture_polygon_float.tolist(),
+        "projection_mode": "workspace_polygon",
         "texture_size_px": {"width": width_px, "height": height_px},
     }
 
@@ -563,17 +595,15 @@ class WorkspaceObservation:
     def to_dict(self) -> dict[str, Any]:
         visible = set(self.visible_ids)
         required = set(self.required_ids)
-        missing_ids = sorted(required - visible)
+        tags_observed = self.detection_mode not in {"not_checked", "disabled"}
+        missing_ids = sorted(required - visible) if tags_observed else []
         all_required_visible = required.issubset(visible)
         if not self.enabled:
             status = "disabled"
             message = "Workspace calibration is disabled."
-        elif self.homography_source == "workspace_aruco_live" and all_required_visible:
-            status = "live_tags"
-            message = "Live workspace tags are visible; using live planar calibration."
         elif self.homography_source == "workspace_aruco_saved":
             status = "saved_calibration"
-            message = "Using saved planar workspace calibration; live tags are optional."
+            message = "Using the saved planar workspace calibration."
             if self.warning:
                 message = f"{message} {self.warning}"
         elif self.homography is not None:
@@ -596,7 +626,7 @@ class WorkspaceObservation:
                 self.polygon_px.astype(float).tolist() if self.polygon_px is not None else None
             ),
             "workspace_polygon_source": self.polygon_source,
-            "detection_source": "full_frame",
+            "detection_source": "full_frame" if tags_observed else "not_checked",
             "homography_source": self.homography_source,
             "homography_metrics": self.homography_metrics or {},
             "calibrated": self.homography is not None,
@@ -609,7 +639,7 @@ class WorkspaceObservation:
                 if self.layout_errors_px
                 else {}
             ),
-            "live_tags_required": self.homography is None,
+            "live_tags_required": False,
             "error": self.error,
         }
 
@@ -635,6 +665,8 @@ class VisionPipeline:
             repr(settings.get("tag_box_corner_index", {})),
             repr(settings.get("tag_centers_robot_mm", {})),
             repr(settings.get("reference_points_px", {})),
+            repr(settings.get("reference_workspace_corners_px", {})),
+            repr(settings.get("workspace_polygon_robot_mm", [])),
         )
 
     def configure(self, camera: dict[str, Any]) -> None:
@@ -644,7 +676,7 @@ class VisionPipeline:
             self._last_image_shape = None
             self._signature = signature
 
-    def _observe_workspace(
+    def _observe_saved_workspace(
         self,
         image_bgr: np.ndarray,
         camera: dict[str, Any],
@@ -654,7 +686,14 @@ class VisionPipeline:
         required = [int(value) for value in settings.get("required_ids", [])]
         configured_dictionary = str(settings.get("dictionary", "DICT_4X4_50")).upper()
         candidates = dictionary_candidates(settings)
-        empty_detection = FiducialDetection([], None, configured_dictionary, "disabled", [], 0)
+        empty_detection = FiducialDetection(
+            [],
+            None,
+            configured_dictionary,
+            "not_checked",
+            [],
+            0,
+        )
         if not bool(settings.get("enabled", False)):
             return WorkspaceObservation(
                 enabled=False,
@@ -666,74 +705,44 @@ class VisionPipeline:
                 homography=None,
                 homography_source="none",
                 error="workspace ArUco calibration is disabled",
-                marker_detection=empty_detection,
+                marker_detection=FiducialDetection(
+                    [],
+                    None,
+                    configured_dictionary,
+                    "disabled",
+                    [],
+                    0,
+                ),
                 configured_dictionary=configured_dictionary,
                 candidate_dictionaries=candidates,
             )
 
-        detection = detect_fiducials(image_bgr, settings)
-        centers = marker_centers(detection.corners, detection.ids)
-        layout_mismatches, layout_errors = layout_diagnostics(centers, settings, image_bgr.shape)
-        layout_warning = None
-        if layout_mismatches:
-            layout_warning = (
-                "Live tag IDs do not match the saved table layout. "
-                "Using saved calibration instead."
-            )
-
-        polygon = marker_box_polygon(
-            detection.corners,
-            detection.ids,
-            settings.get("tag_box_corner_index", {}),
+        homography, metrics = saved_homography(settings, image_bgr.shape)
+        source = "workspace_aruco_saved" if homography is not None else "none"
+        error = None if homography is not None else str(
+            metrics.get("error") or "no saved workspace calibration is available"
         )
-        polygon_source = "live_tags" if polygon is not None else "none"
-        if polygon is not None:
-            self._last_workspace_polygon = polygon.copy()
-            self._last_image_shape = image_bgr.shape[:2]
-        elif self._last_workspace_polygon is not None and self._last_image_shape == image_bgr.shape[:2]:
-            polygon = self._last_workspace_polygon.copy()
-            polygon_source = "previous_live_tags"
-
-        homography = None
-        metrics: dict[str, Any] = {}
-        source = "none"
-        error = None
-        if not layout_mismatches:
-            homography, metrics = homography_from_marker_centers(centers, settings)
-            if homography is not None:
-                source = "workspace_aruco_live"
-        if homography is None:
-            saved, saved_metrics = saved_homography(settings, image_bgr.shape)
-            if saved is not None:
-                homography = saved
-                metrics = saved_metrics
-                source = "workspace_aruco_saved"
-            else:
-                error = str(saved_metrics.get("error") or metrics.get("error") or "all configured workspace tags are not visible")
-        if polygon is None and homography is not None:
-            polygon = polygon_from_robot(homography, settings)
-            if polygon is not None:
-                polygon_source = "saved_workspace_config"
-        if homography is None and layout_warning:
-            error = layout_warning
+        polygon = (
+            polygon_from_robot(homography, settings)
+            if homography is not None
+            else None
+        )
+        polygon_source = "saved_workspace_config" if polygon is not None else "none"
 
         return WorkspaceObservation(
             enabled=True,
-            dictionary=detection.dictionary,
-            detection_mode=detection.mode,
-            visible_ids=detection.visible_ids,
+            dictionary=configured_dictionary,
+            detection_mode="not_checked",
+            visible_ids=[],
             required_ids=required,
             polygon_px=polygon,
             homography=homography,
             homography_source=source,
             error=error,
-            marker_detection=detection,
+            marker_detection=empty_detection,
             configured_dictionary=configured_dictionary,
             candidate_dictionaries=candidates,
             polygon_source=polygon_source,
-            warning=layout_warning,
-            layout_mismatches=layout_mismatches,
-            layout_errors_px=layout_errors,
             homography_metrics=metrics,
         )
 
@@ -745,14 +754,15 @@ class VisionPipeline:
         profile_names: list[str] | None = None,
         include_workspace_projection: bool = False,
     ) -> dict[str, Any]:
-        workspace = self._observe_workspace(image_bgr, camera)
+        workspace = self._observe_saved_workspace(image_bgr, camera)
         calibration = camera.get("calibration") if isinstance(camera.get("calibration"), dict) else {}
-        projection = _projection_from_calibration(calibration)
-        if projection["source"] == "unavailable" and workspace.homography is not None:
+        if workspace.homography is not None:
             projection = {
                 "source": workspace.homography_source,
                 "homography": workspace.homography,
             }
+        else:
+            projection = _projection_from_calibration(calibration)
         detection_settings = (
             camera.get("detection") if isinstance(camera.get("detection"), dict) else {}
         )
@@ -840,25 +850,51 @@ class VisionPipeline:
             )
         return response
 
+    def project_workspace_frame(
+        self,
+        image_bgr: np.ndarray,
+        camera: dict[str, Any],
+    ) -> dict[str, Any]:
+        workspace = self._observe_saved_workspace(image_bgr, camera)
+        projection = _workspace_projection_texture(
+            image_bgr,
+            workspace,
+            workspace_aruco_settings(camera),
+        )
+        return {
+            "ok": projection is not None,
+            "workspace": {
+                **workspace.to_dict(),
+                "image_size_px": {
+                    "width": int(image_bgr.shape[1]),
+                    "height": int(image_bgr.shape[0]),
+                },
+            },
+            "workspace_projection": projection,
+            "error": workspace.error if projection is None else None,
+        }
+
     def project_external_detections(
         self,
         detections: list[dict[str, Any]],
         camera: dict[str, Any],
     ) -> list[dict[str, Any]]:
         calibration = camera.get("calibration") if isinstance(camera.get("calibration"), dict) else {}
-        projection = _projection_from_calibration(calibration)
-        if projection["source"] == "unavailable":
-            settings = workspace_aruco_settings(camera)
-            resolution = camera.get("resolution") if isinstance(camera.get("resolution"), dict) else {}
-            shape = (
-                int(resolution.get("height", 0) or 0),
-                int(resolution.get("width", 0) or 0),
-                3,
-            )
-            if shape[0] > 0 and shape[1] > 0:
-                homography, _metrics = saved_homography(settings, shape)
-                if homography is not None:
-                    projection = {"source": "workspace_aruco_saved", "homography": homography}
+        settings = workspace_aruco_settings(camera)
+        resolution = camera.get("resolution") if isinstance(camera.get("resolution"), dict) else {}
+        shape = (
+            int(resolution.get("height", 0) or 0),
+            int(resolution.get("width", 0) or 0),
+            3,
+        )
+        homography = None
+        if shape[0] > 0 and shape[1] > 0:
+            homography, _metrics = saved_homography(settings, shape)
+        projection = (
+            {"source": "workspace_aruco_saved", "homography": homography}
+            if homography is not None
+            else _projection_from_calibration(calibration)
+        )
 
         normalized: list[dict[str, Any]] = []
         for index, raw in enumerate(detections, start=1):
@@ -954,8 +990,7 @@ def annotated_detection_frame(
             status = f"tag layout warning | visible {workspace.visible_ids or '-'} | using saved calibration"
         elif workspace.homography_source == "workspace_aruco_saved":
             status = (
-                f"saved planar calibration | live tags {workspace.visible_ids or '-'} | "
-                f"workspace {workspace.polygon_source}"
+                f"saved planar calibration | workspace {workspace.polygon_source}"
             )
         else:
             status = (

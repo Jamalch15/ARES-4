@@ -76,7 +76,23 @@ from .safety import validate_can_move, validate_joint_targets
 from .serial_client import SerialClient, SerialClientError
 from .simulator import apply_simulation_step
 from .tasks import build_batch_sorting_sequence, build_pick_and_place_sequence, build_sorting_sequence
-from .vision import CameraCapture, VisionPipeline, decode_image_b64, encode_image_b64
+from .vision import (
+    CameraCapture,
+    VisionPipeline,
+    apply_planar_transform,
+    decode_image_b64,
+    encode_image_b64,
+    workspace_aruco_settings,
+)
+from .workspace_calibration import (
+    WorkspaceCalibrationSession,
+    annotate_workspace_calibration,
+    detect_fiducials,
+    marker_box_corners,
+    marker_centers,
+    saved_homography,
+    workspace_mapping_errors,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -124,26 +140,55 @@ def _origin_main_revision() -> str | None:
         return None
 
 
-def _source_files() -> list[Path]:
-    files = [
+def _frontend_files() -> list[Path]:
+    return [
         path
-        for path in APP_DIR.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".py", ".js", ".css", ".html"}
+        for path in STATIC_DIR.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".js", ".css", ".html"}
     ]
-    if config.source_path.exists():
-        files.append(config.source_path)
-    return sorted(set(files), key=lambda path: str(path).lower())
 
 
-def source_fingerprint() -> str:
+def _backend_files() -> list[Path]:
+    return [
+        path
+        for path in APP_DIR.rglob("*.py")
+        if path.is_file()
+    ]
+
+
+def _fingerprint_files(files: list[Path]) -> str:
     digest = hashlib.sha256()
-    for path in _source_files():
-        digest.update(str(path.relative_to(PROJECT_DIR)).replace("\\", "/").encode("utf-8"))
+    for path in sorted(set(files), key=lambda candidate: str(candidate).lower()):
+        try:
+            relative_path = path.relative_to(PROJECT_DIR)
+        except ValueError:
+            relative_path = path
+        digest.update(str(relative_path).replace("\\", "/").encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
 
+
+def frontend_fingerprint() -> str:
+    return _fingerprint_files(_frontend_files())
+
+
+def backend_fingerprint() -> str:
+    return _fingerprint_files(_backend_files())
+
+
+def source_fingerprint() -> str:
+    """Compatibility helper for callers that still need one combined source hash."""
+    return _fingerprint_files([*_backend_files(), *_frontend_files()])
+
+
+def config_fingerprint() -> str | None:
+    if not config.source_path.exists():
+        return None
+    return _fingerprint_files([config.source_path])
+
 config: RobotConfig = load_config()
-RUNNING_BUILD_ID = source_fingerprint()
+RUNNING_BACKEND_BUILD_ID = backend_fingerprint()
+RUNNING_CONFIG_ID = config_fingerprint()
 RUNNING_BUILD_STARTED_AT = datetime.now(timezone.utc).isoformat()
 RUNNING_GIT = _git_revision()
 state = RobotState(
@@ -189,6 +234,9 @@ cartesian_jog_runtime: dict[str, Any] = {
     "stop_reason": None,
 }
 april_tag_session = AprilTagCalibrationSession(camera_settings(config))
+workspace_calibration_session = WorkspaceCalibrationSession(
+    workspace_aruco_settings(camera_settings(config))
+)
 camera_capture = CameraCapture()
 vision_pipeline = VisionPipeline()
 
@@ -334,6 +382,15 @@ class VisionProjectRequest(BaseModel):
     detections: list[dict[str, Any]]
 
 
+class WorkspaceCalibrationRequest(BaseModel):
+    image_b64: str | None = None
+
+
+class WorkspaceCalibrationRunRequest(BaseModel):
+    max_frames: int = 36
+    sample_interval_ms: int = 60
+
+
 class AprilTagCaptureRequest(BaseModel):
     image_b64: str | None = None
     sample_count: int = 1
@@ -390,7 +447,9 @@ def public_config() -> dict[str, Any]:
 
 
 def running_version_payload() -> dict[str, Any]:
-    disk_build_id = source_fingerprint()
+    frontend_build_id = frontend_fingerprint()
+    disk_backend_build_id = backend_fingerprint()
+    disk_config_id = config_fingerprint()
     current_git = _git_revision()
     origin_main_commit = _origin_main_revision()
     checkout_changed = bool(
@@ -398,25 +457,41 @@ def running_version_payload() -> dict[str, Any]:
         and current_git["commit"]
         and RUNNING_GIT["commit"] != current_git["commit"]
     )
-    source_changed = disk_build_id != RUNNING_BUILD_ID
-    pull_required = bool(
+    backend_changed = disk_backend_build_id != RUNNING_BACKEND_BUILD_ID
+    config_changed = bool(
+        RUNNING_CONFIG_ID
+        and disk_config_id
+        and RUNNING_CONFIG_ID != disk_config_id
+    )
+    remote_differs = bool(
         origin_main_commit
         and current_git["commit"]
         and origin_main_commit != current_git["commit"]
     )
-    restart_required = source_changed or checkout_changed
+    restart_required = backend_changed
     reasons: list[str] = []
-    if source_changed:
-        reasons.append("source or configuration files changed after the server started")
-    if checkout_changed:
-        reasons.append("the local Git checkout changed after the server started")
-    if pull_required:
+    if backend_changed:
+        reasons.append("backend Python files changed after the server process started")
+    if config_changed:
+        reasons.append("configuration file changed after the runtime config was loaded")
+    if remote_differs:
         reasons.append("the local checkout is not at origin/main")
     return {
-        "running_build_id": RUNNING_BUILD_ID,
-        "disk_build_id": disk_build_id,
+        "frontend_build_id": frontend_build_id,
+        "running_backend_build_id": RUNNING_BACKEND_BUILD_ID,
+        "disk_backend_build_id": disk_backend_build_id,
+        "running_config_id": RUNNING_CONFIG_ID,
+        "disk_config_id": disk_config_id,
+        "backend_restart_required": restart_required,
+        "config_reload_required": config_changed,
+        "remote_differs": remote_differs,
+        "checkout_changed_since_start": checkout_changed,
+        # Compatibility fields make an older browser detect the new frontend
+        # build and refresh once after this version contract changes.
+        "running_build_id": frontend_build_id,
+        "disk_build_id": frontend_build_id,
         "restart_required": restart_required,
-        "pull_required": pull_required,
+        "pull_required": remote_differs,
         "reasons": reasons,
         "started_at": RUNNING_BUILD_STARTED_AT,
         "git_commit": RUNNING_GIT["commit"],
@@ -1900,8 +1975,9 @@ async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, An
 
 
 def reload_runtime_config() -> None:
-    global config, limiter, serial_client
+    global config, limiter, serial_client, RUNNING_CONFIG_ID
     config = load_config()
+    RUNNING_CONFIG_ID = config_fingerprint()
     limiter.config = config
     serial_client.config = config.serial
     cartesian_servo.reconfigure(config.links, config.joints)
@@ -1913,6 +1989,10 @@ def reload_runtime_config() -> None:
     state.closed_loop_mode = str(encoder_settings(config).get("closed_loop_mode", "off"))
     camera = camera_settings(config)
     april_tag_session.configure(camera, preserve_frames=True)
+    workspace_calibration_session.configure(
+        workspace_aruco_settings(camera),
+        preserve_frames=True,
+    )
     vision_pipeline.configure(camera)
     if not state.simulation:
         apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
@@ -1986,8 +2066,9 @@ async def startup() -> None:
 
 @app.get("/")
 async def index() -> HTMLResponse:
+    frontend_build_id = frontend_fingerprint()
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    html = html.replace("__APP_BUILD_ID__", RUNNING_BUILD_ID)
+    html = html.replace("__APP_BUILD_ID__", frontend_build_id)
     return HTMLResponse(
         html,
         headers={
@@ -2156,6 +2237,98 @@ def april_tag_status_payload() -> dict[str, Any]:
     }
 
 
+def workspace_detection_payload(
+    detection: Any,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    centers = marker_centers(detection.corners, detection.ids)
+    inner_corners = marker_box_corners(
+        detection.corners,
+        detection.ids,
+        settings.get("tag_box_corner_index", {}),
+    )
+    robot_centers = settings.get("tag_centers_robot_mm")
+    if not isinstance(robot_centers, dict):
+        robot_centers = {}
+    required = {int(value) for value in settings.get("required_ids", [])}
+    payload: list[dict[str, Any]] = []
+    for marker_id in sorted(centers):
+        center = centers[marker_id]
+        corner = inner_corners.get(marker_id)
+        robot = robot_centers.get(str(marker_id), robot_centers.get(marker_id))
+        payload.append(
+            {
+                "id": marker_id,
+                "configured": marker_id in required,
+                "center_px": {"x": float(center[0]), "y": float(center[1])},
+                "workspace_corner_px": (
+                    {"x": float(corner[0]), "y": float(corner[1])}
+                    if corner is not None
+                    else None
+                ),
+                "robot_center_mm": (
+                    {"x": float(robot[0]), "y": float(robot[1])}
+                    if isinstance(robot, (list, tuple)) and len(robot) >= 2
+                    else None
+                ),
+            }
+        )
+    return payload
+
+
+def workspace_status_payload() -> dict[str, Any]:
+    camera = camera_settings(config)
+    settings = workspace_aruco_settings(camera)
+    resolution = settings.get("reference_resolution")
+    if not isinstance(resolution, dict):
+        resolution = {}
+    shape = (
+        int(resolution.get("height", 0) or 0),
+        int(resolution.get("width", 0) or 0),
+        3,
+    )
+    saved_result: dict[str, Any] | None = None
+    if shape[0] > 0 and shape[1] > 0:
+        homography, metrics = saved_homography(settings, shape)
+        saved_result = {
+            "ok": homography is not None,
+            "metrics": metrics,
+            "reference_resolution": {
+                "width": shape[1],
+                "height": shape[0],
+            },
+            "saved_at": settings.get("last_calibrated_at"),
+        }
+    return {
+        "camera": camera,
+        "settings": settings,
+        "session": workspace_calibration_session.summary(),
+        "saved_result": saved_result,
+    }
+
+
+def persist_workspace_calibration_result(result: dict[str, Any]) -> dict[str, Any]:
+    updated_camera = camera_settings(config)
+    calibration = updated_camera.setdefault("calibration", {})
+    workspace = calibration.setdefault("workspace_aruco", {})
+    workspace.update(
+        {
+            "enabled": True,
+            "dictionary": result["dictionary"],
+            "reference_points_px": result["reference_points_px"],
+            "reference_workspace_corners_px": result[
+                "reference_workspace_corners_px"
+            ],
+            "reference_resolution": result["reference_resolution"],
+            "last_calibrated_at": time(),
+            "last_calibration_metrics": result["metrics"],
+        }
+    )
+    save_calibration_updates(ensure_local_config(), {"camera": updated_camera})
+    reload_runtime_config()
+    return public_config()
+
+
 @app.post("/api/vision/settings")
 async def save_vision_settings(request: VisionSettingsRequest) -> dict[str, Any]:
     updates = request.__dict__
@@ -2169,6 +2342,149 @@ async def save_vision_settings(request: VisionSettingsRequest) -> dict[str, Any]
     log_event("vision", "vision settings saved")
     await broadcast_state()
     return {"ok": True, "config": public_config(), "state": state.to_dict()}
+
+
+@app.get("/api/vision/workspace/status")
+async def get_workspace_calibration_status() -> dict[str, Any]:
+    workspace_calibration_session.configure(
+        workspace_aruco_settings(camera_settings(config)),
+        preserve_frames=True,
+    )
+    return {"ok": True, **workspace_status_payload()}
+
+
+@app.post("/api/vision/workspace/calibrate")
+async def calibrate_workspace(
+    request: WorkspaceCalibrationRunRequest,
+) -> dict[str, Any]:
+    camera = camera_settings(config)
+    settings = workspace_aruco_settings(camera)
+    workspace_calibration_session.configure(settings, preserve_frames=False)
+    max_frames = max(
+        workspace_calibration_session.minimum_samples,
+        min(int(request.max_frames), 120),
+    )
+    interval_s = max(
+        0.0,
+        min(float(request.sample_interval_ms) / 1000.0, 0.5),
+    )
+    latest_image = None
+    latest_detection = None
+    try:
+        if not bool(camera.get("enabled", False)):
+            raise RuntimeError("camera is disabled in Settings")
+        for frame_index in range(max_frames):
+            latest_image = await asyncio.to_thread(capture_camera_frame, camera)
+            latest_detection = await asyncio.to_thread(
+                detect_fiducials,
+                latest_image,
+                settings,
+            )
+            workspace_calibration_session.add(
+                latest_detection,
+                latest_image.shape,
+            )
+            if workspace_calibration_session.summary().get("ready"):
+                break
+            if frame_index + 1 < max_frames and interval_s > 0:
+                await asyncio.sleep(interval_s)
+
+        result = workspace_calibration_session.solve(require_minimum_samples=True)
+        annotated = annotate_workspace_calibration(
+            latest_image,
+            latest_detection,
+            settings,
+            result,
+        )
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get(
+                    "error",
+                    "workspace calibration did not collect enough stable frames",
+                ),
+                "image_b64": encode_image_b64(annotated),
+                "detections": workspace_detection_payload(
+                    latest_detection,
+                    settings,
+                ),
+                "result": result,
+                **workspace_status_payload(),
+            }
+        updated_config = persist_workspace_calibration_result(result)
+    except Exception as exc:
+        error = f"workspace calibration failed: {exc}"
+        state.set_error(error)
+        log_event("vision", "workspace calibration failed", error=str(exc))
+        await broadcast_state()
+        return {"ok": False, "error": error, **workspace_status_payload()}
+
+    log_event(
+        "vision",
+        "workspace calibrated and saved",
+        frames=result.get("frame_count"),
+        dictionary=result.get("dictionary"),
+        rmse_mm=result.get("metrics", {}).get("rmse_mm"),
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "calibrated": True,
+        "image_b64": encode_image_b64(annotated),
+        "detections": workspace_detection_payload(latest_detection, settings),
+        "result": result,
+        "config": updated_config,
+        **workspace_status_payload(),
+    }
+
+@app.post("/api/vision/workspace/verify")
+async def verify_workspace_calibration(
+    request: WorkspaceCalibrationRequest,
+) -> dict[str, Any]:
+    camera = camera_settings(config)
+    settings = workspace_aruco_settings(camera)
+    try:
+        image = (
+            decode_image_b64(request.image_b64)
+            if request.image_b64
+            else await asyncio.to_thread(capture_camera_frame, camera)
+        )
+        detection = detect_fiducials(image, settings)
+        homography, saved_metrics = saved_homography(settings, image.shape)
+        if homography is None:
+            raise RuntimeError(
+                saved_metrics.get("error", "no planar workspace calibration is saved")
+            )
+        comparison = workspace_mapping_errors(homography, detection, settings)
+        if not comparison.get("point_count"):
+            raise RuntimeError(comparison.get("error", "no configured workspace tags detected"))
+        annotated = annotate_workspace_calibration(
+            image,
+            detection,
+            settings,
+            comparison,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"workspace verification failed: {exc}"}
+    return {
+        "ok": bool(comparison.get("ok")),
+        "error": (
+            None
+            if comparison.get("ok")
+            else (
+                f"missing required tags: {comparison.get('missing_ids', [])}"
+                if comparison.get("missing_ids")
+                else (
+                    f"verification exceeds limits: {comparison.get('rmse_mm', 0):.2f} mm RMSE, "
+                    f"{comparison.get('max_error_mm', 0):.2f} mm max"
+                )
+            )
+        ),
+        "image_b64": encode_image_b64(annotated),
+        "comparison": comparison,
+        "detections": workspace_detection_payload(detection, settings),
+        **workspace_status_payload(),
+    }
 
 
 @app.get("/api/vision/apriltag/status")
@@ -2274,7 +2590,7 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
             )
         )
     if not pose_accepted and not planar_ok:
-        errors.append(result.get("error") or "camera pose did not pass quality checks")
+        errors.append(result.get("error") or "workspace calibration did not pass quality checks")
     if errors:
         return {"ok": False, "error": "; ".join(errors), "result": result, **april_tag_status_payload()}
 
@@ -2285,7 +2601,7 @@ async def save_apriltag_calibration(request: AprilTagSaveRequest) -> dict[str, A
         result = {
             **result,
             "saved_projection": "planar_homography",
-            "save_note": "Saved planar image-to-robot homography. Camera intrinsics are only required for 3D pose.",
+            "save_note": "Saved planar workspace calibration for robot X/Y coordinates.",
         }
     april_tag["result"] = result
     april_tag["saved_at"] = time()
@@ -2315,7 +2631,7 @@ async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[s
     saved_planar = saved.get("planar") if isinstance(saved, dict) and isinstance(saved.get("planar"), dict) else {}
     saved_has_planar = bool(saved_planar.get("ok"))
     if not isinstance(saved, dict) or not (saved.get("accepted") or saved_has_planar):
-        return {"ok": False, "error": "no AprilTag pose or planar workspace calibration has been saved"}
+        return {"ok": False, "error": "no planar workspace calibration has been saved"}
     try:
         image = (
             decode_image_b64(request.image_b64)
@@ -2326,7 +2642,7 @@ async def verify_apriltag_calibration(request: AprilTagCaptureRequest) -> dict[s
         live = estimate_camera_pose(detections, camera)
         if saved.get("accepted"):
             if not live.get("ok"):
-                raise RuntimeError(live.get("error", "could not estimate live camera pose"))
+                raise RuntimeError(live.get("error", "could not verify live workspace calibration"))
             import cv2
             import numpy as np
 
@@ -2404,7 +2720,7 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
 
 
 @app.get("/api/vision/frame")
-async def get_vision_frame(project_workspace: bool = False) -> dict[str, Any]:
+async def get_vision_frame() -> dict[str, Any]:
     try:
         camera = camera_settings(config)
         image = await asyncio.to_thread(capture_camera_frame, camera)
@@ -2412,19 +2728,36 @@ async def get_vision_frame(project_workspace: bool = False) -> dict[str, Any]:
             image,
             camera,
             color_profiles(config),
-            include_workspace_projection=project_workspace,
         )
         return {
             "ok": True,
+            "raw_image_b64": encode_image_b64(image),
             "image_b64": encode_image_b64(result["annotated"]),
             "detections": result["detections"],
             "workspace": result["workspace"],
-            "workspace_projection": result.get("workspace_projection"),
             "provider": result["provider"],
             "calibration_source": result["calibration_source"],
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "detections": []}
+
+
+@app.get("/api/vision/workspace/live")
+async def get_live_workspace_projection() -> dict[str, Any]:
+    try:
+        camera = camera_settings(config)
+        image = await asyncio.to_thread(capture_camera_frame, camera)
+        result = vision_pipeline.project_workspace_frame(image, camera)
+        return {
+            **result,
+            "captured_at": time(),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "workspace_projection": None,
+        }
 
 
 @app.post("/api/vision/project")
@@ -3365,9 +3698,9 @@ async def clear_estop() -> dict[str, Any]:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     websockets.add(websocket)
-    await websocket.send_json({"type": "config", "config": public_config()})
-    await websocket.send_json({"type": "state", "state": state.to_dict()})
     try:
+        await websocket.send_json({"type": "config", "config": public_config()})
+        await websocket.send_json({"type": "state", "state": state.to_dict()})
         while True:
             payload = await websocket.receive_json()
             command = payload.get("command")

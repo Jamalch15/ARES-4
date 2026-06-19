@@ -110,6 +110,51 @@ Then open `http://127.0.0.1:8001`.
 python -m pip install -r requirements.txt
 ```
 
+## Stop, Restart, And Reset
+
+### Stop The Server
+
+In the PowerShell window running Uvicorn, press `Ctrl+C`. Closing that window
+also stops localhost.
+
+### Restart The Server
+
+Stop it with `Ctrl+C`, then run:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Use `Ctrl+F5` in the browser if it still displays old frontend files.
+
+### Clear A Stuck Port
+
+If Uvicorn reports that port 8000 is already in use:
+
+```powershell
+$processId = (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess
+Stop-Process -Id $processId
+```
+
+Start Uvicorn again afterward. Only stop the process after confirming it is
+the old localhost server.
+
+### Reset Saved App Settings
+
+The app stores machine-specific settings and calibration in
+`config/robot.local.yaml`. To return to the tracked simulation-safe defaults,
+stop Uvicorn and rename that file:
+
+```powershell
+Move-Item .\config\robot.local.yaml .\config\robot.local.backup.yaml
+```
+
+Restart Uvicorn. The app will load `config/robot.example.yaml`. This resets
+saved hardware IO, geometry/calibration, tools, camera settings, and other
+local changes. To restore the old settings, stop Uvicorn and rename the backup
+to `robot.local.yaml`.
+
 ## User Guide
 
 The dashboard is a sandbox for testing the arm model and motion behavior before trusting real hardware.
@@ -117,13 +162,24 @@ The dashboard is a sandbox for testing the arm model and motion behavior before 
 The bottom-left build indicator verifies the running localhost instance every
 15 seconds:
 
-- `Current checkout <commit>` means the browser tab, backend process, local
-  files, local Git HEAD, and `origin/main` match.
-- `Browser outdated` means click the indicator to reload the tab.
-- `Server outdated` means source/config files changed after Uvicorn started;
-  stop and restart the localhost server.
-- `Code outdated` means this checkout is behind or different from
-  `origin/main`; pull the repository, then restart localhost.
+- `Current localhost <commit>` means the browser assets match the current
+  HTML/JS/CSS files, the running Python backend matches the Python files on
+  disk, and the loaded robot settings match the config file.
+- `Current localhost <commit> - remote differs` means localhost is fresh, but
+  local `HEAD` does not match `origin/main`.
+- `Browser outdated` means HTML/JS/CSS changed; click the indicator to reload
+  the tab with build-keyed asset URLs.
+- `Backend outdated` means Python files changed without the server process
+  reloading. With the documented `uvicorn --reload` command this should clear
+  automatically; otherwise restart localhost.
+- `Settings file changed` means the config file changed outside the loaded
+  runtime config; restart localhost before trusting the displayed settings.
+
+The frontend and backend checks are intentionally separate. FastAPI serves
+static files directly from disk, while imported Python code remains in the
+running process until Uvicorn reloads it. Uvicorn's default reload filter
+watches Python files, not HTML/JS/CSS, so frontend edits are handled by browser
+refresh and backend edits by the Uvicorn reloader.
 
 ### Layout
 
@@ -185,30 +241,29 @@ Use this as the shared robot model for both FK and IK.
 - Draft edits do not affect FK/IK until you press `Save`.
 - After saving, the backend reloads config, refreshes the dashboard from the saved model, and tries to resync the ESP if serial hardware is connected.
 
-### AprilTag Workspace Calibration
+### Workspace Camera Calibration
 
-The Settings tab includes a fixed-workspace AprilTag workflow using OpenCV's `DICT_APRILTAG_36H11` detector.
+The Settings tab uses one planar calibration path for object coordinates and
+the projected camera layer. It detects square tags 0-3 using the configured
+ArUco/AprilTag dictionary candidates and does not require camera intrinsics.
 
-Current assumptions:
+- Robot `X` is sideways, robot `Y` is forward, and the work plate is `Z=0`.
+- Each sample records the tag center for layout diagnostics and the physical
+  outer corner for the coordinate fit. Printed marker rotation is ignored.
+- Twelve observations per required center and outer corner are median-filtered.
+- `Calibrate workspace` collects, validates, and saves the map in one action.
+- Saving is blocked when outer-corner fit or tag-center layout exceeds the
+  configured millimeter limits.
+- Verification projects a fresh tag frame through the saved map and reports
+  center/corner errors in millimeters.
+- Normal operation never recalibrates from live tags.
+- The live camera texture uses a dedicated fast saved-map endpoint and is
+  placed on the matching robot-coordinate polygon in the 3D view.
+- The Settings preview updates only after calibration or verification. Color
+  detection stays in Tasks.
 
-- Tag IDs `0, 1, 2, 3` are 40 mm squares.
-- Configured coordinates are the physical workspace corners in robot millimeters.
-- Tags lie on robot `Z=0` and their printed top edges point toward robot `+Y`.
-- Tags are placed inside the workspace. Their outer corners align with the workspace corners: tag 0 bottom-left, tag 1 bottom-right, tag 2 top-right, and tag 3 top-left.
-- For 40 mm tags, the resulting centers are `(-219, 106.5)`, `(219, 106.5)`, `(219, 381.5)`, and `(-219, 381.5)`.
-- The camera is fixed while samples are collected.
-
-Enter measured camera intrinsics (`fx`, `fy`, `cx`, `cy`, and distortion coefficients), save them, reset the sample session, then collect at least 12 observations of every required tag. `Save Pose` requires those per-tag sample counts, an accepted reprojection error, and a camera solution above and facing the workspace. `Verify` compares a fresh pose with the saved position and orientation.
-
-Repeated frames reduce corner noise by taking the median corner location for each tag. Frames with only some tags still contribute observations, but every required ID must reach the configured sample count before saving. Changing the camera source, resolution, or tag dictionary resets incompatible accumulated samples. If intrinsics are missing, the calibration view can still report a planar homography, but it deliberately refuses to claim a 6-DoF camera position.
-
-The same workflow is available from the command line:
-
-```powershell
-cd pc_app
-python tools/calibrate_apriltags.py --frames 20 --show
-python tools/calibrate_apriltags.py --frames 20 --save
-```
+Camera intrinsics and the separate 6-DoF pose implementation remain optional
+developer functionality. They are not used by the operator workspace workflow.
 
 ### Hardware IO
 
@@ -277,8 +332,9 @@ Important fields:
 - `joints[].hardware.servo`: PWM pin, pulse min/max, PWM frequency, servo range, neutral angle, and servo-to-joint gear ratio
 - `tools`: active gripper or magnet dimensions and IO settings
 - `encoders`: staged AS5048A readback and verification settings
-- `camera.intrinsics`: calibrated camera matrix and distortion coefficients
-- `camera.calibration.apriltag`: tag family, physical layout, quality thresholds, and saved camera pose
+- `camera.calibration.workspace_aruco`: planar tag layout, saved pixel
+  references, workspace polygon, and millimeter quality thresholds
+- `camera.intrinsics`: optional camera matrix for developer-only 3D pose work
 
 ## Coordinate Frame And Kinematics
 

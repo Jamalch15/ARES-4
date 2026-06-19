@@ -659,30 +659,55 @@ function makeWorkspaceCameraProjectionMesh(texture, projection, opacity) {
     return null;
   }
 
-  const corners = [
-    robotToScene({ x: minX, y: maxY, z }),
-    robotToScene({ x: maxX, y: maxY, z }),
-    robotToScene({ x: maxX, y: minY, z }),
-    robotToScene({ x: minX, y: minY, z }),
+  const fallbackPolygon = [
+    [minX, maxY],
+    [maxX, maxY],
+    [maxX, minY],
+    [minX, minY],
   ];
+  const polygon = Array.isArray(projection?.robot_polygon_mm)
+    && projection.robot_polygon_mm.length >= 3
+    && projection.robot_polygon_mm.every((point) => (
+      Array.isArray(point)
+      && point.length >= 2
+      && Number.isFinite(Number(point[0]))
+      && Number.isFinite(Number(point[1]))
+    ))
+    ? projection.robot_polygon_mm.map((point) => [Number(point[0]), Number(point[1])])
+    : fallbackPolygon;
   const positions = [];
-  corners.forEach((corner) => positions.push(corner.x, corner.y, corner.z));
+  const uvs = [];
+  const suppliedUvs = Array.isArray(projection?.texture_uv)
+    && projection.texture_uv.length === polygon.length
+    && projection.texture_uv.every((point) => (
+      Array.isArray(point)
+      && point.length >= 2
+      && Number.isFinite(Number(point[0]))
+      && Number.isFinite(Number(point[1]))
+    ))
+    ? projection.texture_uv
+    : null;
+  polygon.forEach(([x, y], index) => {
+    const point = robotToScene({ x, y, z });
+    positions.push(point.x, point.y, point.z);
+    if (suppliedUvs) {
+      uvs.push(Number(suppliedUvs[index][0]), Number(suppliedUvs[index][1]));
+    } else {
+      uvs.push(
+        (x - minX) / (maxX - minX),
+        (y - minY) / (maxY - minY)
+      );
+    }
+  });
+  const triangles = THREE.ShapeUtils.triangulateShape(
+    polygon.map(([x, y]) => new THREE.Vector2(x, y)),
+    []
+  );
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geometry.setAttribute(
-    "uv",
-    new THREE.Float32BufferAttribute(
-      [
-        0, 1,
-        1, 1,
-        1, 0,
-        0, 0,
-      ],
-      2
-    )
-  );
-  geometry.setIndex([0, 1, 2, 0, 2, 3]);
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(triangles.flat());
   geometry.computeVertexNormals();
 
   const material = new THREE.MeshBasicMaterial({
@@ -699,7 +724,25 @@ function makeWorkspaceCameraProjectionMesh(texture, projection, opacity) {
   const mesh = new THREE.Mesh(geometry, material);
   mesh.renderOrder = 3;
   mesh.userData.kind = "workspaceCameraProjection";
-  return mesh;
+
+  const outlineGeometry = new THREE.BufferGeometry().setFromPoints(
+    polygon.map(([x, y]) => robotToScene({ x, y, z: z + 0.3 }))
+  );
+  const outlineMaterial = new THREE.LineBasicMaterial({
+    color: 0x5ee6c5,
+    transparent: true,
+    opacity: 0.9,
+  });
+  outlineMaterial.userData.disposeWithObject = true;
+  const outline = new THREE.LineLoop(outlineGeometry, outlineMaterial);
+  outline.renderOrder = 4;
+  outline.userData.kind = "workspaceCameraProjectionOutline";
+
+  const group = new THREE.Group();
+  group.userData.kind = "workspaceCameraProjection";
+  group.userData.polygonPointCount = polygon.length;
+  group.add(mesh, outline);
+  return group;
 }
 
 export class RobotView {
@@ -716,6 +759,9 @@ export class RobotView {
     this.lastRenderedAngles = null;
     this.lastConfigSignature = "";
     this.cameraProjectionLoadId = 0;
+    this.cameraProjectionObject = null;
+    this.cameraProjectionSignature = "";
+    this.cameraProjectionFrameCount = 0;
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x171f2d);
 
@@ -1011,19 +1057,29 @@ export class RobotView {
 
   setWorkspaceCameraProjection(projection, enabled = true) {
     this.cameraProjectionLoadId += 1;
-    clearGroup(this.cameraProjectionGroup);
     if (!enabled) {
+      clearGroup(this.cameraProjectionGroup);
+      this.cameraProjectionObject = null;
+      this.cameraProjectionSignature = "";
       this.container.dataset.workspaceCameraProjection = "off";
       this.render();
       return;
     }
     if (!projection?.ok || !projection.image_b64 || !projection.robot_bounds_mm) {
+      clearGroup(this.cameraProjectionGroup);
+      this.cameraProjectionObject = null;
+      this.cameraProjectionSignature = "";
       this.container.dataset.workspaceCameraProjection = "unavailable";
       this.render();
       return;
     }
 
     const loadId = this.cameraProjectionLoadId;
+    const geometrySignature = JSON.stringify({
+      bounds: projection.robot_bounds_mm,
+      polygon: projection.robot_polygon_mm,
+      uv: projection.texture_uv,
+    });
     this.container.dataset.workspaceCameraProjection = "loading";
     new THREE.TextureLoader().load(
       projection.image_b64,
@@ -1033,18 +1089,54 @@ export class RobotView {
           return;
         }
         texture.colorSpace = THREE.SRGBColorSpace;
+        texture.flipY = true;
+        texture.wrapS = THREE.ClampToEdgeWrapping;
+        texture.wrapT = THREE.ClampToEdgeWrapping;
         const opacity = this.config.camera?.display?.projection_opacity ?? 0.72;
-        const mesh = makeWorkspaceCameraProjectionMesh(texture, projection, opacity);
-        if (!mesh) {
-          texture.dispose();
-          this.container.dataset.workspaceCameraProjection = "invalid-bounds";
-          this.render();
-          return;
+        if (
+          this.cameraProjectionObject
+          && this.cameraProjectionSignature === geometrySignature
+        ) {
+          const surface = this.cameraProjectionObject.children.find(
+            (child) => child.userData.kind === "workspaceCameraProjection"
+          );
+          if (surface?.material) {
+            const previousTexture = surface.material.map;
+            surface.material.map = texture;
+            surface.material.opacity = clamp01(opacity, 0.72);
+            surface.material.needsUpdate = true;
+            previousTexture?.dispose();
+          } else {
+            texture.dispose();
+            return;
+          }
+        } else {
+          const mesh = makeWorkspaceCameraProjectionMesh(
+            texture,
+            projection,
+            opacity
+          );
+          if (!mesh) {
+            texture.dispose();
+            this.container.dataset.workspaceCameraProjection = "invalid-bounds";
+            this.render();
+            return;
+          }
+          clearGroup(this.cameraProjectionGroup);
+          this.cameraProjectionObject = mesh;
+          this.cameraProjectionSignature = geometrySignature;
+          this.cameraProjectionGroup.add(mesh);
+          this.container.dataset.workspaceCameraPolygonPoints = String(
+            mesh.userData.polygonPointCount || 0
+          );
         }
-        this.cameraProjectionGroup.add(mesh);
         const size = projection.texture_size_px || {};
         const source = projection.homography_source || "unknown";
         this.container.dataset.workspaceCameraProjection = `${source}|${size.width || 0}x${size.height || 0}`;
+        this.cameraProjectionFrameCount += 1;
+        this.container.dataset.workspaceCameraFrameCount = String(
+          this.cameraProjectionFrameCount
+        );
         this.render();
       },
       undefined,
@@ -1059,7 +1151,8 @@ export class RobotView {
 
   setAprilTagCalibration(calibration) {
     clearGroup(this.calibrationGroup);
-    if (!calibration) {
+    const showCameraPose = Boolean(this.config.camera?.display?.show_3d_pose_overlay);
+    if (!calibration || !showCameraPose) {
       delete this.container.dataset.aprilTagCalibration;
       this.render();
       return;
@@ -1075,7 +1168,7 @@ export class RobotView {
       this.calibrationGroup.add(makeCameraPoseOverlay(result));
       this.container.dataset.aprilTagCalibration = result.id || "live";
     } else {
-      this.container.dataset.aprilTagCalibration = "tags-only";
+      this.container.dataset.aprilTagCalibration = result?.planar?.ok ? "workspace-planar" : "tags-only";
     }
     this.calibrationGroup.visible = this.framesVisible;
     this.render();

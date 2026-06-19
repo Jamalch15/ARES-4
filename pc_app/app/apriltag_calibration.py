@@ -119,7 +119,7 @@ def camera_intrinsics(camera: dict[str, Any]) -> tuple[np.ndarray | None, np.nda
                 camera_matrix = None
                 errors.append("camera focal lengths must be positive")
     if camera_matrix is None and not errors:
-        errors.append("camera intrinsics are missing; configure fx, fy, cx, and cy before solving 6-DoF pose")
+        errors.append("optional 3D camera pose skipped because intrinsics are blank")
 
     distortion = raw.get("distortion_coefficients", [0.0, 0.0, 0.0, 0.0, 0.0])
     try:
@@ -296,8 +296,9 @@ def estimate_camera_pose(
     if camera_matrix is None:
         base["planar_only"] = bool(planar.get("ok"))
         base["error"] = (
-            "; ".join(intrinsic_errors)
-            + ("; planar homography is available without camera intrinsics" if planar.get("ok") else "")
+            "planar workspace calibration is available for robot X/Y coordinates"
+            if planar.get("ok")
+            else "; ".join(intrinsic_errors)
         )
         return base
     min_tags = max(1, int(settings.get("min_tags_for_pose", 2)))
@@ -554,7 +555,7 @@ def project_image_point_to_plane(
         or not np.all(np.isfinite(position))
         or not np.all(np.isfinite(dist_coeffs))
     ):
-        raise ValueError("saved AprilTag camera pose is incomplete")
+        raise ValueError("saved optional 3D projection data is incomplete")
     pixel = np.asarray(image_point, dtype=np.float64)
     if pixel.shape != (2,) or not np.all(np.isfinite(pixel)):
         raise ValueError("image point must contain two finite pixel coordinates")

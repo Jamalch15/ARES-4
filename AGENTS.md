@@ -79,3 +79,35 @@ If the repo contains an unfinished or ambiguous design:
 - Keep interfaces simple
 
 The main goal at this stage is to support exploration while keeping the project understandable.
+
+## Tests And GitHub Actions
+
+GitHub Actions runs the PC application tests on Ubuntu from a clean checkout.
+The developer machine may also contain the ignored
+`pc_app/config/robot.local.yaml`, so a test that calls `load_config()` can
+silently use different robot geometry or calibration locally than it uses in
+CI.
+
+The June 18, 2026 failure on commit `0476bef` was caused by this difference.
+`test_endpoint_ik_escape_restores_inward_authority_at_exact_extension` passed
+against the local configuration but failed in GitHub Actions because the clean
+checkout used `robot.example.yaml`. The behavior was valid in both cases, but
+the test required one incidental solver mode string.
+
+To prevent this:
+
+- Tests must use `load_config(EXAMPLE_CONFIG_PATH)` when they require the
+  committed reference robot configuration.
+- Use bare `load_config()` only when the purpose of the test is specifically
+  to exercise local-config selection or normal runtime configuration loading.
+- Assert the externally relevant behavior, coordinates, limits, or safety
+  result. Do not require one internal solver/fallback label when multiple
+  solver paths satisfy the same contract.
+- Before pushing, run the complete suite from `pc_app` with:
+  `python -m pytest`.
+- When a change may depend on ignored local files, also test from a clean
+  checkout or a copied tree that excludes `robot.local.yaml`.
+- Do not commit localhost server logs, pytest caches, virtual environments, or
+  local robot calibration files.
+- After pushing, wait for the `Python tests` GitHub Actions workflow and verify
+  that it completes successfully. A successful local run is not sufficient.

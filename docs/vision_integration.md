@@ -10,8 +10,7 @@ robot calibration.
 
 ```text
 USB camera
--> normal/inverted square-tag detection
--> workspace polygon and planar pixel-to-robot homography
+-> saved workspace polygon and planar pixel-to-robot homography
 -> workspace-masked multi-object color detection
 -> normalized detection objects
 -> task preview
@@ -27,26 +26,28 @@ the example keeps the imported ZIP assumption visible. Saved ArUco reference
 points are valid only while the camera, resolution, zoom, and work plate remain
 fixed.
 
-## Calibration Paths
+## Workspace Calibration
 
-The two calibration paths are intentionally separate:
+`camera.calibration.workspace_aruco` is the authoritative operator calibration.
+It uses the four physical tag corners facing away from the workspace center,
+independent of each printed marker's rotation. Repeated observations are
+median-filtered before the four outer corners define the image-to-robot
+homography. Tag centers remain layout and ID diagnostics, not fit points.
+Tag detection and homography solving run only when the operator presses
+`Calibrate workspace` or `Verify calibration`. Normal vision and viewport
+streaming use the saved homography without live recalibration.
 
-- `workspace_aruco`: the imported, known-working 2D homography using inverted
-  `DICT_4X4_50` IDs 0-3. The marker backend can also try
-  `DICT_APRILTAG_36H11` because the physical table tags may use either family.
-  This is the current default for table objects and does not require camera
-  intrinsics.
-- `apriltag`: a tag-based calibration workflow that can save either a planar
-  image-to-robot homography or, when real camera intrinsics are configured, a
-  full 6-DoF camera pose. Intrinsics are only required for the 3D pose path.
+The robot frame is:
 
-An accepted AprilTag 3D pose has projection priority. A saved AprilTag planar
-homography, the working ArUco homography, and the older manually entered
-four-point homography are the planar fallback paths.
-For the current temporary physical setup, the reference tags may be absent. In
-that case the app treats the saved ZIP homography and saved workspace polygon as
-the normal calibrated task mode; live tags become optional diagnostics until the
-tags are glued on.
+- `X`: sideways across the work plate
+- `Y`: forward from the robot base
+- `Z`: upward, with the workspace at `Z=0`
+
+The saved map drives color-object coordinates, external AI detection
+coordinates, the workspace mask, and the projected camera texture. Camera
+intrinsics are not part of this path. The older `apriltag` 6-DoF implementation
+is retained only as an optional developer feature and is hidden from normal
+settings.
 
 ## Detection Contract
 
@@ -72,9 +73,7 @@ IK, motion, and frontend code do not need model-specific branches.
 - Confirm camera enumeration on the demonstration PC; indices can change when
   virtual cameras or USB devices are added.
 - Re-record ArUco reference points if the physical setup has moved.
-- Confirm the imported robot XY tag-center coordinates against the robot base
-  frame used by motion planning.
-- Add a guided reference-point recapture workflow instead of relying only on
-  the imported saved points.
+- Re-run workspace calibration whenever the physical
+  camera, resolution, zoom, or tags move.
 - Add editable color profiles and physical workspace-bound validation in the
   Tasks workflow. Settings should remain focused on camera and calibration.
