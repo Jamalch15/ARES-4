@@ -800,6 +800,7 @@ export class RobotView {
     this.previewGroup = new THREE.Group();
     this.overlayGroup = new THREE.Group();
     this.objectGroup = new THREE.Group();
+    this.taskPreviewGroup = new THREE.Group();
     this.calibrationGroup = new THREE.Group();
     this.cameraProjectionGroup = new THREE.Group();
     this.workPlateGroup = makeWorkPlate();
@@ -809,6 +810,7 @@ export class RobotView {
     this.scene.add(this.previewGroup);
     this.scene.add(this.overlayGroup);
     this.scene.add(this.objectGroup);
+    this.scene.add(this.taskPreviewGroup);
     this.scene.add(this.calibrationGroup);
     this.container.dataset.workPlate = `${WORK_PLATE.widthXMm}x${WORK_PLATE.depthYMm}@y${WORK_PLATE.centerYMm}`;
     this.container.dataset.workspaceCameraProjection = "off";
@@ -898,6 +900,11 @@ export class RobotView {
       emissive: 0x332300,
       roughness: 0.35,
     });
+    this.taskMaterials = {
+      pickup: new THREE.MeshStandardMaterial({ color: 0x5ee6c5, emissive: 0x05231d, roughness: 0.35 }),
+      drop: new THREE.MeshStandardMaterial({ color: 0xffb04a, emissive: 0x2c1602, roughness: 0.35 }),
+      line: new THREE.LineBasicMaterial({ color: 0xffb04a, transparent: true, opacity: 0.8 }),
+    };
     this.objectMaterials = {
       red: new THREE.MeshStandardMaterial({ color: 0xff526d, emissive: 0x28040c, roughness: 0.4 }),
       green: new THREE.MeshStandardMaterial({ color: 0x53d18e, emissive: 0x052211, roughness: 0.4 }),
@@ -979,7 +986,7 @@ export class RobotView {
     this.render();
   }
 
-  setPathWaypoints(waypoints) {
+  setPathWaypoints(waypoints, physicalWaypoints = null) {
     removeChildrenByKind(this.overlayGroup, "path");
     removeChildrenByKind(this.overlayGroup, "plannedPath");
     if (!waypoints || waypoints.length < 2) {
@@ -989,9 +996,16 @@ export class RobotView {
     }
 
     this.container.dataset.pathWaypointCount = String(waypoints.length);
-    const pathPoints = waypoints.map((angles) => {
-      return robotToScene(armPose(angles.map(Number), this.links, this.geometryPreset).tcp);
-    });
+    const usePhysicalPath = Array.isArray(physicalWaypoints) && physicalWaypoints.length === waypoints.length;
+    const pathPoints = usePhysicalPath
+      ? physicalWaypoints.map((point) => robotToScene({
+          x: Number(point.x_mm ?? point.x ?? 0),
+          y: Number(point.y_mm ?? point.y ?? 0),
+          z: Number(point.z_mm ?? point.z ?? 0),
+        }))
+      : waypoints.map((angles) => {
+          return robotToScene(armPose(angles.map(Number), this.links, this.geometryPreset).tcp);
+        });
     const geometry = new THREE.BufferGeometry().setFromPoints(pathPoints);
     const line = new THREE.Line(geometry, this.pathMaterial);
     line.userData.kind = "plannedPath";
@@ -1037,7 +1051,7 @@ export class RobotView {
     detections.forEach((detection) => {
       const robot = detection.robot || {};
       if (robot.x_mm == null || robot.y_mm == null) return;
-      const colorName = String(detection.color || "default").toLowerCase();
+      const colorName = String(detection.color || detection.label || "default").toLowerCase();
       const material = this.objectMaterials[colorName] || this.objectMaterials.default;
       const marker = new THREE.Mesh(new THREE.SphereGeometry(8, 24, 16), material);
       marker.position.copy(
@@ -1052,6 +1066,71 @@ export class RobotView {
       count += 1;
     });
     this.container.dataset.objectMarkerCount = String(count);
+    this.render();
+  }
+
+  setTaskPreview(taskPreview) {
+    clearGroup(this.taskPreviewGroup);
+    const objects = Array.isArray(taskPreview?.selected_objects) ? taskPreview.selected_objects : [];
+    if (!objects.length) {
+      delete this.container.dataset.taskPreviewObjectCount;
+      this.render();
+      return;
+    }
+
+    let count = 0;
+    objects.forEach((object, index) => {
+      const pickup = object.object_target || {};
+      const drop = object.drop_target || {};
+      const hasPickup = pickup.x_mm != null && pickup.y_mm != null;
+      const hasDrop = drop.x_mm != null && drop.y_mm != null;
+      if (hasPickup) {
+        const marker = new THREE.Mesh(new THREE.SphereGeometry(7, 24, 16), this.taskMaterials.pickup);
+        marker.position.copy(robotToScene({
+          x: Number(pickup.x_mm),
+          y: Number(pickup.y_mm),
+          z: Number(pickup.z_mm ?? 0),
+        }));
+        marker.userData.kind = "taskPreview";
+        this.taskPreviewGroup.add(marker);
+      }
+      if (hasDrop) {
+        const marker = new THREE.Mesh(new THREE.BoxGeometry(16, 5, 16), this.taskMaterials.drop);
+        marker.position.copy(robotToScene({
+          x: Number(drop.x_mm),
+          y: Number(drop.y_mm),
+          z: Number(drop.z_mm ?? 0),
+        }));
+        marker.userData.kind = "taskPreview";
+        this.taskPreviewGroup.add(marker);
+      }
+      if (hasPickup && hasDrop) {
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([
+            robotToScene({ x: Number(pickup.x_mm), y: Number(pickup.y_mm), z: Number(pickup.z_mm ?? 0) + 8 }),
+            robotToScene({ x: Number(drop.x_mm), y: Number(drop.y_mm), z: Number(drop.z_mm ?? 0) + 8 }),
+          ]),
+          this.taskMaterials.line
+        );
+        line.userData.kind = "taskPreview";
+        this.taskPreviewGroup.add(line);
+      }
+      const labelText = `${index + 1}:${object.color || "object"}${object.grid_slot ? ` #${Number(object.grid_slot.index || 0) + 1}` : ""}`;
+      const anchor = hasPickup ? pickup : drop;
+      if (anchor.x_mm != null && anchor.y_mm != null) {
+        const label = makeTextSprite(labelText, "#5ee6c5");
+        label.position.copy(robotToScene({
+          x: Number(anchor.x_mm),
+          y: Number(anchor.y_mm),
+          z: Number(anchor.z_mm ?? 0) + 26,
+        }));
+        label.scale.multiplyScalar(0.62);
+        label.userData.kind = "taskPreview";
+        this.taskPreviewGroup.add(label);
+      }
+      count += 1;
+    });
+    this.container.dataset.taskPreviewObjectCount = String(count);
     this.render();
   }
 
@@ -1202,11 +1281,13 @@ export class RobotView {
   clearPreview() {
     clearGroup(this.previewGroup);
     clearGroup(this.overlayGroup);
+    clearGroup(this.taskPreviewGroup);
     this.previewAngles = null;
     delete this.container.dataset.previewAngles;
     delete this.container.dataset.targetPoint;
     delete this.container.dataset.pathWaypointCount;
     delete this.container.dataset.actualPathPointCount;
+    delete this.container.dataset.taskPreviewObjectCount;
     this.render();
   }
 

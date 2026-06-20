@@ -707,11 +707,13 @@ def save_calibration_updates(path: str | Path, updates: dict[str, Any]) -> None:
         "color_profiles",
         "drop_zones",
         "task_defaults",
+        "tasks",
         "path_defaults",
         "tool",
         "tools",
         "encoders",
         "calibration",
+        "kinematics_calibration",
         "geometry",
     ]:
         if key in updates and isinstance(updates[key], dict):

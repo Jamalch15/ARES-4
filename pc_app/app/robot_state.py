@@ -48,6 +48,7 @@ class RobotState:
     last_controller_response: str = ""
     motion_execution_state: str = "idle"
     motion_diagnostics: dict[str, Any] = field(default_factory=dict)
+    task_execution: dict[str, Any] = field(default_factory=dict)
     fk: dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time)
 
@@ -85,6 +86,7 @@ class RobotState:
             "last_controller_response": self.last_controller_response,
             "motion_execution_state": self.motion_execution_state,
             "motion_diagnostics": self.motion_diagnostics,
+            "task_execution": self.task_execution,
             "fk": self.fk,
             "updated_at": self.updated_at,
         }

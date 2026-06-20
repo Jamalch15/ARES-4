@@ -93,11 +93,58 @@ def test_reversal_decelerates_before_changing_direction():
     assert max(lateral) < 0.01
 
 
+def test_joint_acceleration_limits_bound_live_servo_velocity_changes():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    servo = CartesianServo(config.links, config.joints, [0.0, 25.0, 80.0, -50.0])
+    limits = CartesianServoLimits(
+        joint_speed_deg_s=[joint.max_speed_deg_s for joint in config.joints],
+        joint_accel_deg_s2=[6.0, 7.0, 8.0, 9.0],
+        tcp_accel_mm_s2=10_000.0,
+        phi_accel_deg_s2=10_000.0,
+    )
+    servo.set_command([0.0, 60.0, 0.0, 0.0])
+
+    first = servo.step(0.05, limits)
+    second = servo.step(0.05, limits)
+
+    for velocity, acceleration in zip(
+        first["joint_velocity_deg_s"],
+        limits.joint_accel_deg_s2,
+        strict=True,
+    ):
+        assert abs(velocity) <= acceleration * 0.05 + 1e-8
+    for previous, velocity, acceleration in zip(
+        first["joint_velocity_deg_s"],
+        second["joint_velocity_deg_s"],
+        limits.joint_accel_deg_s2,
+        strict=True,
+    ):
+        assert abs(velocity - previous) <= acceleration * 0.05 + 1e-8
+
+
+def test_adding_phi_command_during_translation_is_not_treated_as_reversal():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    servo = CartesianServo(config.links, config.joints, [0.0, 25.0, 80.0, -50.0])
+    limits = CartesianServoLimits(
+        joint_speed_deg_s=[joint.max_speed_deg_s for joint in config.joints],
+        joint_accel_deg_s2=[120.0, 120.0, 180.0, 180.0],
+    )
+    servo.set_command([0.0, 30.0, 0.0, 0.0])
+    for _ in range(5):
+        servo.step(1.0 / 30.0, limits)
+
+    servo.set_command([0.0, 30.0, 0.0, 20.0])
+    result = servo.step(1.0 / 30.0, limits)
+
+    assert result["applied_task_velocity"][3] > 0.0
+
+
 def test_inward_cartesian_command_retains_authority_at_reference_pose():
     config = load_config(EXAMPLE_CONFIG_PATH)
     servo = CartesianServo(config.links, config.joints, config.home_pose)
     limits = CartesianServoLimits(
         [joint.max_speed_deg_s for joint in config.joints],
+        joint_accel_deg_s2=[joint.max_accel_deg_s2 for joint in config.joints],
         tcp_accel_mm_s2=360.0,
         phi_accel_deg_s2=240.0,
     )

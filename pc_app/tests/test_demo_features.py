@@ -114,7 +114,7 @@ def test_pick_and_place_sequence_uses_active_magnet_actions():
 
 
 def test_sorting_sequence_uses_color_drop_zone():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
     profiles = color_profiles(config)
     sequence = build_sorting_sequence(
         config,

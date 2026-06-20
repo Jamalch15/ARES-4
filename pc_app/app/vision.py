@@ -97,6 +97,11 @@ class CameraCapture:
         self._signature = signature
         return capture
 
+    @staticmethod
+    def _orient_image(image: np.ndarray, camera: dict[str, Any]) -> np.ndarray:
+        display = camera.get("display") if isinstance(camera.get("display"), dict) else {}
+        return cv2.flip(image, 1) if bool(display.get("flip_x", False)) else image
+
     def read(self, camera: dict[str, Any]) -> np.ndarray:
         with self._lock:
             capture = self._ensure_open(camera)
@@ -104,7 +109,7 @@ class CameraCapture:
             if not ok or image is None:
                 self.close()
                 raise RuntimeError("could not read camera frame")
-            return image
+            return self._orient_image(image, camera)
 
     def read_many(
         self,
@@ -120,7 +125,7 @@ class CameraCapture:
                 if not ok or image is None:
                     self.close()
                     raise RuntimeError("could not read camera frame")
-                images.append(image)
+                images.append(self._orient_image(image, camera))
                 if index + 1 < sample_count and interval_s > 0:
                     sleep(interval_s)
         return images

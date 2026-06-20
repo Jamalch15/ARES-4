@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from pytest import approx
 
 from app.config import EXAMPLE_CONFIG_PATH, load_config
@@ -221,6 +223,51 @@ def test_program_trajectory_accepts_joint_and_cartesian_waypoints():
     assert len(trajectory["segments"]) == 2
 
 
+def test_program_joint_transfer_can_change_automatic_ik_branch():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=42.69)
+        if row.joint_index == 1
+        else replace(row, a_mm=50.0)
+        if row.joint_index == 3
+        else row
+        for row in config.links.dh_rows
+    ]
+    links = replace(config.links, wrist_mm=50.0, dh_rows=rows)
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+    target = lambda x, y: {
+        "x_mm": x,
+        "y_mm": y,
+        "z_mm": 80.0,
+        "phi_auto": True,
+        "preferred_phi_deg": -90.0,
+    }
+
+    trajectory = build_program_trajectory(
+        [0.0, 35.0, 15.0, 0.0],
+        [
+            {"type": "cartesian", "mode": "joint", "label": "above pickup", "target": target(120.0, -50.0)},
+            {"type": "cartesian", "mode": "joint", "label": "above dropoff", "target": target(120.0, 180.0)},
+        ],
+        links,
+        joints,
+        {"waypoint_rate_hz": 12.0},
+        "auto",
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    assert len(trajectory["segments"]) == 2
+
+
 def test_program_trajectory_rejects_missing_joint_angles():
     config = load_config()
 
@@ -233,3 +280,63 @@ def test_program_trajectory_rejects_missing_joint_angles():
 
     assert not trajectory["ok"]
     assert "missing joint angles" in trajectory["errors"][0]
+
+
+def test_program_trajectory_skips_disabled_steps_and_reports_each_step():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    target = config.home_pose.copy()
+    target[0] = min(config.joints[0].max_deg, target[0] + 5.0)
+
+    trajectory = build_program_trajectory(
+        config.home_pose,
+        [
+            {
+                "label": "disabled draft",
+                "type": "joint",
+                "mode": "joint",
+                "enabled": False,
+                "angles_deg": config.home_pose,
+            },
+            {
+                "label": "active move",
+                "type": "joint",
+                "mode": "joint",
+                "enabled": True,
+                "angles_deg": target,
+            },
+        ],
+        config.links,
+        config.joints,
+        {"waypoint_rate_hz": 12.0},
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    assert trajectory["step_count"] == 2
+    assert trajectory["move_count"] == 1
+    assert [result["status"] for result in trajectory["step_results"]] == ["disabled", "valid"]
+    assert trajectory["segments"][0]["index"] == 1
+
+
+def test_program_trajectory_exposes_the_failing_step_error():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    unsafe = config.home_pose.copy()
+    unsafe[0] = config.joints[0].max_deg + 1.0
+
+    trajectory = build_program_trajectory(
+        config.home_pose,
+        [
+            {"label": "safe start", "type": "joint", "mode": "joint", "angles_deg": config.home_pose},
+            {"label": "unsafe target", "type": "joint", "mode": "joint", "angles_deg": unsafe},
+        ],
+        config.links,
+        config.joints,
+        {"waypoint_rate_hz": 12.0},
+    )
+
+    assert not trajectory["ok"]
+    assert trajectory["step_count"] == 2
+    assert trajectory["move_count"] == 2
+    assert trajectory["step_results"][0]["status"] == "valid"
+    assert trajectory["step_results"][1]["index"] == 1
+    assert trajectory["step_results"][1]["status"] == "invalid"
+    assert "outside" in trajectory["step_results"][1]["errors"][0]

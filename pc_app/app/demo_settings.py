@@ -37,15 +37,15 @@ def default_named_positions(config: RobotConfig) -> dict[str, dict[str, Any]]:
         "pickup_test": {
             "type": "cartesian",
             "target": {
-                "x_mm": fk["x_mm"],
-                "y_mm": max(120.0, fk["y_mm"]),
-                "z_mm": max(35.0, fk["z_mm"] - 120.0),
-                "phi_deg": fk["tool_phi_deg"],
+                "x_mm": -120.0,
+                "y_mm": 150.0,
+                "z_mm": 45.0,
+                "phi_deg": 0.0,
             },
         },
         "dropoff_a": {
             "type": "cartesian",
-            "target": {"x_mm": -120.0, "y_mm": 180.0, "z_mm": 45.0, "phi_deg": 0.0},
+            "target": {"x_mm": -160.0, "y_mm": 180.0, "z_mm": 45.0, "phi_deg": 0.0},
         },
         "dropoff_b": {
             "type": "cartesian",
@@ -84,6 +84,7 @@ def camera_settings(config: RobotConfig) -> dict[str, Any]:
             "live_interval_ms": 450,
         },
         "display": {
+            "flip_x": False,
             "project_live_view": False,
             "projection_opacity": 0.72,
             "projection_interval_ms": 80,
@@ -226,6 +227,9 @@ def _pose_from_config_target(target: dict[str, Any], default_z_mm: float = 45.0)
         pose["phi_auto"] = True
     else:
         pose["phi_deg"] = float(raw_phi)
+    for key in ["label", "description", "grid", "placement"]:
+        if key in target:
+            pose[key] = deepcopy(target[key])
     return pose
 
 
@@ -241,7 +245,12 @@ def drop_zones(config: RobotConfig) -> dict[str, dict[str, Any]]:
     if isinstance(raw, dict):
         for name, value in raw.items():
             if isinstance(value, dict):
-                zones[name] = _pose_from_config_target(value)
+                target = value.get("target") if isinstance(value.get("target"), dict) else value
+                zone = _pose_from_config_target(target)
+                for key in ["label", "description", "grid", "placement"]:
+                    if key in value:
+                        zone[key] = deepcopy(value[key])
+                zones[name] = zone
     return zones
 
 
@@ -373,6 +382,94 @@ def task_defaults(config: RobotConfig) -> dict[str, Any]:
     if isinstance(raw, dict):
         defaults.update(deepcopy(raw))
     return defaults
+
+
+def color_sorting_task_defaults(config: RobotConfig) -> dict[str, Any]:
+    """Normalized defaults for the current color-sorting task workflow.
+
+    Working assumption: task Z values are active-TCP robot-frame coordinates.
+    Vision detections only supply table X/Y; pickup/drop heights and phi are
+    resolved here so perception and task execution remain loosely coupled.
+    """
+
+    legacy = task_defaults(config)
+    pickup_z = float(legacy.get("pickup_z_mm", legacy.get("pickup_height_mm", 25.0)))
+    dropoff_z = float(legacy.get("dropoff_z_mm", legacy.get("dropoff_height_mm", 45.0)))
+    legacy_approach_height = float(legacy.get("approach_height_mm", max(pickup_z, dropoff_z) + 55.0))
+    approach_clearance = max(0.0, legacy_approach_height - pickup_z)
+    drop_clearance = max(0.0, legacy_approach_height - dropoff_z)
+    defaults: dict[str, Any] = {
+        "execution_strategy": "closed_loop",
+        "max_objects": 10,
+        "filters": {
+            "min_confidence": 0.0,
+            "min_area_px": 0.0,
+            "include_colors": [],
+            "require_robot_coordinates": True,
+        },
+        "ordering": {
+            "policy": "nearest_to_safe",
+            "color_priority": [],
+        },
+        "safe_position": str(legacy.get("safe_position", "safe")),
+        "camera_clear_position": str(legacy.get("camera_clear_position", legacy.get("safe_position", "safe"))),
+        "pickup_z_mm": pickup_z,
+        "dropoff_z_mm": dropoff_z,
+        "approach_clearance_mm": approach_clearance,
+        "drop_approach_clearance_mm": drop_clearance,
+        "pickup_phi_deg": 0.0,
+        "drop_phi_deg": 0.0,
+        "downward_phi_deg": -90.0,
+        "pickup_preferred_phi_deg": -90.0,
+        "drop_preferred_phi_deg": -90.0,
+        "orientation_policy": "prefer_downward",
+        "motion_modes": {
+            "transfer": "joint",
+            "pickup_approach": "linear",
+            "pickup_descent": "linear",
+            "lift": "linear",
+            "drop_approach": "linear",
+            "drop_descent": "linear",
+        },
+        "missing_drop_zone_policy": "error",
+        "unknown_color_policy": "ignore",
+        "placement_policy": "fixed",
+        "capture_settle_ms": 250,
+        "tool_settle_ms": 150,
+        "tool_action_delay_ms": 150,
+        "object_profiles": {},
+        "default_drop_zone": str(legacy.get("default_drop_zone", "dropoff_a")),
+    }
+    tasks = config.raw.get("tasks")
+    if isinstance(tasks, dict) and isinstance(tasks.get("color_sorting"), dict):
+        _merge_task_settings(defaults, tasks["color_sorting"])
+    raw = config.raw.get("color_sorting")
+    if isinstance(raw, dict):
+        _merge_task_settings(defaults, raw)
+    return defaults
+
+
+def _merge_task_settings(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        if value is None:
+            continue
+        if key == "strategy":
+            target["execution_strategy"] = deepcopy(value)
+        elif key == "limits" and isinstance(value, dict):
+            if value.get("max_objects") is not None:
+                target["max_objects"] = deepcopy(value["max_objects"])
+        elif key == "filters" and isinstance(value, dict):
+            target["filters"].update(deepcopy(value))
+        elif key == "ordering" and isinstance(value, dict):
+            target["ordering"].update(deepcopy(value))
+        elif key in {"motion", "motion_modes"} and isinstance(value, dict):
+            target["motion_modes"].update(deepcopy(value))
+        elif key in {"approach_height_mm", "pickup_height_mm", "dropoff_height_mm"}:
+            target[key] = deepcopy(value)
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
+            target[key].update(deepcopy(value))
+        else:
+            target[key] = deepcopy(value)
 
 
 def validate_named_position(config: RobotConfig, name: str, position: dict[str, Any]) -> list[str]:

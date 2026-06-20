@@ -332,13 +332,16 @@ def build_linear_cartesian_trajectory(
     raw_phi = target.get("phi_deg", target.get("tool_phi_deg"))
     auto_phi = bool(target.get("phi_auto", False)) or raw_phi is None
     if auto_phi:
+        auto_target = {
+            "x_mm": float(target.get("x_mm", start_fk["x_mm"])),
+            "y_mm": float(target.get("y_mm", start_fk["y_mm"])),
+            "z_mm": float(target.get("z_mm", start_fk["z_mm"])),
+            "phi_auto": True,
+        }
+        if target.get("preferred_phi_deg") is not None:
+            auto_target["preferred_phi_deg"] = float(target["preferred_phi_deg"])
         final_ik = inverse_kinematics(
-            {
-                "x_mm": float(target.get("x_mm", start_fk["x_mm"])),
-                "y_mm": float(target.get("y_mm", start_fk["y_mm"])),
-                "z_mm": float(target.get("z_mm", start_fk["z_mm"])),
-                "phi_auto": True,
-            },
+            auto_target,
             links,
             joints,
             start_deg,
@@ -508,6 +511,26 @@ def _append_segment(
         combined_durations.append(duration)
 
 
+def _waypoint_label(waypoint: dict[str, Any], index: int) -> str:
+    label = waypoint.get("label") or waypoint.get("name") or waypoint.get("kind")
+    return str(label) if label else f"waypoint {index + 1}"
+
+
+def _format_cartesian_target(target: dict[str, Any]) -> str:
+    parts = [
+        f"x {float(target.get('x_mm', target.get('x', 0.0))):.1f}",
+        f"y {float(target.get('y_mm', target.get('y', 0.0))):.1f}",
+        f"z {float(target.get('z_mm', target.get('z', 0.0))):.1f}",
+    ]
+    if target.get("preferred_phi_deg") is not None:
+        parts.append(f"preferred phi {float(target.get('preferred_phi_deg')):.1f}")
+    elif target.get("phi_auto"):
+        parts.append("phi auto")
+    elif target.get("phi_deg") is not None or target.get("phi") is not None:
+        parts.append(f"phi {float(target.get('phi_deg', target.get('phi'))):.1f}")
+    return ", ".join(parts)
+
+
 def build_program_trajectory(
     start_deg: list[float],
     waypoints: list[dict[str, Any]],
@@ -518,7 +541,15 @@ def build_program_trajectory(
 ) -> dict[str, Any]:
     settings = settings or {}
     if not waypoints:
-        return {"ok": False, "mode": "program", "waypoints": [], "errors": ["program has no waypoints"]}
+        return {
+            "ok": False,
+            "mode": "program",
+            "step_count": 0,
+            "move_count": 0,
+            "waypoints": [],
+            "step_results": [],
+            "errors": ["program has no waypoints"],
+        }
 
     current = [float(value) for value in start_deg]
     selected_branch = branch
@@ -526,24 +557,91 @@ def build_program_trajectory(
     combined_durations: list[float] = []
     segment_summaries: list[dict[str, Any]] = []
     cartesian_waypoints: list[dict[str, float]] = []
+    step_results: list[dict[str, Any]] = []
+    move_count = sum(1 for waypoint in waypoints if waypoint.get("enabled", True) is not False)
+    if move_count == 0:
+        return {
+            "ok": False,
+            "mode": "program",
+            "step_count": len(waypoints),
+            "move_count": 0,
+            "waypoints": [],
+            "step_results": [
+                {
+                    "index": index,
+                    "label": _waypoint_label(waypoint, index),
+                    "type": str(waypoint.get("type") or waypoint.get("kind") or "cartesian").lower(),
+                    "mode": str(waypoint.get("mode") or "joint").lower(),
+                    "enabled": False,
+                    "status": "disabled",
+                    "duration_s": 0.0,
+                    "waypoint_count": 0,
+                    "errors": [],
+                }
+                for index, waypoint in enumerate(waypoints)
+            ],
+            "errors": ["program has no enabled waypoints"],
+        }
 
     for index, waypoint in enumerate(waypoints):
+        waypoint_label = _waypoint_label(waypoint, index)
         waypoint_settings = _settings_for_waypoint(settings, waypoint)
         kind = str(waypoint.get("type") or waypoint.get("kind") or "cartesian").lower()
         mode = str(waypoint.get("mode") or ("linear" if kind == "cartesian" else "joint")).lower()
-        waypoint_branch = str(waypoint.get("branch") or selected_branch or "auto")
+        if waypoint.get("enabled", True) is False:
+            step_results.append(
+                {
+                    "index": index,
+                    "label": waypoint_label,
+                    "type": kind,
+                    "mode": mode,
+                    "enabled": False,
+                    "status": "disabled",
+                    "duration_s": 0.0,
+                    "waypoint_count": 0,
+                    "errors": [],
+                }
+            )
+            continue
+        explicit_waypoint_branch = waypoint.get("branch")
+        if explicit_waypoint_branch is not None:
+            waypoint_branch = str(explicit_waypoint_branch)
+        elif mode == "linear":
+            waypoint_branch = str(selected_branch or branch or "auto")
+        else:
+            # A joint-space transfer may legitimately move to another IK
+            # branch. Preserve branch continuity only inside linear segments
+            # unless the caller explicitly requests a branch.
+            waypoint_branch = str(branch or "auto")
 
         if kind == "joint":
             target_angles = waypoint.get("angles_deg") or waypoint.get("joints_deg")
             if isinstance(waypoint.get("target"), dict):
                 target_angles = target_angles or waypoint["target"].get("angles_deg")
             if not isinstance(target_angles, list):
+                error = f"program waypoint {index + 1} ({waypoint_label}) missing joint angles"
+                step_results.append(
+                    {
+                        "index": index,
+                        "label": waypoint_label,
+                        "type": kind,
+                        "mode": "joint",
+                        "enabled": True,
+                        "status": "invalid",
+                        "duration_s": 0.0,
+                        "waypoint_count": 0,
+                        "errors": ["missing joint angles"],
+                    }
+                )
                 return {
                     "ok": False,
                     "mode": "program",
+                    "step_count": len(waypoints),
+                    "move_count": move_count,
                     "waypoints": combined_waypoints,
-                    "errors": [f"program waypoint {index + 1} missing joint angles"],
+                    "errors": [error],
                     "segments": segment_summaries,
+                    "step_results": step_results,
                 }
             segment = build_joint_trajectory(current, [float(value) for value in target_angles], joints, waypoint_settings)
         else:
@@ -556,6 +654,8 @@ def build_program_trajectory(
             }
             if bool(raw_target.get("phi_auto", False)) or raw_phi is None:
                 target["phi_auto"] = True
+                if raw_target.get("preferred_phi_deg") is not None:
+                    target["preferred_phi_deg"] = float(raw_target["preferred_phi_deg"])
             else:
                 target["phi_deg"] = float(raw_phi)
             if mode == "linear":
@@ -570,13 +670,32 @@ def build_program_trajectory(
             else:
                 ik = inverse_kinematics(target, links, joints, current, waypoint_branch)
                 if not ik["ok"] or not ik["selected"]:
+                    error = f"no valid IK solution at {_format_cartesian_target(target)}"
+                    step_results.append(
+                        {
+                            "index": index,
+                            "label": waypoint_label,
+                            "type": kind,
+                            "mode": mode,
+                            "enabled": True,
+                            "status": "invalid",
+                            "duration_s": 0.0,
+                            "waypoint_count": 0,
+                            "errors": [error],
+                        }
+                    )
                     return {
                         "ok": False,
                         "mode": "program",
+                        "step_count": len(waypoints),
+                        "move_count": move_count,
                         "waypoints": combined_waypoints,
-                        "errors": [f"program waypoint {index + 1} has no valid IK solution"],
+                        "errors": [
+                            f"program waypoint {index + 1} ({waypoint_label}) has {error}"
+                        ],
                         "ik": ik,
                         "segments": segment_summaries,
+                        "step_results": step_results,
                     }
                 selected_branch = ik["selected_branch"] or waypoint_branch
                 segment = build_joint_trajectory(
@@ -588,30 +707,57 @@ def build_program_trajectory(
             cartesian_waypoints.append(target)
 
         if not segment["ok"]:
+            segment_errors = [str(error) for error in segment.get("errors", [])]
+            step_results.append(
+                {
+                    "index": index,
+                    "label": waypoint_label,
+                    "type": kind,
+                    "mode": mode,
+                    "enabled": True,
+                    "status": "invalid",
+                    "duration_s": 0.0,
+                    "waypoint_count": 0,
+                    "errors": segment_errors,
+                }
+            )
             return {
                 "ok": False,
                 "mode": "program",
+                "step_count": len(waypoints),
+                "move_count": move_count,
                 "waypoints": combined_waypoints,
-                "errors": [f"program waypoint {index + 1}: {'; '.join(segment.get('errors', []))}"],
+                "errors": [f"program waypoint {index + 1} ({waypoint_label}): {'; '.join(segment_errors)}"],
                 "segments": segment_summaries,
+                "step_results": step_results,
             }
 
         _append_segment(combined_waypoints, combined_durations, segment)
         current = [float(value) for value in segment["waypoints"][-1]]
-        segment_summaries.append(
+        summary = {
+            "index": index,
+            "label": waypoint_label,
+            "type": kind,
+            "mode": segment.get("mode", mode),
+            "duration_s": segment.get("duration_s", 0.0),
+            "waypoint_count": segment.get("waypoint_count", 0),
+            "profile": segment.get("profile", _profile_name(waypoint_settings)),
+        }
+        segment_summaries.append(summary)
+        step_results.append(
             {
-                "index": index,
-                "type": kind,
-                "mode": segment.get("mode", mode),
-                "duration_s": segment.get("duration_s", 0.0),
-                "waypoint_count": segment.get("waypoint_count", 0),
-                "profile": segment.get("profile", _profile_name(waypoint_settings)),
+                **summary,
+                "enabled": True,
+                "status": "valid",
+                "errors": [],
             }
         )
 
     return {
         "ok": True,
         "mode": "program",
+        "step_count": len(waypoints),
+        "move_count": move_count,
         "profile": _profile_name(settings),
         "duration_s": sum(combined_durations),
         "waypoint_count": len(combined_waypoints),
@@ -619,6 +765,7 @@ def build_program_trajectory(
         "segment_durations_s": combined_durations,
         "time_from_start_s": _cumulative_times(combined_durations),
         "segments": segment_summaries,
+        "step_results": step_results,
         "cartesian_waypoints": cartesian_waypoints,
         "errors": [],
     }

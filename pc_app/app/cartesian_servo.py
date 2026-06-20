@@ -215,6 +215,7 @@ def _task_delta(start_fk: dict[str, Any], end_fk: dict[str, Any]) -> np.ndarray:
 @dataclass
 class CartesianServoLimits:
     joint_speed_deg_s: list[float]
+    joint_accel_deg_s2: list[float] | None = None
     tcp_accel_mm_s2: float = 360.0
     phi_accel_deg_s2: float = 240.0
     joint_limit_margin_deg: float = 0.25
@@ -235,6 +236,8 @@ class CartesianServo:
         self.target_task_velocity = np.zeros(4, dtype=float)
         self.applied_task_velocity = np.zeros(4, dtype=float)
         self.joint_velocity_deg_s = np.zeros(len(joints), dtype=float)
+        self.translation_reversal_pending = False
+        self.phi_reversal_pending = False
         self.last_result: dict[str, Any] = {}
 
     def reconfigure(self, links: LinkConfig, joints: list[JointConfig]) -> None:
@@ -247,6 +250,8 @@ class CartesianServo:
         self.target_task_velocity = np.zeros(4, dtype=float)
         self.applied_task_velocity = np.zeros(4, dtype=float)
         self.joint_velocity_deg_s = np.zeros(len(self.joints), dtype=float)
+        self.translation_reversal_pending = False
+        self.phi_reversal_pending = False
         self.last_result = {}
 
     def set_command(self, velocity: list[float] | tuple[float, float, float, float]) -> None:
@@ -270,6 +275,13 @@ class CartesianServo:
         speeds = np.asarray(limits.joint_speed_deg_s, dtype=float)
         lower = -speeds
         upper = speeds
+        if limits.joint_accel_deg_s2 is not None:
+            accelerations = np.asarray(limits.joint_accel_deg_s2, dtype=float)
+            if accelerations.shape != speeds.shape:
+                raise ValueError("joint acceleration limit count does not match the robot")
+            max_velocity_delta = accelerations * dt_s
+            lower = np.maximum(lower, self.joint_velocity_deg_s - max_velocity_delta)
+            upper = np.minimum(upper, self.joint_velocity_deg_s + max_velocity_delta)
         margin = max(0.0, float(limits.joint_limit_margin_deg))
         for index, joint in enumerate(self.joints):
             safe_min = min(joint.max_deg, joint.min_deg + margin)
@@ -295,7 +307,11 @@ class CartesianServo:
         if phi_active:
             active_rows.append(3)
         if not active_rows:
-            return np.zeros(len(self.joints), dtype=float), 1.0, [], 1.0
+            if limits.joint_accel_deg_s2 is None:
+                return np.zeros(len(self.joints), dtype=float), 1.0, [], 1.0
+            lower, upper = self._velocity_bounds(joints_deg, dt_s, limits)
+            decelerating_velocity = np.minimum(upper, np.maximum(lower, np.zeros(len(self.joints))))
+            return decelerating_velocity, 1.0, [], 1.0
 
         task_jacobian = geometric_task_jacobian(joints_deg.tolist(), self.links)[active_rows, :]
         requested = task_velocity[active_rows]
@@ -393,15 +409,50 @@ class CartesianServo:
         dt = min(0.1, max(0.005, float(dt_s)))
         if len(limits.joint_speed_deg_s) != len(self.joints):
             raise ValueError("joint speed limit count does not match the robot")
+        if limits.joint_accel_deg_s2 is not None and len(limits.joint_accel_deg_s2) != len(self.joints):
+            raise ValueError("joint acceleration limit count does not match the robot")
 
+        translation_target = self.target_task_velocity[:3]
+        translation_current = self.applied_task_velocity[:3]
+        joint_motion_active = float(np.linalg.norm(self.joint_velocity_deg_s)) > 1e-6
+        if float(translation_current @ translation_target) < -1e-9:
+            self.translation_reversal_pending = True
+        elif (
+            self.translation_reversal_pending
+            and float(np.linalg.norm(translation_current)) > 1e-9
+            and float(np.linalg.norm(translation_target)) > 1e-9
+            and float(translation_current @ translation_target) >= 0.0
+        ):
+            self.translation_reversal_pending = False
+        if self.translation_reversal_pending:
+            translation_target = np.zeros(3, dtype=float)
+            if float(np.linalg.norm(translation_current)) <= 1e-9 and not joint_motion_active:
+                self.translation_reversal_pending = False
+                translation_target = self.target_task_velocity[:3]
         self.applied_task_velocity[:3] = _ramp_vector(
-            self.applied_task_velocity[:3],
-            self.target_task_velocity[:3],
+            translation_current,
+            translation_target,
             max(1.0, float(limits.tcp_accel_mm_s2)) * dt,
         )
+        phi_target = float(self.target_task_velocity[3])
+        phi_current = float(self.applied_task_velocity[3])
+        if phi_current * phi_target < -1e-9:
+            self.phi_reversal_pending = True
+        elif (
+            self.phi_reversal_pending
+            and abs(phi_current) > 1e-9
+            and abs(phi_target) > 1e-9
+            and phi_current * phi_target >= 0.0
+        ):
+            self.phi_reversal_pending = False
+        if self.phi_reversal_pending:
+            phi_target = 0.0
+            if abs(phi_current) <= 1e-9 and not joint_motion_active:
+                self.phi_reversal_pending = False
+                phi_target = float(self.target_task_velocity[3])
         self.applied_task_velocity[3] = _ramp_scalar(
-            float(self.applied_task_velocity[3]),
-            float(self.target_task_velocity[3]),
+            phi_current,
+            phi_target,
             max(1.0, float(limits.phi_accel_deg_s2)) * dt,
         )
 

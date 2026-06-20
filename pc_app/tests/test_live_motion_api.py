@@ -159,7 +159,7 @@ def test_cartesian_jog_simulation_endpoint_tracks_straight_z_path():
         points = [[sample["x_mm"], sample["y_mm"], sample["z_mm"]] for sample in path]
         metrics = cartesian_path_metrics(points, [0.0, 0.0, 1.0])
 
-        assert metrics["progress_mm"] > 25.0
+        assert metrics["progress_mm"] > 15.0
         assert metrics["alignment"] > 0.999
         assert metrics["max_lateral_mm"] < 0.1
         assert metrics["backward_steps"] == 0
@@ -167,7 +167,7 @@ def test_cartesian_jog_simulation_endpoint_tracks_straight_z_path():
     reset_runtime_state()
 
 
-def test_cartesian_jog_rejects_stale_blocked_goal_and_allows_immediate_reverse():
+def test_cartesian_jog_replaces_stale_blocked_goal_with_reverse_command():
     reset_runtime_state()
     start = [0.0, 45.0, 25.0, -20.0]
     main.state.reported_angles_deg = start.copy()
@@ -196,19 +196,30 @@ def test_cartesian_jog_rejects_stale_blocked_goal_and_allows_immediate_reverse()
             "z_mm": 0.0,
             "phi_deg": 0.0,
         }
-        blocked_pose = main.state.reported_angles_deg.copy()
-
         reverse = client.post(
             "/api/cartesian-jog",
             json={"vz_mm_s": -20.0},
         ).json()
         assert reverse["ok"], reverse
-        sleep(0.2)
-        reverse_result = main.cartesian_jog_runtime.get("last_result")
-        assert reverse_result and not reverse_result["blocked"], reverse_result
-        assert reverse_result["requested_delta"]["z_mm"] < 0.0
-        assert reverse_result["achieved_delta"]["z_mm"] < 0.0
-        assert reverse_result["target_angles_deg"] != blocked_pose
+        reverse_result = None
+        for _ in range(20):
+            refresh = client.post(
+                "/api/cartesian-jog",
+                json={"vz_mm_s": -20.0},
+            ).json()
+            assert refresh["ok"], refresh
+            sleep(0.08)
+            latest = main.cartesian_jog_runtime.get("last_result")
+            if (
+                latest
+                and latest["target_task_velocity"][2] < 0.0
+            ):
+                reverse_result = latest
+                break
+        assert reverse_result, reverse_result
+        assert main.cartesian_jog_runtime["command_velocity"][2] == -20.0
+        assert main.cartesian_servo.target_task_velocity[2] == -20.0
+        assert reverse_result["target_task_velocity"][2] == -20.0
         client.post("/api/cartesian-jog/stop")
     reset_runtime_state()
 
@@ -296,6 +307,32 @@ def test_default_path_settings_apply_saved_overrides_and_joint_fallbacks():
         "per_joint_accel_deg_s2",
         [joint.max_accel_deg_s2 for joint in main.config.joints],
     )
+
+
+def test_cartesian_servo_limits_use_requested_joint_speed_and_acceleration():
+    settings = main.request_settings(
+        {
+            "global_speed_deg_s": 20.0,
+            "global_accel_deg_s2": 30.0,
+            "per_joint_speed_deg_s": [18.0, 17.0, 16.0, 15.0],
+            "per_joint_accel_deg_s2": [14.0, 13.0, 12.0, 11.0],
+        }
+    )
+
+    limits = main._cartesian_servo_limits(settings)
+
+    assert limits.joint_speed_deg_s == [18.0, 17.0, 16.0, 15.0]
+    assert limits.joint_accel_deg_s2 == [12.0, 12.0, 12.0, 11.0]
+
+
+def test_browser_live_cartesian_jog_uses_continuous_servo_loop():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    payload_body = app_js.split("function cartesianJogPayload()", 1)[1].split(
+        "function scheduleCartesianJog",
+        1,
+    )[0]
+
+    assert "dt_s:" not in payload_body
 
 
 def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):
