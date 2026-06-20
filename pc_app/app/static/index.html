@@ -443,6 +443,7 @@
                   </div>
                   <nav class="settings-section-nav" aria-label="Settings sections">
                     <button type="button" data-settings-target="settingsGeometry">Geometry</button>
+                    <button type="button" data-settings-target="settingsModelTruth">Model truth</button>
                     <button type="button" data-settings-target="settingsJoints">Joints</button>
                     <button type="button" data-settings-target="settingsMotion">Motion</button>
                     <button type="button" data-settings-target="settingsTooling">Tooling</button>
@@ -472,6 +473,16 @@
                       <p id="dhTableStatus" class="field-help">The table is calculated from the physical dimensions above.</p>
                     </div>
                   </details>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsModelTruth">
+                  <div class="section-header">
+                    <div>
+                      <h2>Physical model truth</h2>
+                      <p class="hint">Read-only frame, TCP, and calibration-chain diagnostics. Cartesian command correction is a later compensation layer, not FK truth.</p>
+                    </div>
+                  </div>
+                  <div id="modelTruthSummary" class="path-summary model-truth-summary"></div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsJoints">

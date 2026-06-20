@@ -6,6 +6,10 @@ The current implementation uses a tool-specific Cartesian command correction.
 It does not change FK, the DH model, joint conventions, or camera/workspace
 calibration.
 
+Physical geometry, joint convention, frame, and TCP definitions are tracked in
+[physical_calibration_truth.md](physical_calibration_truth.md). Check that
+contract before fitting command correction to a persistent landing error.
+
 All coordinates are robot-base-frame millimetres:
 
 - +X is sideways.

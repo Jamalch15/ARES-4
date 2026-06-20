@@ -301,6 +301,7 @@ const elements = {
   dhTableEditor: $("#dhTableEditor"),
   dhTableStatus: $("#dhTableStatus"),
   geometryPresetEditor: $("#geometryPresetEditor"),
+  modelTruthSummary: $("#modelTruthSummary"),
   toolCalibration: $("#toolCalibration"),
   encoderCalibration: $("#encoderCalibration"),
   workspaceCalibrationStatus: $("#workspaceCalibrationStatus"),
@@ -901,6 +902,65 @@ function renderDhRows(rows) {
   `;
 }
 
+function formatPoint(point = {}, decimals = 1) {
+  if (!point) return "-";
+  return `x ${format(point.x_mm ?? point.x, decimals)}, y ${format(point.y_mm ?? point.y, decimals)}, z ${format(point.z_mm ?? point.z, decimals)}`;
+}
+
+function renderModelTruthSummary() {
+  if (!elements.modelTruthSummary) return;
+  const truth = state.config?.model_truth || {};
+  const tool = truth.active_tool || {};
+  const chain = Array.isArray(truth.transform_chain) ? truth.transform_chain : [];
+  const conventions = Array.isArray(truth.joint_conventions) ? truth.joint_conventions : [];
+  const fk = state.robotState?.fk || truth.current_fk || {};
+  const tcpPoint = fk.tcp_frame?.origin || fk;
+  const flangePoint = fk.flange_frame?.origin || fk.wrist_frame;
+  const axisZ = fk.tcp_frame?.axes?.z;
+  const currentFrameHtml = `
+    <div class="model-truth-current">
+      <div class="log-line"><span>Current TCP</span><code>${formatPoint(tcpPoint)}</code></div>
+      <div class="log-line"><span>Flange F4</span><code>${formatPoint(flangePoint)}</code></div>
+      <div class="log-line"><span>Tool +Z</span><code>${axisZ ? `x ${format(axisZ.x, 3)}, y ${format(axisZ.y, 3)}, z ${format(axisZ.z, 3)}` : "toggle Frames for viewport axes"}</code></div>
+    </div>
+  `;
+  elements.modelTruthSummary.innerHTML = `
+    <div class="log-line"><span>Active tool</span><code>${escapeHtml(tool.label || tool.name || "-")} (${escapeHtml(tool.type || "generic")}) TCP ${formatPoint(tool.tcp_offset_mm || {}, 1)} mm</code></div>
+    <div class="log-line"><span>Tool mapping</span><code>tool +Z -> local DH +X; command correction does not change FK</code></div>
+    ${currentFrameHtml}
+    <div class="model-truth-chain">
+      ${chain.map((step, index) => `
+        <div class="model-truth-step">
+          <strong>${index + 1}. ${escapeHtml(step.label || step.id)}</strong>
+          <span>${escapeHtml(step.notes || "")}</span>
+        </div>
+      `).join("")}
+    </div>
+    <div class="dh-table-wrap model-truth-table">
+      <table class="dh-grid dh-grid-readonly">
+        <thead>
+          <tr>
+            <th>Joint</th>
+            <th>Actuator mapping</th>
+            <th>DH theta mapping</th>
+            <th>Home</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${conventions.map((row) => `
+            <tr>
+              <td><strong>J${row.joint} ${escapeHtml(row.name)}</strong></td>
+              <td><code>zero ${format(row.actuator_mapping?.zero_offset_deg, 2)}, sign ${Number(row.actuator_mapping?.direction_sign) === -1 ? "-1" : "+1"}</code></td>
+              <td><code>theta = q*${Number(row.dh_model_mapping?.direction_sign) === -1 ? "-1" : "+1"} + ${format(row.dh_model_mapping?.zero_offset_deg, 2)} + ${format(row.dh_model_mapping?.theta_offset_deg, 2)}</code></td>
+              <td><code>${format(row.mechanical_home_deg, 2)} deg</code></td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function refreshDerivedModelDraft() {
   const draft = geometryDraft();
   state.linkDraft = draft.links;
@@ -1040,6 +1100,7 @@ function readToolsPayload() {
 function buildCalibrationEditors() {
   buildGeometryPresetEditor();
   refreshDerivedModelDraft();
+  renderModelTruthSummary();
 
   elements.jointCalibration.innerHTML = `
     <div class="calibration-row calibration-header" aria-hidden="true">
@@ -1444,7 +1505,7 @@ function renderSetupChecklist() {
     ["Config sync", Boolean(robot.simulation || robot.config_sync_status === "synced"), robot.simulation ? "simulation" : robot.config_sync_status || "unknown"],
     ["Active tool", Boolean(robot.active_tool), `${robot.active_tool || "-"} / ${robot.tool_type || "-"}`],
     ["Camera", Boolean(camera.enabled), camera.enabled ? `enabled index ${camera.source_index}` : "disabled"],
-    ["Tool calibration", Boolean(calibration.tool_dimensions_validated), calibration.tool_dimensions_validated ? "validated" : "not validated"],
+    ["Tool/TCP dimensions", Boolean(calibration.tool_dimensions_validated), calibration.tool_dimensions_validated ? "validated" : "not validated"],
     ["Safe pose", !state.config?.validation?.named_position_errors?.safe, state.config?.validation?.named_position_errors?.safe?.join("; ") || "valid"],
     ["Drop zones", missingZones.length === 0, missingZones.length ? `missing ${missingZones.join(", ")}` : `${Object.keys(zones).length} configured`],
   ];
@@ -1878,6 +1939,11 @@ async function refreshDiagnostics() {
   const err = robotState.encoder_errors_deg || [];
   const pending = robotState.pending_motion || {};
   const configChange = robotState.config_change || {};
+  const truth = payload.model_truth || state.config?.model_truth || {};
+  const tool = truth.active_tool || {};
+  const currentFk = truth.current_fk || robotState.fk || {};
+  const currentTcp = currentFk.tcp_frame?.origin || currentFk.tcp || currentFk;
+  const currentFlange = currentFk.flange_frame?.origin || robotState.fk?.flange_frame?.origin;
   const angleText = (values) => Array.isArray(values) ? values.map((value) => format(value, 2)).join(", ") : "-";
   const previewRevision = state.latestPreview?.start_pose_revision;
   elements.diagnosticsSummary.innerHTML = `
@@ -1890,6 +1956,9 @@ async function refreshDiagnostics() {
     <div class="log-line"><span>Preview start</span><code>${previewRevision == null ? "none" : `revision ${previewRevision}: ${angleText(state.latestPreview?.start_reported_angles_deg)}`}</code></div>
     <div class="log-line"><span>Last rejection/error</span><code>${robotState.last_error || "-"}</code></div>
     <div class="log-line"><span>Config impact</span><code>${(configChange.categories || []).join(", ") || "none"}; pose invalidated=${Boolean(configChange.pose_invalidated)}</code></div>
+    <div class="log-line"><span>Model chain</span><code>${(truth.transform_chain || []).map((step) => step.id).join(" -> ") || "-"}</code></div>
+    <div class="log-line"><span>Active TCP</span><code>${tool.name || "-"} ${formatPoint(tool.tcp_offset_mm || {})} mm</code></div>
+    <div class="log-line"><span>FK frames</span><code>flange ${formatPoint(currentFlange)}; TCP ${formatPoint(currentTcp)}</code></div>
     <div class="log-line"><span>Encoders</span><code>${robotState.encoder_available || "0000"}</code></div>
     <div class="log-line"><span>Encoder angles</span><code>${enc.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
     <div class="log-line"><span>Encoder errors</span><code>${err.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
@@ -3793,6 +3862,7 @@ function renderState(robotState) {
   elements.fkZ.textContent = `${format(fk.z_mm)} mm`;
   elements.fkPitch.textContent = `${format(fk.tool_phi_deg ?? fk.tool_pitch_deg)} deg`;
   elements.eeCompact.textContent = `x ${format(fk.x_mm)}, y ${format(fk.y_mm)}, z ${format(fk.z_mm)} mm`;
+  renderModelTruthSummary();
   elements.lastCommand.textContent = robotState.last_command || "-";
   elements.lastError.textContent = robotState.last_error || "-";
   elements.portStatus.textContent = robotState.serial_port || (robotState.simulation ? "simulation" : "-");

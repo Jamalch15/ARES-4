@@ -59,6 +59,9 @@ geometry:
       starting_pose_deg: [0.0, 0.0, -70.0, -20.0]
 
 kinematics:
+  # Model mapping from logical joint coordinate q to Standard-DH theta.
+  # This is separate from joints[].zero_offset_deg/direction_sign, which are
+  # actuator/controller mapping values.
   convention: standard_dh
   position_tolerance_mm: 1.0
   orientation_tolerance_deg: 1.0
@@ -107,6 +110,8 @@ kinematics:
       direction_sign: 1
 
 joints:
+  # Joint zero/sign values below describe actuator/controller mapping into the
+  # logical joint coordinate q. DH theta mapping lives in kinematics.dh_rows.
   - name: base
     actuator: stepper
     limits_deg:

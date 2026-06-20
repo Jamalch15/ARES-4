@@ -75,6 +75,7 @@ It is not yet decided whether each task should be a separate program, a plugin/m
 - [docs/architecture.md](docs/architecture.md): rough system architecture ideas
 - [docs/component_master_plan.md](docs/component_master_plan.md): broad component planning guide
 - [docs/accelerated_exam_demo_plan.md](docs/accelerated_exam_demo_plan.md): faster exam-focused demo roadmap
+- [docs/physical_calibration_truth.md](docs/physical_calibration_truth.md): working DH, joint convention, TCP, and calibration-chain contract
 - [docs/tasks/README.md](docs/tasks/README.md): early notes on task structure
 - [docs/open_questions.md](docs/open_questions.md): unresolved decisions and design questions
 

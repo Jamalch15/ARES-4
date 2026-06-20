@@ -8,6 +8,12 @@ import numpy as np
 from .config import DHRowConfig, JointConfig, LinkConfig
 
 
+TOOL_AXIS_TO_DH = {
+    "x": np.array([0.0, 1.0, 0.0], dtype=float),
+    "y": np.array([0.0, 0.0, 1.0], dtype=float),
+    "z": np.array([1.0, 0.0, 0.0], dtype=float),
+}
+
 COORDINATE_FRAME = """
 Standard DH kinematics with the project robot frame mapped from the DH frame:
 - The DH table uses theta, d, a, alpha in the standard convention.
@@ -133,6 +139,57 @@ def _dh_step_with_side_offset(
 
 def _robot_point_from_dh(vector: np.ndarray) -> dict[str, float]:
     return {"x_mm": float(vector[1]), "y_mm": float(-vector[0]), "z_mm": float(vector[2])}
+
+
+def _robot_direction_from_dh(vector: np.ndarray) -> dict[str, float]:
+    mapped = np.array([float(vector[1]), float(-vector[0]), float(vector[2])], dtype=float)
+    norm = float(np.linalg.norm(mapped))
+    if norm <= 1e-12:
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
+    mapped /= norm
+    return {"x": float(mapped[0]), "y": float(mapped[1]), "z": float(mapped[2])}
+
+
+def _dh_frame_axes(transform: np.ndarray) -> dict[str, dict[str, float]]:
+    return {
+        "x": _robot_direction_from_dh(transform[:3, :3] @ np.array([1.0, 0.0, 0.0], dtype=float)),
+        "y": _robot_direction_from_dh(transform[:3, :3] @ np.array([0.0, 1.0, 0.0], dtype=float)),
+        "z": _robot_direction_from_dh(transform[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=float)),
+    }
+
+
+def _tool_frame_axes(transform: np.ndarray) -> dict[str, dict[str, float]]:
+    return {
+        axis: _robot_direction_from_dh(transform[:3, :3] @ dh_axis)
+        for axis, dh_axis in TOOL_AXIS_TO_DH.items()
+    }
+
+
+def _frame_metadata(
+    frame_id: str,
+    origin: dict[str, float],
+    axes: dict[str, dict[str, float]],
+    *,
+    label: str,
+    parent: str | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    return {
+        "id": frame_id,
+        "label": label,
+        "origin": origin,
+        "axes": axes,
+        "parent": parent,
+        "notes": notes,
+    }
+
+
+def _point_copy(point: dict[str, float]) -> dict[str, float]:
+    return {
+        "x_mm": float(point["x_mm"]),
+        "y_mm": float(point["y_mm"]),
+        "z_mm": float(point["z_mm"]),
+    }
 
 
 def _row_theta(row: DHRowConfig, joint_angles_deg: list[float]) -> float:
@@ -271,6 +328,30 @@ def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict
     wrist = _robot_point_from_dh(frames[-1][:3, 3])
     tcp_vector = frames[-1] @ _tool_tcp_offset_vector(links)
     tcp = _robot_point_from_dh(tcp_vector[:3])
+    flange_frame = _frame_metadata(
+        "flange",
+        _point_copy(wrist),
+        _dh_frame_axes(frames[-1]),
+        label="DH frame 4 / wrist-flange",
+        parent="dh_frame_3",
+        notes="Origin after the final DH row, before active tool TCP offset.",
+    )
+    tool_frame = _frame_metadata(
+        "tool",
+        _point_copy(wrist),
+        _tool_frame_axes(frames[-1]),
+        label="Active tool frame",
+        parent="flange",
+        notes="Tool +Z is the configured forward/TCP length direction and maps to local DH +X.",
+    )
+    tcp_frame = _frame_metadata(
+        "tcp",
+        _point_copy(tcp),
+        _tool_frame_axes(frames[-1]),
+        label="Active tool TCP",
+        parent="tool",
+        notes="Origin is flange origin plus active tool tcp_offset_mm expressed in the tool frame.",
+    )
     phi_deg = _tool_phi_from_angles(joint_angles_deg, links)
     tcp["radial_mm"] = hypot(tcp["x_mm"], tcp["y_mm"])
     tcp["tool_phi_deg"] = phi_deg
@@ -278,6 +359,9 @@ def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict
     tcp["dh_frames"] = joint_frame_points(joint_angles_deg, links)
     tcp["dh_segments"] = dh_segment_points(joint_angles_deg, links)
     tcp["wrist_frame"] = wrist
+    tcp["flange_frame"] = flange_frame
+    tcp["tool_frame"] = tool_frame
+    tcp["tcp_frame"] = tcp_frame
     tcp["tool_tcp_offset_mm"] = dict(links.tool_tcp_offset_mm or {})
     return tcp
 

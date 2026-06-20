@@ -39,6 +39,7 @@ from .cartesian_calibration import (
     predict_physical_pose,
     workspace_context as kinematics_workspace_context,
 )
+from .calibration_truth import model_truth_summary
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
     camera_settings,
@@ -575,6 +576,7 @@ def public_config() -> dict[str, Any]:
         "encoders": encoder_settings(config),
         "calibration": calibration_settings(config),
         "kinematics_calibration": kinematics_calibration_summary(config),
+        "model_truth": model_truth_summary(config),
         "geometry": geometry_settings(config),
         "validation": {
             "model_warnings": model_validation_warnings(config),
@@ -3126,6 +3128,7 @@ async def diagnostics(limit: int = 120) -> dict[str, Any]:
         "encoders": encoder_settings(config),
         "kinematics": asdict(config.kinematics),
         "kinematics_calibration": kinematics_calibration_summary(config),
+        "model_truth": model_truth_summary(config, state.fk),
         "motion": state.motion_diagnostics,
         "pose_contract": {
             "pose_revision": state.pose_revision,

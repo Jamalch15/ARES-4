@@ -61,7 +61,16 @@ function armPose(anglesDeg, links, geometryPreset = {}) {
   });
   const tcp = toolTcpPoint(transform, links);
   const lastFrame = frames[frames.length - 1];
-  return { frames, frameTransforms, segments, tcp, hasTcpOffset: !samePoint(tcp, lastFrame) };
+  return {
+    frames,
+    frameTransforms,
+    segments,
+    tcp,
+    flangeFrame: { origin: { ...lastFrame }, axes: dhFrameAxes(transform) },
+    toolFrame: { origin: { ...lastFrame }, axes: toolFrameAxes(transform) },
+    tcpFrame: { origin: { ...tcp }, axes: toolFrameAxes(transform) },
+    hasTcpOffset: !samePoint(tcp, lastFrame),
+  };
 }
 
 function dhJointIndex(row, fallbackIndex) {
@@ -130,6 +139,36 @@ function robotPointFromDh(transform) {
 
 function robotPointFromDhVector(vector) {
   return { x: vector[1], y: -vector[0], z: vector[2] };
+}
+
+function robotDirectionFromDhVector(vector) {
+  const mapped = { x: vector[1], y: -vector[0], z: vector[2] };
+  const length = Math.hypot(mapped.x, mapped.y, mapped.z);
+  if (length <= 1e-12) return { x: 0, y: 0, z: 0 };
+  return { x: mapped.x / length, y: mapped.y / length, z: mapped.z / length };
+}
+
+function dhDirection(transform, direction) {
+  const vector = [0, 1, 2].map((rowIndex) =>
+    [0, 1, 2].reduce((sum, columnIndex) => sum + transform[rowIndex][columnIndex] * direction[columnIndex], 0)
+  );
+  return robotDirectionFromDhVector(vector);
+}
+
+function dhFrameAxes(transform) {
+  return {
+    x: dhDirection(transform, [1, 0, 0]),
+    y: dhDirection(transform, [0, 1, 0]),
+    z: dhDirection(transform, [0, 0, 1]),
+  };
+}
+
+function toolFrameAxes(transform) {
+  return {
+    x: dhDirection(transform, [0, 1, 0]),
+    y: dhDirection(transform, [0, 0, 1]),
+    z: dhDirection(transform, [1, 0, 0]),
+  };
 }
 
 function dhSegmentLabel(rowIndex, kind) {
@@ -398,6 +437,10 @@ function robotToScene(point) {
   return new THREE.Vector3(point.x, point.z, -point.y);
 }
 
+function sceneDirectionFromRobotDirection(direction) {
+  return new THREE.Vector3(direction.x, direction.z, -direction.y).normalize();
+}
+
 function sceneDirectionFromDh(transform, direction) {
   const dhVector = [0, 1, 2].map((rowIndex) =>
     [0, 1, 2].reduce((sum, columnIndex) => sum + transform[rowIndex][columnIndex] * direction[columnIndex], 0)
@@ -528,6 +571,47 @@ function makeJointHub(transform, frameIndex, radiusScale, material) {
   );
 }
 
+function makeTcpFrameAxes(pose, radiusScale) {
+  const group = new THREE.Group();
+  const tcpOrigin = robotToScene(pose.tcpFrame?.origin || pose.tcp);
+  const flangeOrigin = robotToScene(pose.flangeFrame?.origin || pose.frames[pose.frames.length - 1]);
+  [
+    { label: "TCP X", direction: pose.tcpFrame?.axes?.x, color: 0xff6374 },
+    { label: "TCP Y", direction: pose.tcpFrame?.axes?.y, color: 0x53d18e },
+    { label: "TCP +Z", direction: pose.tcpFrame?.axes?.z, color: 0x6aa7ff },
+  ].forEach((axis) => {
+    if (!axis.direction) return;
+    const sceneDirection = sceneDirectionFromRobotDirection(axis.direction);
+    const helper = new THREE.ArrowHelper(
+      sceneDirection,
+      tcpOrigin,
+      42 * radiusScale,
+      axis.color,
+      8 * radiusScale,
+      4 * radiusScale
+    );
+    helper.line.material.userData.disposeWithObject = true;
+    helper.cone.material.userData.disposeWithObject = true;
+    group.add(helper);
+
+    const label = makeTextSprite(axis.label, `#${axis.color.toString(16).padStart(6, "0")}`);
+    label.position.copy(tcpOrigin).addScaledVector(sceneDirection, 52 * radiusScale);
+    label.scale.multiplyScalar(0.56);
+    group.add(label);
+  });
+
+  const tcpLabel = makeTextSprite("TCP", "#dce4ee");
+  tcpLabel.position.copy(tcpOrigin).add(new THREE.Vector3(0, 20 * radiusScale, 0));
+  tcpLabel.scale.multiplyScalar(0.62);
+  group.add(tcpLabel);
+
+  const flangeLabel = makeTextSprite("Flange F4", "#f2b45b");
+  flangeLabel.position.copy(flangeOrigin).add(new THREE.Vector3(0, 20 * radiusScale, 0));
+  flangeLabel.scale.multiplyScalar(0.56);
+  group.add(flangeLabel);
+  return group;
+}
+
 function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
   const group = new THREE.Group();
   const points = pose.frames.map(robotToScene);
@@ -586,6 +670,7 @@ function makeArmObjects(pose, materials, radiusScale = 1, options = {}) {
     (pose.frameTransforms || []).forEach((transform, frameIndex) => {
       group.add(makeFrameAxes(transform, frameIndex, radiusScale));
     });
+    group.add(makeTcpFrameAxes(pose, radiusScale));
   }
 
   return group;
@@ -1315,6 +1400,23 @@ export class RobotView {
     clearGroup(this.armGroup);
     this.lastRenderedAngles = this.angles.slice();
     const pose = armPose(this.angles, this.links, this.geometryPreset);
+    this.container.dataset.currentTcp = [
+      Number(pose.tcp.x || 0).toFixed(3),
+      Number(pose.tcp.y || 0).toFixed(3),
+      Number(pose.tcp.z || 0).toFixed(3),
+    ].join(",");
+    const flange = pose.flangeFrame?.origin || pose.frames[pose.frames.length - 1];
+    this.container.dataset.currentFlange = [
+      Number(flange.x || 0).toFixed(3),
+      Number(flange.y || 0).toFixed(3),
+      Number(flange.z || 0).toFixed(3),
+    ].join(",");
+    const axisZ = pose.tcpFrame?.axes?.z || { x: 0, y: 0, z: 0 };
+    this.container.dataset.currentTcpAxisZ = [
+      Number(axisZ.x || 0).toFixed(6),
+      Number(axisZ.y || 0).toFixed(6),
+      Number(axisZ.z || 0).toFixed(6),
+    ].join(",");
 
     const base = new THREE.Mesh(
       new THREE.CylinderGeometry(54, 66, 28, 32),

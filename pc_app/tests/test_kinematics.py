@@ -107,6 +107,27 @@ def test_tool_tcp_z_offset_extends_along_tool_axis():
     assert abs(result["z_mm"]) < 1e-9
 
 
+def test_forward_kinematics_exposes_flange_tool_and_tcp_frames():
+    links = LinkConfig(
+        0.0,
+        100.0,
+        0.0,
+        0.0,
+        0.0,
+        tool_tcp_offset_mm={"x": 0.0, "y": 0.0, "z": 20.0},
+    )
+
+    result = forward_kinematics([0.0, 90.0, 0.0, 0.0], links)
+
+    assert result["flange_frame"]["origin"]["y_mm"] == approx(100.0)
+    assert result["tcp_frame"]["origin"]["y_mm"] == approx(120.0)
+    assert result["tool_frame"]["origin"] == result["flange_frame"]["origin"]
+    assert result["tcp_frame"]["axes"]["z"]["x"] == approx(0.0, abs=1e-9)
+    assert result["tcp_frame"]["axes"]["z"]["y"] == approx(1.0, abs=1e-9)
+    assert result["tcp_frame"]["axes"]["z"]["z"] == approx(0.0, abs=1e-9)
+    assert result["tcp_frame"]["notes"].startswith("Origin is flange origin")
+
+
 def test_inverse_kinematics_round_trips_reachable_target():
     config = load_config()
     original = [15.0, 35.0, 30.0, -20.0]
@@ -397,6 +418,9 @@ def test_forward_kinematics_exposes_dh_frames():
     assert len(result["dh_frames"]) == 5
     assert result["dh_frames"][-1]["x_mm"] == approx(result["wrist_frame"]["x_mm"])
     assert set(result["tool_tcp_offset_mm"]) == {"x", "y", "z"}
+    assert result["flange_frame"]["id"] == "flange"
+    assert result["tool_frame"]["parent"] == "flange"
+    assert result["tcp_frame"]["parent"] == "tool"
 
 
 def test_forward_kinematics_exposes_dh_d_and_a_segments():

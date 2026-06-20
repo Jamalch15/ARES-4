@@ -121,3 +121,25 @@ def test_app_js_uses_independent_frontend_and_backend_version_fields():
     assert "version?.disk_backend_build_id || version?.disk_build_id" in app_js
     assert "version?.backend_restart_required ?? version?.restart_required" in app_js
     assert "Backend outdated - restart localhost" in app_js
+
+
+def test_config_endpoint_exposes_model_truth_summary():
+    client = TestClient(main.app)
+
+    payload = client.get("/api/config").json()
+
+    assert "model_truth" in payload
+    assert payload["model_truth"]["transform_chain"][0]["id"] == "actuator"
+    assert payload["model_truth"]["active_tool"]["tcp_axis_mapping"]["tool_z"] == "local DH +X / tool-forward"
+
+
+def test_frontend_contains_model_truth_and_tcp_frame_hooks():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    robot_view_js = (main.STATIC_DIR / "robot_view.js").read_text(encoding="utf-8")
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "renderModelTruthSummary" in app_js
+    assert "Tool/TCP dimensions" in app_js
+    assert "settingsModelTruth" in index_html
+    assert "makeTcpFrameAxes" in robot_view_js
+    assert "currentTcpAxisZ" in robot_view_js

@@ -1904,6 +1904,40 @@ label {
   align-items: end;
 }
 
+.model-truth-summary {
+  display: grid;
+  gap: 10px;
+}
+
+.model-truth-chain {
+  display: grid;
+  gap: 6px;
+}
+
+.model-truth-step {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: rgba(10, 15, 23, 0.46);
+}
+
+.model-truth-step strong {
+  color: var(--text);
+  font-size: 0.72rem;
+}
+
+.model-truth-step span {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.model-truth-table {
+  border-radius: 8px;
+}
+
 .tuning-row strong,
 .calibration-row strong {
   align-self: center;
