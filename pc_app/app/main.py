@@ -246,6 +246,8 @@ MAX_TRAJECTORY_UPLOAD_POINTS = 220
 TASK_PREVIEW_TTL_S = 600.0
 PREVIEW_START_TOLERANCE_DEG = 0.1
 CARTESIAN_JOG_STALE_S = 0.35
+HOME_SPEED_CAP_DEG_S = 15.0
+HOME_ACCEL_CAP_DEG_S2 = 60.0
 cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
     "active": False,
@@ -363,6 +365,10 @@ class IkTargetRequest(BaseModel):
 class PathSettingsRequest(BaseModel):
     global_speed_deg_s: float | None = None
     global_accel_deg_s2: float | None = None
+    tcp_speed_mm_s: float | None = None
+    phi_speed_deg_s: float | None = None
+    tcp_accel_mm_s2: float | None = None
+    phi_accel_deg_s2: float | None = None
     waypoint_rate_hz: float | None = None
     cartesian_step_mm: float | None = None
     planner_type: str | None = None
@@ -370,8 +376,6 @@ class PathSettingsRequest(BaseModel):
     blend_percent: float | None = None
     per_joint_speed_deg_s: list[float] | None = None
     per_joint_accel_deg_s2: list[float] | None = None
-    tcp_accel_mm_s2: float | None = None
-    phi_accel_deg_s2: float | None = None
 
 
 class IkSolveRequest(BaseModel):
@@ -1011,6 +1015,10 @@ def default_path_settings() -> dict[str, Any]:
     defaults = {
         "global_speed_deg_s": min(joint.max_speed_deg_s for joint in config.joints),
         "global_accel_deg_s2": config.motion.acceleration_deg_s2,
+        "tcp_speed_mm_s": 60.0,
+        "phi_speed_deg_s": 45.0,
+        "tcp_accel_mm_s2": 360.0,
+        "phi_accel_deg_s2": 240.0,
         "waypoint_rate_hz": config.motion.command_rate_limit_hz,
         "cartesian_step_mm": 10.0,
         "planner_type": "s_curve",
@@ -1023,6 +1031,31 @@ def default_path_settings() -> dict[str, Any]:
     if isinstance(stored, dict):
         defaults.update({key: value for key, value in stored.items() if value is not None})
     return defaults
+
+
+def home_path_settings() -> dict[str, Any]:
+    settings = request_settings(None)
+    speed_cap = min(HOME_SPEED_CAP_DEG_S, *(joint.max_speed_deg_s for joint in config.joints))
+    accel_cap = min(HOME_ACCEL_CAP_DEG_S2, *(joint.max_accel_deg_s2 for joint in config.joints))
+    settings["global_speed_deg_s"] = min(float(settings.get("global_speed_deg_s") or speed_cap), speed_cap)
+    settings["global_accel_deg_s2"] = min(float(settings.get("global_accel_deg_s2") or accel_cap), accel_cap)
+    per_joint_speed = settings.get("per_joint_speed_deg_s")
+    if not isinstance(per_joint_speed, list) or len(per_joint_speed) != len(config.joints):
+        per_joint_speed = [joint.max_speed_deg_s for joint in config.joints]
+    per_joint_accel = settings.get("per_joint_accel_deg_s2")
+    if not isinstance(per_joint_accel, list) or len(per_joint_accel) != len(config.joints):
+        per_joint_accel = [joint.max_accel_deg_s2 for joint in config.joints]
+    settings["per_joint_speed_deg_s"] = [
+        min(float(value), speed_cap, joint.max_speed_deg_s)
+        for value, joint in zip(per_joint_speed, config.joints, strict=True)
+    ]
+    settings["per_joint_accel_deg_s2"] = [
+        min(float(value), accel_cap, joint.max_accel_deg_s2)
+        for value, joint in zip(per_joint_accel, config.joints, strict=True)
+    ]
+    settings["planner_type"] = "s_curve"
+    settings["motion_purpose"] = "configured_home_pose_move"
+    return settings
 
 
 def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
@@ -1050,7 +1083,16 @@ def validated_task_path_settings(settings: PathSettingsRequest | dict[str, Any] 
         else:
             merged[key] = number
 
-    for key in ("global_speed_deg_s", "global_accel_deg_s2", "waypoint_rate_hz", "cartesian_step_mm"):
+    for key in (
+        "global_speed_deg_s",
+        "global_accel_deg_s2",
+        "tcp_speed_mm_s",
+        "phi_speed_deg_s",
+        "tcp_accel_mm_s2",
+        "phi_accel_deg_s2",
+        "waypoint_rate_hz",
+        "cartesian_step_mm",
+    ):
         positive_number(key)
 
     planner = str(merged.get("planner_type", "s_curve")).strip().lower().replace("-", "_")
@@ -1159,6 +1201,133 @@ def _cartesian_servo_limits(settings: dict[str, Any]) -> CartesianServoLimits:
         tcp_accel_mm_s2=max(1.0, tcp_accel),
         phi_accel_deg_s2=max(1.0, phi_accel),
     )
+
+
+def cartesian_jog_motion_contract(
+    settings: dict[str, Any],
+    *,
+    tcp_speed_mm_s: float | None = None,
+    phi_speed_deg_s: float | None = None,
+) -> dict[str, Any]:
+    joint_speed, joint_accel = _joint_limits_from_settings(settings)
+    tcp_speed = max(1.0, float(tcp_speed_mm_s if tcp_speed_mm_s is not None else settings.get("tcp_speed_mm_s") or 60.0))
+    phi_speed = max(1.0, float(phi_speed_deg_s if phi_speed_deg_s is not None else settings.get("phi_speed_deg_s") or 45.0))
+    tcp_accel = max(1.0, float(settings.get("tcp_accel_mm_s2") or 360.0))
+    phi_accel = max(1.0, float(settings.get("phi_accel_deg_s2") or 240.0))
+    limits = {
+        "schema": "motion_limit_summary_v1",
+        "path_mode": "cartesian_jog",
+        "target_type": "cartesian_velocity",
+        "profile": "fixed_rate_servo",
+        "duration_s": None,
+        "limiting_constraint": {
+            "type": "live_velocity",
+            "joint_index": None,
+            "joint_name": "",
+            "duration_s": None,
+        },
+        "effective_joint_speed_deg_s": joint_speed,
+        "effective_joint_accel_deg_s2": joint_accel,
+        "tcp_speed_mm_s": tcp_speed,
+        "phi_speed_deg_s": phi_speed,
+        "tcp_accel_mm_s2": tcp_accel,
+        "phi_accel_deg_s2": phi_accel,
+        "notes": ["Cartesian jog is a fixed-rate velocity servo, not a precomputed trajectory"],
+    }
+    return {
+        "schema": "motion_plan_contract_v1",
+        "path_mode": "cartesian_jog",
+        "target_type": "cartesian_velocity",
+        "profile": "fixed_rate_servo",
+        "interpolation": "fixed-rate Cartesian velocity servo with synchronized SERVOJ targets",
+        "duration_s": None,
+        "waypoint_count": 0,
+        "limits": limits,
+        "controller_command": controller_command_contract("SERVOJ", settings=settings),
+    }
+
+
+def controller_command_contract(command: str, *, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = command.upper()
+    settings = settings or {}
+    if normalized == "MOVEJ":
+        return {
+            "schema": "controller_command_contract_v1",
+            "command": "MOVEJ",
+            "timing_authority": "controller_endpoint_profile",
+            "uses_planned_timestamps": False,
+            "speed_deg_s": settings.get("global_speed_deg_s"),
+            "accel_deg_s2": settings.get("global_accel_deg_s2"),
+            "notes": [
+                "hardware endpoint MOVEJ receives one global speed and acceleration",
+                "firmware configuration and per-axis caps still apply on the controller",
+                "per-joint override limits affect preview estimates but are not transmitted in MOVEJ",
+            ],
+        }
+    if normalized == "TRAJ":
+        return {
+            "schema": "controller_command_contract_v1",
+            "command": "TRAJ",
+            "timing_authority": "pc_planned_timed_trajectory",
+            "uses_planned_timestamps": True,
+            "speed_deg_s": settings.get("global_speed_deg_s"),
+            "accel_deg_s2": settings.get("global_accel_deg_s2"),
+            "notes": [
+                "queued trajectory uploads planned waypoint timestamps to the controller",
+                "firmware still enforces configured hardware limits",
+            ],
+        }
+    if normalized == "SERVOJ":
+        return {
+            "schema": "controller_command_contract_v1",
+            "command": "SERVOJ",
+            "timing_authority": "pc_fixed_rate_cartesian_servo",
+            "uses_planned_timestamps": False,
+            "notes": ["Cartesian jog sends finite synchronized SERVOJ targets at a fixed servo period"],
+        }
+    if normalized == "SIM_TRAJ":
+        return {
+            "schema": "controller_command_contract_v1",
+            "command": "SIM_TRAJ",
+            "timing_authority": "pc_simulation_timed_trajectory",
+            "uses_planned_timestamps": True,
+            "notes": ["simulation follows the planned trajectory timestamps and effective joint limits"],
+        }
+    return {
+        "schema": "controller_command_contract_v1",
+        "command": normalized,
+        "timing_authority": "unknown",
+        "uses_planned_timestamps": False,
+        "notes": [],
+    }
+
+
+def motion_contract_for_controller(
+    motion_contract: dict[str, Any] | None,
+    command: str,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = deepcopy(motion_contract or {})
+    contract["controller_command"] = controller_command_contract(command, settings=settings)
+    return contract
+
+
+def attach_controller_command_to_motion_contract(
+    preview: dict[str, Any],
+    command: str,
+    settings: dict[str, Any] | None = None,
+) -> None:
+    contract = motion_contract_for_controller(preview.get("motion_contract"), command, settings)
+    preview["motion_contract"] = contract
+    preview["controller_command_contract"] = contract["controller_command"]
+
+
+def anticipated_controller_command(trajectory_mode: str) -> str:
+    if state.simulation:
+        return "SIM_TRAJ"
+    if str(trajectory_mode).lower() in {"joint", "jog"}:
+        return "MOVEJ"
+    return "TRAJ"
 
 
 def cancel_task(task: asyncio.Task[None] | None) -> None:
@@ -1375,6 +1544,7 @@ def start_motion_diagnostics(
     target_deg: list[float],
     expected_duration_s: float,
     waypoint_count: int,
+    motion_contract: dict[str, Any] | None = None,
     step_label: str = "",
     step_index: int = 0,
     step_total: int = 0,
@@ -1388,6 +1558,8 @@ def start_motion_diagnostics(
         "run_id": run_id,
         "source": source,
         "mode": mode,
+        "motion_contract": motion_contract or {},
+        "limit_summary": (motion_contract or {}).get("limits", {}),
         "execution_state": "queued",
         "requested_target_deg": [float(value) for value in target_deg],
         "start_reported_deg": [float(value) for value in state.reported_angles_deg],
@@ -1418,6 +1590,8 @@ def start_motion_diagnostics(
         "start_pose_revision": state.pose_revision,
         "start_reported_angles_deg": [float(value) for value in state.reported_angles_deg],
         "target_angles_deg": [float(value) for value in target_deg],
+        "motion_contract": motion_contract or {},
+        "limit_summary": (motion_contract or {}).get("limits", {}),
         "status": "queued",
         "started_at": time(),
     }
@@ -1915,8 +2089,15 @@ def build_preview(
         "settings": settings,
         "ik": ik_result,
         "trajectory": trajectory,
+        "motion_contract": trajectory.get("motion_contract", {}),
+        "limit_summary": trajectory.get("limit_summary", {}),
         "completion_feedback": "timed + STATUS estimate for hardware",
     }
+    attach_controller_command_to_motion_contract(
+        preview,
+        anticipated_controller_command(str(trajectory.get("mode", preview_mode))),
+        settings,
+    )
     if preview_mode == "program":
         preview["program_revision"] = program_revision
     path_previews[preview_id] = preview
@@ -2083,8 +2264,15 @@ async def start_joint_target_trajectory(
         "settings": settings,
         "ik": None,
         "trajectory": trajectory,
+        "motion_contract": trajectory.get("motion_contract", {}),
+        "limit_summary": trajectory.get("limit_summary", {}),
         "completion_feedback": "timed + STATUS estimate for hardware",
     }
+    attach_controller_command_to_motion_contract(
+        preview,
+        anticipated_controller_command(str(trajectory.get("mode", "joint"))),
+        settings,
+    )
     path_previews[preview_id] = preview
     state.clear_error()
     state.last_command = f"{command_label.upper()} {preview_id}"
@@ -2108,12 +2296,19 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
     speed = settings.get("global_speed_deg_s")
     accel = settings.get("global_accel_deg_s2")
     expected_duration = float(trajectory.get("duration_s", 0.0))
+    command_contract_name = "SIM_TRAJ" if state.simulation else "MOVEJ"
+    runtime_motion_contract = motion_contract_for_controller(
+        trajectory.get("motion_contract") or preview.get("motion_contract"),
+        command_contract_name,
+        settings,
+    )
     run_id = start_motion_diagnostics(
         source=str(preview.get("source", "joint")),
-        mode="joint_endpoint",
+        mode="joint_timed_simulation" if state.simulation else "joint_endpoint",
         target_deg=target,
         expected_duration_s=expected_duration,
         waypoint_count=1,
+        motion_contract=runtime_motion_contract,
         step_label=str(preview.get("task_step_label", "")),
         step_index=int(preview.get("task_step_index", 0) or 0),
         step_total=int(preview.get("task_step_total", 0) or 0),
@@ -2128,6 +2323,11 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
     )
 
     try:
+        if state.simulation:
+            state.last_command = f"SIM_TRAJ {preview.get('source', 'joint')}"
+            await execute_simulated_waypoint_trajectory(trajectory, run_id)
+            return
+
         response = set_targets(
             target,
             f"{preview.get('source', 'joint')}_endpoint",
@@ -2137,21 +2337,6 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
         await broadcast_state()
         if not response["ok"]:
             finish_motion_diagnostics("failed", response.get("error", "joint endpoint failed"), run_id)
-            return
-
-        if state.simulation:
-            deadline = monotonic() + max(1.0, expected_duration * 4.0 + 0.5)
-            while monotonic() < deadline:
-                if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
-                    finish_motion_diagnostics("stopped", state.motion_state.value, run_id)
-                    return
-                if has_reached_target(state.reported_angles_deg, target, tolerance_deg=0.08):
-                    state.motion_state = MotionState.IDLE
-                    finish_motion_diagnostics("reached", run_id=run_id)
-                    return
-                await asyncio.sleep(0.03)
-            state.set_error("simulation target timeout", fault=True)
-            finish_motion_diagnostics("failed", state.last_error, run_id)
             return
 
         ok, message = await wait_for_hardware_target(
@@ -2262,12 +2447,19 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
     speed = settings.get("global_speed_deg_s")
     accel = settings.get("global_accel_deg_s2")
     final_target = [float(value) for value in waypoints[-1]] if waypoints else state.target_angles_deg.copy()
+    command_contract_name = "SIM_TRAJ" if state.simulation else "TRAJ"
+    runtime_motion_contract = motion_contract_for_controller(
+        trajectory.get("motion_contract") or preview.get("motion_contract"),
+        command_contract_name,
+        settings,
+    )
     run_id = start_motion_diagnostics(
         source=str(preview.get("source", "path")),
         mode=str(trajectory.get("mode", preview.get("mode", "path"))),
         target_deg=final_target,
         expected_duration_s=float(trajectory.get("duration_s", 0.0)),
         waypoint_count=len(waypoints),
+        motion_contract=runtime_motion_contract,
         step_label=str(preview.get("task_step_label", "")),
         step_index=int(preview.get("task_step_index", 0) or 0),
         step_total=int(preview.get("task_step_total", 0) or 0),
@@ -4701,8 +4893,15 @@ async def live_target(request: LiveTargetRequest) -> dict[str, Any]:
             "settings": settings,
             "ik": None,
             "trajectory": trajectory,
+            "motion_contract": trajectory.get("motion_contract", {}),
+            "limit_summary": trajectory.get("limit_summary", {}),
             "completion_feedback": "timed + STATUS estimate for hardware",
         }
+        attach_controller_command_to_motion_contract(
+            preview,
+            anticipated_controller_command(str(trajectory.get("mode", "joint"))),
+            settings,
+        )
         path_previews[preview_id] = preview
         result = {"ok": True, "preview_id": preview_id, "preview": preview}
     else:
@@ -4959,12 +5158,18 @@ async def cartesian_jog(request: CartesianJogRequest) -> dict[str, Any]:
     run_id = cartesian_jog_runtime.get("run_id")
     if not cartesian_jog_runtime.get("active") or not run_id:
         cartesian_servo.reset(state.reported_angles_deg)
+        motion_contract = cartesian_jog_motion_contract(
+            settings,
+            tcp_speed_mm_s=tcp_limit,
+            phi_speed_deg_s=phi_limit,
+        )
         run_id = start_motion_diagnostics(
             source="cartesian_jog",
             mode="cartesian_jog",
             target_deg=state.reported_angles_deg,
             expected_duration_s=0.0,
             waypoint_count=0,
+            motion_contract=motion_contract,
         )
         cartesian_jog_runtime["run_id"] = run_id
 
@@ -5227,7 +5432,7 @@ async def set_all_joint_targets(request: AllTargetsRequest) -> dict[str, Any]:
 
 @app.post("/api/home")
 async def home() -> dict[str, Any]:
-    response = await start_joint_target_trajectory(config.home_pose, "home")
+    response = await start_joint_target_trajectory(config.home_pose, "home", home_path_settings())
     if response["ok"]:
         log_event("motion", "go home accepted", preview_id=response.get("preview_id"))
     return response

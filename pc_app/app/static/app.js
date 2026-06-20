@@ -184,6 +184,10 @@ const elements = {
   hardwareArmToggle: $("#hardwareArmToggle"),
   globalSpeedInput: $("#globalSpeedInput"),
   globalAccelInput: $("#globalAccelInput"),
+  tcpSpeedInput: $("#tcpSpeedInput"),
+  tcpAccelInput: $("#tcpAccelInput"),
+  phiSpeedInput: $("#phiSpeedInput"),
+  phiAccelInput: $("#phiAccelInput"),
   waypointRateInput: $("#waypointRateInput"),
   cartesianStepInput: $("#cartesianStepInput"),
   plannerTypeSelect: $("#plannerTypeSelect"),
@@ -1938,6 +1942,7 @@ async function refreshDiagnostics() {
   const enc = robotState.encoder_angles_deg || [];
   const err = robotState.encoder_errors_deg || [];
   const pending = robotState.pending_motion || {};
+  const diagnostics = robotState.motion_diagnostics || {};
   const configChange = robotState.config_change || {};
   const truth = payload.model_truth || state.config?.model_truth || {};
   const tool = truth.active_tool || {};
@@ -1946,15 +1951,22 @@ async function refreshDiagnostics() {
   const currentFlange = currentFk.flange_frame?.origin || robotState.fk?.flange_frame?.origin;
   const angleText = (values) => Array.isArray(values) ? values.map((value) => format(value, 2)).join(", ") : "-";
   const previewRevision = state.latestPreview?.start_pose_revision;
+  const activeRunId = diagnostics.run_id || pending.run_id || "";
+  const diagnosticMotionSummary = diagnostics.motion_contract
+    ? motionContractHtml(diagnostics, null, { includeNotes: true })
+    : "";
   elements.diagnosticsSummary.innerHTML = `
     <div class="log-line"><span>Pose source</span><code>${robotState.pose_source || "unknown"}</code></div>
     <div class="log-line"><span>Pose revision</span><code>${robotState.pose_revision ?? 0} (${robotState.pose_known_mask || "0000"})</code></div>
     <div class="log-line"><span>Reported</span><code>${angleText(robotState.reported_angles_deg)}</code></div>
     <div class="log-line"><span>Commanded</span><code>${angleText(robotState.commanded_target_deg || robotState.target_angles_deg)}</code></div>
-    <div class="log-line"><span>Pending motion</span><code>${pending.run_id ? `${pending.source}/${pending.mode} - ${pending.status}` : "none"}</code></div>
+    <div class="log-line"><span>Active run</span><code>${activeRunId ? `${activeRunId} ${diagnostics.result || pending.status || ""}` : "none"}</code></div>
+    <div class="log-line"><span>Run source/mode</span><code>${activeRunId ? `${diagnostics.source || pending.source || "-"} / ${diagnostics.mode || pending.mode || "-"}` : "-"}</code></div>
+    <div class="log-line"><span>Run revisions</span><code>${activeRunId ? `start ${pending.start_pose_revision ?? "-"} -> current ${robotState.pose_revision ?? 0}` : "-"}</code></div>
+    ${diagnosticMotionSummary}
     <div class="log-line"><span>Draft</span><code>${angleText(state.draftAngles)}</code></div>
     <div class="log-line"><span>Preview start</span><code>${previewRevision == null ? "none" : `revision ${previewRevision}: ${angleText(state.latestPreview?.start_reported_angles_deg)}`}</code></div>
-    <div class="log-line"><span>Last rejection/error</span><code>${robotState.last_error || "-"}</code></div>
+    <div class="log-line"><span>Last rejection/error</span><code>${robotState.last_error || diagnostics.error || "-"}</code></div>
     <div class="log-line"><span>Config impact</span><code>${(configChange.categories || []).join(", ") || "none"}; pose invalidated=${Boolean(configChange.pose_invalidated)}</code></div>
     <div class="log-line"><span>Model chain</span><code>${(truth.transform_chain || []).map((step) => step.id).join(" -> ") || "-"}</code></div>
     <div class="log-line"><span>Active TCP</span><code>${tool.name || "-"} ${formatPoint(tool.tcp_offset_mm || {})} mm</code></div>
@@ -2108,7 +2120,6 @@ function renderTaskSummary(sequence, preview) {
   const taskPreview = sequence?.task_preview || state.lastTaskPreview || {};
   const warnings = taskPreview.warnings || [];
   const normalized = taskPreview.normalized_settings || {};
-  const motionSettings = preview?.settings || {};
   const calibrationApplied = Array.isArray(preview?.calibration)
     && preview.calibration.some((item) => item.applied);
   const orientation = normalized.orientation_policy === "fixed"
@@ -2117,13 +2128,12 @@ function renderTaskSummary(sequence, preview) {
   elements.taskSummary.innerHTML = `
     <div class="log-line"><span>Steps</span><code>${steps.length}</code></div>
     <div class="log-line"><span>Moves</span><code>${sequence?.waypoints?.length || 0}</code></div>
-    <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
+    ${motionContractHtml(preview, trajectory)}
     <div class="log-line"><span>TCP correction</span><code>${calibrationApplied ? "enabled for Cartesian task targets" : "not applied"}</code></div>
     <div class="log-line"><span>Strategy</span><code>${taskPreview.strategy || sequence?.strategy || "-"}</code></div>
     <div class="log-line"><span>Objects</span><code>${taskPreview.selected_objects?.length || sequence?.object_count || 0}</code></div>
     <div class="log-line"><span>TCP Z</span><code>pick ${format(normalized.pickup_z_mm)} / drop ${format(normalized.dropoff_z_mm)} mm</code></div>
     <div class="log-line"><span>Orientation</span><code>${orientation}</code></div>
-    <div class="log-line"><span>Motion limits</span><code>${format(motionSettings.global_speed_deg_s)} deg/s / ${format(motionSettings.global_accel_deg_s2)} deg/s²</code></div>
     <div class="log-line"><span>Warnings</span><code>${warnings.length ? warnings.join("; ") : "-"}</code></div>
   `;
 }
@@ -3254,6 +3264,86 @@ function formatCartesianTarget(target = {}) {
   return `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}, ${phiText}`;
 }
 
+function motionContractFrom(source = {}, fallbackTrajectory = null) {
+  return source.motion_contract || fallbackTrajectory?.motion_contract || source.trajectory?.motion_contract || null;
+}
+
+function motionLimitsFrom(source = {}, fallbackTrajectory = null) {
+  return source.limit_summary
+    || motionContractFrom(source, fallbackTrajectory)?.limits
+    || fallbackTrajectory?.limit_summary
+    || source.trajectory?.limit_summary
+    || {};
+}
+
+function motionModeLabel(contract = {}, trajectory = {}) {
+  const mode = contract.path_mode || trajectory.mode || "-";
+  if (mode === "linear") return "sampled Cartesian linear";
+  if (mode === "joint") return "joint";
+  if (mode === "program") return "program";
+  if (mode === "cartesian_jog") return "Cartesian jog";
+  return mode;
+}
+
+function formatLimitList(values = [], unit = "") {
+  if (!Array.isArray(values) || !values.length) return "-";
+  return values.map((value, index) => `J${index + 1} ${format(value, 1)}${unit}`).join(", ");
+}
+
+function formatLimitingConstraint(limits = {}) {
+  const constraint = limits.limiting_constraint || {};
+  const type = constraint.type || "none";
+  if (type === "none") return "none";
+  if (constraint.segment_index !== undefined && constraint.segment_index !== null) {
+    const label = constraint.segment_label ? ` ${constraint.segment_label}` : "";
+    return `step ${Number(constraint.segment_index) + 1}${label}: ${type}`;
+  }
+  if (constraint.joint_index !== undefined && constraint.joint_index !== null) {
+    const name = constraint.joint_name || `J${Number(constraint.joint_index) + 1}`;
+    return `${name}: ${type}`;
+  }
+  return type;
+}
+
+function motionContractLines(source = {}, fallbackTrajectory = null, options = {}) {
+  const trajectory = fallbackTrajectory || source.trajectory || {};
+  const contract = motionContractFrom(source, trajectory) || {};
+  const limits = motionLimitsFrom(source, trajectory);
+  const command = contract.controller_command || source.controller_command_contract || {};
+  const notes = Array.isArray(limits.notes) ? limits.notes : [];
+  const waypointCount = contract.waypoint_count ?? trajectory.waypoint_count ?? 0;
+  const duration = contract.duration_s ?? trajectory.duration_s;
+  const lines = [
+    ["Mode", motionModeLabel(contract, trajectory)],
+    ["Profile", contract.profile || trajectory.profile || limits.profile || "-"],
+    ["Controller", command.command ? `${command.command} (${command.timing_authority || "unknown"})` : "-"],
+    ["Duration", Number.isFinite(Number(duration)) ? `${format(duration, 2)} s` : "-"],
+    ["Waypoints", waypointCount],
+    ["Limiting", formatLimitingConstraint(limits)],
+    ["Joint speed", formatLimitList(limits.effective_joint_speed_deg_s || trajectory.speed_limits_deg_s, " deg/s")],
+    ["Joint accel", formatLimitList(limits.effective_joint_accel_deg_s2 || trajectory.accel_limits_deg_s2, " deg/s²")],
+  ];
+  if (limits.tcp_speed_mm_s !== undefined || limits.tcp_accel_mm_s2 !== undefined) {
+    lines.push(["TCP jog", `${format(limits.tcp_speed_mm_s, 1)} mm/s, ${format(limits.tcp_accel_mm_s2, 1)} mm/s²`]);
+  }
+  if (limits.phi_speed_deg_s !== undefined || limits.phi_accel_deg_s2 !== undefined) {
+    lines.push(["Phi jog", `${format(limits.phi_speed_deg_s, 1)} deg/s, ${format(limits.phi_accel_deg_s2, 1)} deg/s²`]);
+  }
+  if (options.includeNotes !== false && notes.length) {
+    lines.push(["Notes", notes.join("; ")]);
+  }
+  if (options.includeNotes !== false && Array.isArray(command.notes) && command.notes.length) {
+    lines.push(["Command notes", command.notes.join("; ")]);
+  }
+  return lines;
+}
+
+function motionContractHtml(source = {}, fallbackTrajectory = null, options = {}) {
+  return motionContractLines(source, fallbackTrajectory, options)
+    .map(([label, value]) => `<div class="log-line"><span>${label}</span><code>${escapeHtml(value)}</code></div>`)
+    .join("");
+}
+
 function clearIkSolutionPreview() {
   state.previewId = null;
   state.latestPreview = null;
@@ -3293,6 +3383,10 @@ function pathSettings() {
   return {
     global_speed_deg_s: readNumber(elements.globalSpeedInput, 25),
     global_accel_deg_s2: readNumber(elements.globalAccelInput, 120),
+    tcp_speed_mm_s: readNumber(elements.tcpSpeedInput, 60),
+    phi_speed_deg_s: readNumber(elements.phiSpeedInput, 45),
+    tcp_accel_mm_s2: readNumber(elements.tcpAccelInput, 360),
+    phi_accel_deg_s2: readNumber(elements.phiAccelInput, 240),
     waypoint_rate_hz: readNumber(elements.waypointRateInput, 12),
     cartesian_step_mm: readNumber(elements.cartesianStepInput, 10),
     planner_type: elements.plannerTypeSelect.value,
@@ -3303,14 +3397,28 @@ function pathSettings() {
   };
 }
 
+function syncPlannerControls() {
+  const trapezoidSelected = elements.plannerTypeSelect?.value === "trapezoid";
+  if (elements.blendPercentInput) {
+    elements.blendPercentInput.disabled = !trapezoidSelected;
+    elements.blendPercentInput.title = trapezoidSelected
+      ? "Ramp fraction used by the trapezoid profile"
+      : "Only used by the trapezoid profile";
+  }
+}
+
 function taskPathSettingsPayload() {
   const settings = pathSettings();
   settings.global_speed_deg_s = readRequiredNumber(elements.globalSpeedInput, "Global speed", { min: 0.001 });
   settings.global_accel_deg_s2 = readRequiredNumber(elements.globalAccelInput, "Global acceleration", { min: 0.001 });
+  settings.tcp_speed_mm_s = readRequiredNumber(elements.tcpSpeedInput, "TCP speed", { min: 0.001 });
+  settings.phi_speed_deg_s = readRequiredNumber(elements.phiSpeedInput, "Phi speed", { min: 0.001 });
+  settings.tcp_accel_mm_s2 = readRequiredNumber(elements.tcpAccelInput, "TCP acceleration", { min: 0.001 });
+  settings.phi_accel_deg_s2 = readRequiredNumber(elements.phiAccelInput, "Phi acceleration", { min: 0.001 });
   settings.waypoint_rate_hz = readRequiredNumber(elements.waypointRateInput, "Waypoint rate", { min: 0.001 });
   settings.cartesian_step_mm = readRequiredNumber(elements.cartesianStepInput, "Cartesian step", { min: 0.001 });
   settings.jerk_percent = readRequiredNumber(elements.jerkPercentInput, "Jerk percent", { min: 0, max: 100 });
-  settings.blend_percent = readRequiredNumber(elements.blendPercentInput, "Blend percent", { min: 0, max: 100 });
+  settings.blend_percent = readRequiredNumber(elements.blendPercentInput, "Trapezoid ramp", { min: 0, max: 100 });
   settings.per_joint_speed_deg_s = [...document.querySelectorAll(".joint-speed-limit")]
     .map((input, index) => readRequiredNumber(input, `Joint ${index + 1} speed`, { min: 0.001 }));
   settings.per_joint_accel_deg_s2 = [...document.querySelectorAll(".joint-accel-limit")]
@@ -3932,11 +4040,8 @@ function renderPreview(preview) {
   const commandTarget = preview.command_target || {};
   elements.ikPathSummary.innerHTML = `
     <h3>Path</h3>
-    <div class="log-line"><span>Mode</span><code>${trajectory.mode || preview.mode || "-"}</code></div>
-    <div class="log-line"><span>Profile</span><code>${trajectory.profile || "-"}</code></div>
+    ${motionContractHtml(preview, trajectory)}
     <div class="log-line"><span>Path type</span><code>${pathLayerDescription(preview, trajectory)}</code></div>
-    <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
-    <div class="log-line"><span>Waypoints</span><code>${trajectory.waypoint_count || 0}</code></div>
     <div class="log-line"><span>Branch</span><code>${ik.selected_branch || "-"}</code></div>
     <div class="log-line"><span>Target phi</span><code>${preview.target?.phi_auto ? `auto -> ${format(preview.target.phi_deg, 2)} deg` : `${format(preview.target?.phi_deg, 2)} deg`}</code></div>
     <div class="log-line"><span>TCP calibration</span><code>${calibrationApplied ? "applied at Cartesian command layer" : "not applied"}</code></div>
@@ -4611,6 +4716,9 @@ function renderProgramPreviewSummary() {
   const calibrationWarnings = Array.isArray(state.programPreview?.calibration)
     ? state.programPreview.calibration.flatMap((item) => item.warnings || [])
     : state.programPreview?.calibration?.warnings || [];
+  const motionSummaryHtml = state.programPreview
+    ? motionContractHtml(state.programPreview, trajectory)
+    : "";
   elements.programPreviewSummary.innerHTML = `
     <div class="program-summary-grid">
       <div><span>Steps</span><strong>${stepCount}</strong></div>
@@ -4619,6 +4727,7 @@ function renderProgramPreviewSummary() {
       <div><span>Preview</span><strong class="program-summary-status ${status.toLowerCase().replace(" ", "-")}">${status}</strong></div>
     </div>
     <div class="program-summary-messages">
+      ${motionSummaryHtml ? `<div class="path-summary compact-summary">${motionSummaryHtml}</div>` : ""}
       ${stale ? `<div class="program-summary-message warning"><strong>Preview is stale</strong><span>${escapeHtml(state.programLastEditReason || "The sequence changed after preview.")}</span></div>` : ""}
       ${errors.slice(0, 5).map((error) => `<div class="program-summary-message error"><strong>Needs attention</strong><span>${escapeHtml(error)}</span></div>`).join("")}
       ${calibrationWarnings.slice(0, 3).map((warning) => `<div class="program-summary-message warning"><strong>Warning</strong><span>${escapeHtml(warning)}</span></div>`).join("")}
@@ -4982,11 +5091,18 @@ function applyConfig(config) {
     1
   );
   elements.globalAccelInput.value = format(pathDefaults.global_accel_deg_s2 ?? state.config.motion.acceleration_deg_s2, 1);
+  elements.tcpSpeedInput.value = format(pathDefaults.tcp_speed_mm_s ?? 60, 1);
+  elements.phiSpeedInput.value = format(pathDefaults.phi_speed_deg_s ?? 45, 1);
+  elements.tcpAccelInput.value = format(pathDefaults.tcp_accel_mm_s2 ?? 360, 1);
+  elements.phiAccelInput.value = format(pathDefaults.phi_accel_deg_s2 ?? 240, 1);
+  if (elements.cartesianJogSpeedInput) elements.cartesianJogSpeedInput.value = format(pathDefaults.tcp_speed_mm_s ?? 60, 1);
+  if (elements.cartesianJogPhiSpeedInput) elements.cartesianJogPhiSpeedInput.value = format(pathDefaults.phi_speed_deg_s ?? 45, 1);
   elements.waypointRateInput.value = format(pathDefaults.waypoint_rate_hz ?? state.config.motion.command_rate_limit_hz, 0);
   elements.cartesianStepInput.value = format(pathDefaults.cartesian_step_mm ?? 10, 0);
   elements.plannerTypeSelect.value = pathDefaults.planner_type || "s_curve";
   elements.jerkPercentInput.value = format(pathDefaults.jerk_percent ?? 25, 0);
   elements.blendPercentInput.value = format(pathDefaults.blend_percent ?? 0, 0);
+  syncPlannerControls();
   buildJointControls();
   buildPerJointTuning();
   buildCalibrationEditors();
@@ -5471,6 +5587,10 @@ function bindActions() {
   [
     elements.globalSpeedInput,
     elements.globalAccelInput,
+    elements.tcpSpeedInput,
+    elements.tcpAccelInput,
+    elements.phiSpeedInput,
+    elements.phiAccelInput,
     elements.waypointRateInput,
     elements.cartesianStepInput,
     elements.plannerTypeSelect,
@@ -5478,6 +5598,13 @@ function bindActions() {
     elements.blendPercentInput,
   ].forEach((input) => {
     const handleMotionSettingsChange = () => {
+      if (input === elements.plannerTypeSelect) syncPlannerControls();
+      if (input === elements.tcpSpeedInput && elements.cartesianJogSpeedInput) {
+        elements.cartesianJogSpeedInput.value = elements.tcpSpeedInput.value;
+      }
+      if (input === elements.phiSpeedInput && elements.cartesianJogPhiSpeedInput) {
+        elements.cartesianJogPhiSpeedInput.value = elements.phiSpeedInput.value;
+      }
       markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them.");
       if (state.programWaypoints.length && !state.programExecutionActive) {
         markProgramEdited("Motion settings changed", { inspector: false });

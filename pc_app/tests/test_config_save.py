@@ -45,6 +45,8 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
             "motion": {"command_rate_limit_hz": 14.0, "acceleration_deg_s2": 130.0},
             "path_defaults": {
                 "global_speed_deg_s": 22.0,
+                "tcp_speed_mm_s": 50.0,
+                "phi_speed_deg_s": 40.0,
                 "cartesian_step_mm": 8.0,
                 "planner_type": "trapezoid",
             },
@@ -107,6 +109,8 @@ def test_save_calibration_updates_values_and_preserves_comments(tmp_path):
     assert saved.motion.command_rate_limit_hz == 14.0
     assert saved.motion.acceleration_deg_s2 == 130.0
     assert saved.raw["path_defaults"]["global_speed_deg_s"] == 22.0
+    assert saved.raw["path_defaults"]["tcp_speed_mm_s"] == 50.0
+    assert saved.raw["path_defaults"]["phi_speed_deg_s"] == 40.0
     assert saved.raw["path_defaults"]["planner_type"] == "trapezoid"
     assert saved.raw["camera"]["source_index"] == 1
     assert saved.raw["camera"]["intrinsics"]["fx_px"] == 900.0

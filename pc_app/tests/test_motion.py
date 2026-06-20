@@ -87,6 +87,64 @@ def test_joint_trajectory_uses_requested_profile():
     assert trajectory["segment_durations_s"][1] > 0
 
 
+def test_joint_trajectory_reports_effective_motion_contract():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    start = config.home_pose.copy()
+    target = start.copy()
+    target[2] += 20.0
+
+    trajectory = build_joint_trajectory(
+        start,
+        target,
+        config.joints,
+        {
+            "global_speed_deg_s": 100.0,
+            "global_accel_deg_s2": 1000.0,
+            "per_joint_speed_deg_s": [100.0, 100.0, 2.0, 100.0],
+            "per_joint_accel_deg_s2": [1000.0, 1000.0, 1000.0, 1000.0],
+            "planner_type": "s_curve",
+            "jerk_percent": 40.0,
+            "blend_percent": 20.0,
+        },
+    )
+
+    assert trajectory["ok"]
+    contract = trajectory["motion_contract"]
+    limits = contract["limits"]
+    assert contract["schema"] == "motion_plan_contract_v1"
+    assert contract["path_mode"] == "joint"
+    assert limits["schema"] == "motion_limit_summary_v1"
+    assert limits["effective_joint_speed_deg_s"][2] == 2.0
+    assert limits["limiting_constraint"]["joint_index"] == 2
+    assert limits["limiting_constraint"]["type"] == "speed"
+    assert "jerk_percent and blend_percent do not affect timing" in limits["notes"][0]
+
+
+def test_trapezoid_ramp_is_reported_as_ramp_not_waypoint_blending():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    start = config.home_pose.copy()
+    target = start.copy()
+    target[0] += 10.0
+
+    trajectory = build_joint_trajectory(
+        start,
+        target,
+        config.joints,
+        {
+            "global_speed_deg_s": 30.0,
+            "global_accel_deg_s2": 120.0,
+            "planner_type": "trapezoid",
+            "blend_percent": 30.0,
+        },
+    )
+
+    assert trajectory["ok"]
+    limits = trajectory["limit_summary"]
+    assert limits["profile"] == "trapezoid"
+    assert limits["trapezoid_ramp_fraction"] == approx(0.30)
+    assert any("not waypoint blending" in note for note in limits["notes"])
+
+
 def test_joint_trajectory_rejects_limit_violation():
     config = load_config()
     target = config.home_pose.copy()

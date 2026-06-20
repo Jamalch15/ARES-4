@@ -156,6 +156,50 @@ def test_waypoint_path_uses_queued_trajectory_protocol(monkeypatch):
     assert not any(line.startswith("MOVEJ") for line in fake.sent)
     assert "STATUS" in fake.sent
     assert main.state.motion_diagnostics["result"] == "reached"
+    assert main.state.motion_diagnostics["motion_contract"]["controller_command"]["command"] == "TRAJ"
+    assert main.state.motion_diagnostics["motion_contract"]["controller_command"]["uses_planned_timestamps"] is True
+
+
+def test_joint_endpoint_hardware_reports_movej_command_contract(monkeypatch):
+    reset_hardware_state()
+    start = main.config.home_pose.copy()
+    target = start.copy()
+    target[0] += 1.0
+    fake = FakeSerial(["OK command=MOVEJ hw=mixed"], repeated_status=status_line_for(target))
+    monkeypatch.setattr(main, "serial_client", fake)
+    monkeypatch.setattr(main, "hardware_ready_for_motion", lambda: (True, ""))
+    trajectory = main.build_joint_trajectory(
+        start,
+        target,
+        main.config.joints,
+        {
+            "global_speed_deg_s": 10.0,
+            "global_accel_deg_s2": 20.0,
+            "per_joint_speed_deg_s": [1.0, 10.0, 10.0, 10.0],
+            "per_joint_accel_deg_s2": [20.0, 20.0, 20.0, 20.0],
+        },
+    )
+    preview = {
+        "id": "endpoint-contract",
+        "source": "test",
+        "mode": "joint",
+        "settings": {
+            "global_speed_deg_s": 10.0,
+            "global_accel_deg_s2": 20.0,
+            "per_joint_speed_deg_s": [1.0, 10.0, 10.0, 10.0],
+            "per_joint_accel_deg_s2": [20.0, 20.0, 20.0, 20.0],
+        },
+        "trajectory": trajectory,
+        "motion_contract": trajectory["motion_contract"],
+    }
+
+    asyncio.run(main.execute_joint_endpoint_move(preview))
+
+    contract = main.state.motion_diagnostics["motion_contract"]["controller_command"]
+    assert fake.sent[0].startswith("MOVEJ")
+    assert contract["command"] == "MOVEJ"
+    assert contract["uses_planned_timestamps"] is False
+    assert any("global speed and acceleration" in note for note in contract["notes"])
 
 
 def test_wait_for_hardware_target_times_out_when_status_never_reaches_idle(monkeypatch):

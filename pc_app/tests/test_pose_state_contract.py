@@ -189,17 +189,16 @@ def test_go_home_simulation_moves_on_first_request(monkeypatch):
     async def scenario():
         response = await main.home()
         assert response["ok"]
-        for _ in range(500):
-            apply_simulation_step(main.state, main.limiter, 0.05)
-            await asyncio.sleep(0)
-            if main.state.motion_state == MotionState.IDLE:
-                break
-        await asyncio.wait_for(main.path_task, timeout=1.0)
+        await asyncio.wait_for(main.path_task, timeout=4.0)
         return response
 
     response = asyncio.run(scenario())
 
     assert response["command"] == "home"
+    assert response["preview"]["settings"]["motion_purpose"] == "configured_home_pose_move"
+    assert response["preview"]["settings"]["global_speed_deg_s"] <= main.HOME_SPEED_CAP_DEG_S
+    assert response["preview"]["settings"]["global_accel_deg_s2"] <= main.HOME_ACCEL_CAP_DEG_S2
+    assert response["preview"]["motion_contract"]["controller_command"]["command"] == "SIM_TRAJ"
     assert main.state.reported_angles_deg == pytest.approx(config.home_pose, abs=0.08)
     assert main.state.pose_revision > revision_before
     assert main.state.homed is False
@@ -250,6 +249,8 @@ def test_go_home_hardware_sends_one_move_command_and_no_home_command(monkeypatch
     ]
 
     assert response["command"] == "home"
+    assert response["preview"]["motion_contract"]["controller_command"]["command"] == "MOVEJ"
+    assert response["preview"]["motion_contract"]["controller_command"]["uses_planned_timestamps"] is False
     assert len([line for line in movement_commands if line.startswith("MOVEJ")]) == 1
     assert not any(line.startswith("HOME") for line in movement_commands)
     assert main.state.reported_angles_deg == pytest.approx(config.home_pose)

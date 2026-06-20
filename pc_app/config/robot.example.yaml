@@ -450,6 +450,8 @@ tasks:
 path_defaults:
   global_speed_deg_s: 25.0
   global_accel_deg_s2: 120.0
+  tcp_speed_mm_s: 60.0
+  phi_speed_deg_s: 45.0
   # Live Cartesian servo acceleration. These are working assumptions and
   # should be reduced for first physical tests if the arm feels abrupt.
   tcp_accel_mm_s2: 360.0
@@ -457,7 +459,9 @@ path_defaults:
   waypoint_rate_hz: 12.0
   cartesian_step_mm: 10.0
   planner_type: s_curve
+  # Compatibility field: the current S-curve profile ignores this value.
   jerk_percent: 25.0
+  # Current implementation uses this as trapezoid ramp fraction, not waypoint blending.
   blend_percent: 0.0
 
 tools:

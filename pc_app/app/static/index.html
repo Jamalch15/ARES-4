@@ -513,6 +513,7 @@
                     </div>
                   </div>
                   <div class="settings-field-grid">
+                    <input id="jerkPercentInput" type="hidden" value="25" />
                     <label>Default speed
                       <span class="input-with-unit"><input id="globalSpeedInput" type="number" min="0.1" step="1" /><span>deg/s</span></span>
                     </label>
@@ -532,11 +533,20 @@
                         <option value="linear">Linear test</option>
                       </select>
                     </label>
-                    <label>Smoothing
-                      <span class="input-with-unit"><input id="jerkPercentInput" type="number" min="0" max="45" step="1" value="25" /><span>%</span></span>
-                    </label>
-                    <label>Waypoint blend
+                    <label>Trapezoid ramp
                       <span class="input-with-unit"><input id="blendPercentInput" type="number" min="0" max="45" step="1" value="0" /><span>%</span></span>
+                    </label>
+                    <label>Cart jog TCP speed
+                      <span class="input-with-unit"><input id="tcpSpeedInput" type="number" min="1" step="1" /><span>mm/s</span></span>
+                    </label>
+                    <label>Cart jog TCP acceleration
+                      <span class="input-with-unit"><input id="tcpAccelInput" type="number" min="1" step="10" /><span>mm/s²</span></span>
+                    </label>
+                    <label>Cart jog Phi speed
+                      <span class="input-with-unit"><input id="phiSpeedInput" type="number" min="1" step="1" /><span>deg/s</span></span>
+                    </label>
+                    <label>Cart jog Phi acceleration
+                      <span class="input-with-unit"><input id="phiAccelInput" type="number" min="1" step="10" /><span>deg/s²</span></span>
                     </label>
                   </div>
                   <div class="subsection-heading">

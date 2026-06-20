@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from time import sleep
 
@@ -278,6 +279,74 @@ def test_direct_joint_apply_uses_requested_motion_settings():
     assert trajectory["waypoints"][-1] == target
     assert trajectory["speed_limits_deg_s"][2] == 8.0
     assert trajectory["accel_limits_deg_s2"][2] == 4.0
+    assert trajectory["motion_contract"]["limits"]["effective_joint_speed_deg_s"][2] == 8.0
+    assert payload["preview"]["motion_contract"]["controller_command"]["command"] == "SIM_TRAJ"
+    reset_runtime_state()
+
+
+def test_direct_joint_apply_simulation_executes_timed_trajectory():
+    reset_runtime_state()
+    target = main.config.home_pose.copy()
+    target[0] += 0.5
+    settings = {
+        "global_speed_deg_s": 120.0,
+        "global_accel_deg_s2": 600.0,
+        "waypoint_rate_hz": 30.0,
+        "per_joint_speed_deg_s": [2.0, 120.0, 120.0, 120.0],
+        "per_joint_accel_deg_s2": [600.0, 600.0, 600.0, 600.0],
+    }
+
+    async def scenario():
+        response = await main.start_joint_target_trajectory(target, "test_joint", settings)
+        assert response["ok"], response
+        await main.path_task
+        return response
+
+    response = asyncio.run(scenario())
+    diagnostics = main.state.motion_diagnostics
+
+    assert response["preview"]["trajectory"]["duration_s"] > 0.0
+    assert diagnostics["result"] == "reached"
+    assert diagnostics["expected_duration_s"] == response["preview"]["trajectory"]["duration_s"]
+    assert diagnostics["motion_contract"]["controller_command"]["command"] == "SIM_TRAJ"
+    assert diagnostics["motion_contract"]["controller_command"]["uses_planned_timestamps"] is True
+    assert main.state.reported_angles_deg == approx(target, abs=0.08)
+    reset_runtime_state()
+
+
+def test_direct_joint_apply_and_program_preview_report_consistent_limits():
+    reset_runtime_state()
+    client = TestClient(main.app)
+    target = main.config.home_pose.copy()
+    target[0] += 6.0
+    settings = {
+        "global_speed_deg_s": 18.0,
+        "global_accel_deg_s2": 90.0,
+        "waypoint_rate_hz": 12.0,
+        "per_joint_speed_deg_s": [12.0, 18.0, 18.0, 18.0],
+        "per_joint_accel_deg_s2": [30.0, 90.0, 90.0, 90.0],
+    }
+
+    direct = client.post("/api/joints", json={"angles_deg": target, "settings": settings}).json()
+    assert direct["ok"], direct
+    direct_limits = direct["preview"]["motion_contract"]["limits"]
+    reset_runtime_state()
+
+    program = client.post(
+        "/api/path/preview",
+        json={
+            "mode": "program",
+            "settings": settings,
+            "waypoints": [{"type": "joint", "mode": "joint", "angles_deg": target}],
+        },
+    ).json()
+
+    assert program["ok"], program
+    program_limits = program["preview"]["motion_contract"]["limits"]["segment_limits"][0]
+    assert program["preview"]["motion_contract"]["path_mode"] == "program"
+    assert program_limits["effective_joint_speed_deg_s"] == direct_limits["effective_joint_speed_deg_s"]
+    assert program_limits["effective_joint_accel_deg_s2"] == direct_limits["effective_joint_accel_deg_s2"]
+    assert program_limits["limiting_constraint"] == direct_limits["limiting_constraint"]
     reset_runtime_state()
 
 
@@ -295,6 +364,10 @@ def test_default_path_settings_apply_saved_overrides_and_joint_fallbacks():
         "global_accel_deg_s2",
         main.config.motion.acceleration_deg_s2,
     )
+    assert settings["tcp_speed_mm_s"] == stored.get("tcp_speed_mm_s", 60.0)
+    assert settings["phi_speed_deg_s"] == stored.get("phi_speed_deg_s", 45.0)
+    assert settings["tcp_accel_mm_s2"] == stored.get("tcp_accel_mm_s2", 360.0)
+    assert settings["phi_accel_deg_s2"] == stored.get("phi_accel_deg_s2", 240.0)
     assert settings["waypoint_rate_hz"] == stored.get(
         "waypoint_rate_hz",
         main.config.motion.command_rate_limit_hz,
@@ -325,6 +398,29 @@ def test_cartesian_servo_limits_use_requested_joint_speed_and_acceleration():
     assert limits.joint_accel_deg_s2 == [12.0, 12.0, 12.0, 11.0]
 
 
+def test_cartesian_jog_motion_contract_reports_velocity_limits():
+    settings = main.request_settings(
+        {
+            "tcp_speed_mm_s": 44.0,
+            "phi_speed_deg_s": 33.0,
+            "tcp_accel_mm_s2": 222.0,
+            "phi_accel_deg_s2": 111.0,
+            "global_speed_deg_s": 20.0,
+            "global_accel_deg_s2": 30.0,
+        }
+    )
+
+    contract = main.cartesian_jog_motion_contract(settings)
+    limits = contract["limits"]
+
+    assert contract["path_mode"] == "cartesian_jog"
+    assert limits["tcp_speed_mm_s"] == 44.0
+    assert limits["phi_speed_deg_s"] == 33.0
+    assert limits["tcp_accel_mm_s2"] == 222.0
+    assert limits["phi_accel_deg_s2"] == 111.0
+    assert limits["effective_joint_speed_deg_s"] == [20.0, 20.0, 20.0, 20.0]
+
+
 def test_browser_live_cartesian_jog_uses_continuous_servo_loop():
     app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     payload_body = app_js.split("function cartesianJogPayload()", 1)[1].split(
@@ -333,6 +429,24 @@ def test_browser_live_cartesian_jog_uses_continuous_servo_loop():
     )[0]
 
     assert "dt_s:" not in payload_body
+
+
+def test_motion_settings_labels_are_honest_about_supported_controls():
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    assert "Waypoint blend" not in index_html
+    assert ">Smoothing<" not in index_html
+    assert "Trapezoid ramp" in index_html
+    assert "Cart jog TCP acceleration" in index_html
+    assert "function motionContractHtml" in app_js
+    assert "function syncPlannerControls" in app_js
+    assert "elements.blendPercentInput.disabled = !trapezoidSelected" in app_js
+    assert "motionContractHtml(preview, trajectory)" in app_js
+    assert "motionContractHtml(state.programPreview, trajectory)" in app_js
+    assert "motionContractHtml(diagnostics" in app_js
+    assert "Controller" in app_js
+    assert "controller_command" in app_js
 
 
 def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):

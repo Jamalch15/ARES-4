@@ -95,6 +95,214 @@ def _trapezoid_ramp_fraction(settings: dict[str, Any]) -> float:
     return min(0.45, max(0.05, value))
 
 
+def _joint_duration_components(
+    delta_deg: float,
+    speed_limit_deg_s: float,
+    accel_limit_deg_s2: float,
+    profile: str,
+    ramp_fraction: float,
+) -> dict[str, float]:
+    delta = abs(float(delta_deg))
+    speed = max(float(speed_limit_deg_s), 1e-6)
+    accel = max(float(accel_limit_deg_s2), 1e-6)
+    if delta <= 1e-9:
+        return {"speed_duration_s": 0.0, "accel_duration_s": 0.0, "duration_s": 0.0}
+    if profile == "linear":
+        speed_time = delta / speed
+        accel_time = 0.0
+    elif profile == "trapezoid":
+        ramp = min(0.45, max(0.05, ramp_fraction))
+        speed_time = delta / (speed * (1.0 - ramp))
+        accel_time = sqrt(delta / (accel * ramp * (1.0 - ramp)))
+    else:
+        speed_time = 1.9 * delta / speed
+        accel_time = 2.5 * sqrt(delta / accel)
+    return {
+        "speed_duration_s": speed_time,
+        "accel_duration_s": accel_time,
+        "duration_s": max(speed_time, accel_time),
+    }
+
+
+def _profile_notes(profile: str, settings: dict[str, Any]) -> list[str]:
+    notes: list[str] = []
+    if profile == "s_curve" and (
+        settings.get("jerk_percent") is not None or settings.get("blend_percent") is not None
+    ):
+        notes.append("s_curve uses fixed quintic progress; jerk_percent and blend_percent do not affect timing")
+    if profile == "trapezoid":
+        notes.append("blend_percent is interpreted as trapezoid ramp fraction, not waypoint blending")
+    if profile == "linear":
+        notes.append("linear profile uses constant joint interpolation and ignores acceleration shaping")
+    return notes
+
+
+def _motion_limit_summary(
+    *,
+    path_mode: str,
+    target_type: str,
+    joints: list[JointConfig],
+    deltas_deg: list[float],
+    speed_limits_deg_s: list[float],
+    accel_limits_deg_s2: list[float],
+    profile: str,
+    ramp_fraction: float,
+    settings: dict[str, Any],
+    duration_floor_s: float = 0.0,
+    duration_floor_reason: str = "",
+) -> dict[str, Any]:
+    per_joint: list[dict[str, Any]] = []
+    limiting: dict[str, Any] | None = None
+    joint_limited_duration = 0.0
+
+    for index, (joint, delta, speed, accel) in enumerate(
+        zip(joints, deltas_deg, speed_limits_deg_s, accel_limits_deg_s2, strict=True)
+    ):
+        components = _joint_duration_components(delta, speed, accel, profile, ramp_fraction)
+        duration = float(components["duration_s"])
+        if duration <= 1e-9:
+            constraint = "none"
+        elif components["accel_duration_s"] > components["speed_duration_s"]:
+            constraint = "acceleration"
+        else:
+            constraint = "speed"
+        row = {
+            "joint_index": index,
+            "joint_name": joint.name,
+            "delta_deg": abs(float(delta)),
+            "speed_limit_deg_s": float(speed),
+            "accel_limit_deg_s2": float(accel),
+            "speed_duration_s": float(components["speed_duration_s"]),
+            "accel_duration_s": float(components["accel_duration_s"]),
+            "duration_s": duration,
+            "limiting_constraint": constraint,
+        }
+        per_joint.append(row)
+        if duration > joint_limited_duration + 1e-9:
+            joint_limited_duration = duration
+            limiting = row
+
+    duration_s = joint_limited_duration
+    if duration_floor_s > duration_s + 1e-9:
+        duration_s = float(duration_floor_s)
+        limiting_constraint = {
+            "type": duration_floor_reason or "duration_floor",
+            "joint_index": None,
+            "joint_name": "",
+            "duration_s": duration_s,
+        }
+    elif limiting is not None:
+        limiting_constraint = {
+            "type": limiting["limiting_constraint"],
+            "joint_index": limiting["joint_index"],
+            "joint_name": limiting["joint_name"],
+            "duration_s": limiting["duration_s"],
+        }
+    else:
+        limiting_constraint = {
+            "type": "none",
+            "joint_index": None,
+            "joint_name": "",
+            "duration_s": 0.0,
+        }
+
+    return {
+        "schema": "motion_limit_summary_v1",
+        "path_mode": path_mode,
+        "target_type": target_type,
+        "profile": profile,
+        "duration_s": duration_s,
+        "joint_limited_duration_s": joint_limited_duration,
+        "duration_floor_s": float(duration_floor_s),
+        "duration_floor_reason": duration_floor_reason,
+        "limiting_constraint": limiting_constraint,
+        "effective_joint_speed_deg_s": [float(value) for value in speed_limits_deg_s],
+        "effective_joint_accel_deg_s2": [float(value) for value in accel_limits_deg_s2],
+        "trapezoid_ramp_fraction": ramp_fraction if profile == "trapezoid" else None,
+        "per_joint": per_joint,
+        "notes": _profile_notes(profile, settings),
+    }
+
+
+def _motion_contract(
+    *,
+    path_mode: str,
+    target_type: str,
+    profile: str,
+    duration_s: float,
+    waypoint_count: int,
+    limit_summary: dict[str, Any],
+) -> dict[str, Any]:
+    if path_mode == "linear":
+        interpolation = "sampled Cartesian line with IK at each waypoint"
+    elif path_mode == "program":
+        interpolation = "program sequence of joint or sampled Cartesian segments"
+    else:
+        interpolation = "joint-space interpolation"
+    return {
+        "schema": "motion_plan_contract_v1",
+        "path_mode": path_mode,
+        "target_type": target_type,
+        "profile": profile,
+        "interpolation": interpolation,
+        "duration_s": float(duration_s),
+        "waypoint_count": int(waypoint_count),
+        "limits": limit_summary,
+    }
+
+
+def _program_limit_summary(
+    segment_summaries: list[dict[str, Any]],
+    duration_s: float,
+    waypoint_count: int,
+) -> dict[str, Any]:
+    segment_limits = [
+        summary.get("limit_summary")
+        for summary in segment_summaries
+        if isinstance(summary.get("limit_summary"), dict)
+    ]
+    profiles = sorted({str(summary.get("profile", "")) for summary in segment_summaries if summary.get("profile")})
+    limiting_segment = None
+    limiting_constraint = {
+        "type": "none",
+        "joint_index": None,
+        "joint_name": "",
+        "duration_s": 0.0,
+        "segment_index": None,
+        "segment_label": "",
+    }
+    for summary in segment_summaries:
+        limit = summary.get("limit_summary")
+        if not isinstance(limit, dict):
+            continue
+        constraint = limit.get("limiting_constraint") or {}
+        candidate_duration = float(constraint.get("duration_s") or limit.get("duration_s") or 0.0)
+        if limiting_segment is None or candidate_duration > limiting_constraint["duration_s"]:
+            limiting_segment = summary
+            limiting_constraint = {
+                "type": str(constraint.get("type", "none")),
+                "joint_index": constraint.get("joint_index"),
+                "joint_name": str(constraint.get("joint_name", "")),
+                "duration_s": candidate_duration,
+                "segment_index": int(summary.get("index", 0)),
+                "segment_label": str(summary.get("label", "")),
+            }
+    return {
+        "schema": "motion_limit_summary_v1",
+        "path_mode": "program",
+        "target_type": "program",
+        "profile": profiles[0] if len(profiles) == 1 else "mixed",
+        "duration_s": float(duration_s),
+        "waypoint_count": int(waypoint_count),
+        "limiting_constraint": limiting_constraint,
+        "segment_count": len(segment_summaries),
+        "segment_limits": segment_limits,
+        "notes": [
+            "program limits are reported per segment because step-level settings may differ"
+        ],
+    }
+
+
 def _profile_progress(t: float, profile: str, ramp_fraction: float) -> float:
     t = min(1.0, max(0.0, t))
     if profile == "linear":
@@ -181,18 +389,8 @@ def _joint_delta_duration_s(
 ) -> float:
     duration = 0.0
     for delta, speed, accel in zip(deltas_deg, speed_limits_deg_s, accel_limits_deg_s2, strict=True):
-        if delta <= 1e-9:
-            continue
-        if profile == "linear":
-            speed_time = delta / max(speed, 1e-6)
-            accel_time = 0.0
-        elif profile == "trapezoid":
-            speed_time = delta / (max(speed, 1e-6) * (1.0 - ramp_fraction))
-            accel_time = sqrt(delta / (max(accel, 1e-6) * ramp_fraction * (1.0 - ramp_fraction)))
-        else:
-            speed_time = 1.9 * delta / max(speed, 1e-6)
-            accel_time = 2.5 * sqrt(delta / max(accel, 1e-6))
-        duration = max(duration, speed_time, accel_time)
+        components = _joint_duration_components(delta, speed, accel, profile, ramp_fraction)
+        duration = max(duration, float(components["duration_s"]))
     return duration
 
 
@@ -279,8 +477,28 @@ def build_joint_trajectory(
     )
     profile = _profile_name(settings)
     ramp_fraction = _trapezoid_ramp_fraction(settings)
-    duration_s = _segment_duration_s(start_deg, target_deg, speed_limits, accel_limits, profile, ramp_fraction)
+    deltas = [abs(end - start) for start, end in zip(start_deg, target_deg, strict=True)]
+    duration_s = _joint_delta_duration_s(deltas, speed_limits, accel_limits, profile, ramp_fraction)
+    limit_summary = _motion_limit_summary(
+        path_mode="joint",
+        target_type="joint_angles",
+        joints=joints,
+        deltas_deg=deltas,
+        speed_limits_deg_s=speed_limits,
+        accel_limits_deg_s2=accel_limits,
+        profile=profile,
+        ramp_fraction=ramp_fraction,
+        settings=settings,
+    )
     if duration_s <= 1e-9:
+        contract = _motion_contract(
+            path_mode="joint",
+            target_type="joint_angles",
+            profile=profile,
+            duration_s=0.0,
+            waypoint_count=1,
+            limit_summary=limit_summary,
+        )
         return {
             "ok": True,
             "mode": "joint",
@@ -290,6 +508,10 @@ def build_joint_trajectory(
             "waypoints": [target_deg],
             "segment_durations_s": [0.0],
             "time_from_start_s": [0.0],
+            "speed_limits_deg_s": speed_limits,
+            "accel_limits_deg_s2": accel_limits,
+            "limit_summary": limit_summary,
+            "motion_contract": contract,
             "errors": [],
         }
 
@@ -304,6 +526,14 @@ def build_joint_trajectory(
 
     segment_duration = duration_s / max(steps - 1, 1)
     segment_durations = [0.0] + [segment_duration for _ in waypoints[1:]]
+    contract = _motion_contract(
+        path_mode="joint",
+        target_type="joint_angles",
+        profile=profile,
+        duration_s=duration_s,
+        waypoint_count=len(waypoints),
+        limit_summary=limit_summary,
+    )
     return {
         "ok": True,
         "mode": "joint",
@@ -315,6 +545,8 @@ def build_joint_trajectory(
         "time_from_start_s": _cumulative_times(segment_durations),
         "speed_limits_deg_s": speed_limits,
         "accel_limits_deg_s2": accel_limits,
+        "limit_summary": limit_summary,
+        "motion_contract": contract,
         "errors": [],
     }
 
@@ -440,8 +672,22 @@ def build_linear_cartesian_trajectory(
     profile = _profile_name(settings)
     ramp_fraction = _trapezoid_ramp_fraction(settings)
     path_deltas = _joint_path_deltas(waypoints)
+    duration_floor_s = (len(waypoints) - 1) / waypoint_rate_hz
     duration_s = _joint_delta_duration_s(path_deltas, speed_limits, accel_limits, profile, ramp_fraction)
-    duration_s = max(duration_s, (len(waypoints) - 1) / waypoint_rate_hz)
+    duration_s = max(duration_s, duration_floor_s)
+    limit_summary = _motion_limit_summary(
+        path_mode="linear",
+        target_type="cartesian_pose",
+        joints=joints,
+        deltas_deg=path_deltas,
+        speed_limits_deg_s=speed_limits,
+        accel_limits_deg_s2=accel_limits,
+        profile=profile,
+        ramp_fraction=ramp_fraction,
+        settings=settings,
+        duration_floor_s=duration_floor_s,
+        duration_floor_reason="waypoint_rate",
+    )
     segment_distances = [
         _joint_segment_distance(start, end)
         for start, end in zip(waypoints, waypoints[1:], strict=False)
@@ -458,6 +704,14 @@ def build_linear_cartesian_trajectory(
             for distance in segment_distances
         ]
 
+    contract = _motion_contract(
+        path_mode="linear",
+        target_type="cartesian_pose",
+        profile=profile,
+        duration_s=duration_s,
+        waypoint_count=len(waypoints),
+        limit_summary=limit_summary,
+    )
     return {
         "ok": True,
         "mode": "linear",
@@ -470,6 +724,8 @@ def build_linear_cartesian_trajectory(
         "time_from_start_s": _cumulative_times(segment_durations),
         "speed_limits_deg_s": speed_limits,
         "accel_limits_deg_s2": accel_limits,
+        "limit_summary": limit_summary,
+        "motion_contract": contract,
         "ik_results": ik_results,
         "errors": [],
     }
@@ -742,6 +998,8 @@ def build_program_trajectory(
             "duration_s": segment.get("duration_s", 0.0),
             "waypoint_count": segment.get("waypoint_count", 0),
             "profile": segment.get("profile", _profile_name(waypoint_settings)),
+            "limit_summary": segment.get("limit_summary"),
+            "motion_contract": segment.get("motion_contract"),
         }
         segment_summaries.append(summary)
         step_results.append(
@@ -753,13 +1011,23 @@ def build_program_trajectory(
             }
         )
 
+    duration_s = sum(combined_durations)
+    limit_summary = _program_limit_summary(segment_summaries, duration_s, len(combined_waypoints))
+    contract = _motion_contract(
+        path_mode="program",
+        target_type="program",
+        profile=str(limit_summary.get("profile", _profile_name(settings))),
+        duration_s=duration_s,
+        waypoint_count=len(combined_waypoints),
+        limit_summary=limit_summary,
+    )
     return {
         "ok": True,
         "mode": "program",
         "step_count": len(waypoints),
         "move_count": move_count,
         "profile": _profile_name(settings),
-        "duration_s": sum(combined_durations),
+        "duration_s": duration_s,
         "waypoint_count": len(combined_waypoints),
         "waypoints": combined_waypoints,
         "segment_durations_s": combined_durations,
@@ -767,5 +1035,7 @@ def build_program_trajectory(
         "segments": segment_summaries,
         "step_results": step_results,
         "cartesian_waypoints": cartesian_waypoints,
+        "limit_summary": limit_summary,
+        "motion_contract": contract,
         "errors": [],
     }

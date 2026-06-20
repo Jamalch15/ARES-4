@@ -506,6 +506,41 @@ def test_task_preview_requires_detections_and_valid_motion_settings(monkeypatch)
     assert "planner_type" in invalid_motion["error"]
 
 
+def test_task_preview_carries_program_motion_contract(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": [detection("red")],
+            "settings": {
+                "global_speed_deg_s": 25,
+                "global_accel_deg_s2": 120,
+                "waypoint_rate_hz": 12,
+                "cartesian_step_mm": 10,
+                "planner_type": "s_curve",
+                "per_joint_speed_deg_s": [45, 35, 60, 80],
+                "per_joint_accel_deg_s2": [12, 12, 18, 22],
+            },
+        },
+    ).json()
+
+    assert payload["ok"], payload
+    contract = payload["preview"]["motion_contract"]
+    assert contract["path_mode"] == "program"
+    assert contract["limits"]["path_mode"] == "program"
+    assert contract["limits"]["segment_limits"]
+    assert contract["limits"]["limiting_constraint"]["type"] in {"speed", "acceleration", "waypoint_rate"}
+
+
 @pytest.mark.parametrize(
     ("preview_patch", "message"),
     [
