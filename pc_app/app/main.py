@@ -5,8 +5,10 @@ import hashlib
 import subprocess
 import shutil
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
@@ -26,10 +28,21 @@ from .apriltag_calibration import (
     estimate_camera_pose,
 )
 from .cartesian_servo import CartesianServo, CartesianServoLimits
+from .cartesian_calibration import (
+    calibration_settings as kinematics_calibration_settings,
+    calibration_summary as kinematics_calibration_summary,
+    correct_cartesian_target,
+    correct_waypoint_program,
+    create_sample as create_kinematics_calibration_sample,
+    fit_profile as fit_kinematics_calibration_profile,
+    predict_physical_pose,
+    workspace_context as kinematics_workspace_context,
+)
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
     camera_settings,
     calibration_settings,
+    color_sorting_task_defaults,
     color_profiles,
     drop_zones,
     encoder_settings,
@@ -75,7 +88,15 @@ from .robot_state import MotionState, RobotState
 from .safety import validate_can_move, validate_joint_targets
 from .serial_client import SerialClient, SerialClientError
 from .simulator import apply_simulation_step
-from .tasks import build_batch_sorting_sequence, build_pick_and_place_sequence, build_sorting_sequence
+from .tasks import (
+    build_batch_sorting_sequence,
+    build_color_sorting_plan,
+    build_pick_and_place_sequence,
+    build_sorting_sequence,
+    named_position_waypoint,
+    normalize_color_sorting_settings,
+    TaskSettingsError,
+)
 from .vision import (
     CameraCapture,
     VisionPipeline,
@@ -213,11 +234,15 @@ path_task: asyncio.Task[None] | None = None
 path_task_source: str | None = None
 live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
+task_selection_events: dict[str, asyncio.Event] = {}
+task_selection_choices: dict[str, str] = {}
+simulation_vision_queue: list[dict[str, Any]] = []
 cartesian_jog_task: asyncio.Task[None] | None = None
 event_log = EventLog()
 active_motion_run_id: str | None = None
 simulation_trajectory_active = False
 MAX_TRAJECTORY_UPLOAD_POINTS = 220
+TASK_PREVIEW_TTL_S = 600.0
 CARTESIAN_JOG_STALE_S = 0.35
 cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
@@ -300,10 +325,13 @@ class PathPreviewRequest(BaseModel):
     branch: str = "auto"
     settings: PathSettingsRequest | None = None
     waypoints: list[dict[str, Any]] | None = None
+    apply_calibration: bool = True
+    program_revision: int | None = None
 
 
 class PathExecuteRequest(BaseModel):
     preview_id: str
+    program_revision: int | None = None
 
 
 class LiveMotionRequest(BaseModel):
@@ -340,11 +368,13 @@ class CalibrationRequest(BaseModel):
     color_profiles: dict[str, dict[str, Any]] | None = None
     drop_zones: dict[str, dict[str, Any]] | None = None
     task_defaults: dict[str, Any] | None = None
+    tasks: dict[str, Any] | None = None
     path_defaults: dict[str, Any] | None = None
     tool: dict[str, Any] | None = None
     tools: dict[str, Any] | None = None
     encoders: dict[str, Any] | None = None
     calibration: dict[str, Any] | None = None
+    kinematics_calibration: dict[str, Any] | None = None
     geometry: dict[str, Any] | None = None
 
 
@@ -382,6 +412,10 @@ class VisionProjectRequest(BaseModel):
     detections: list[dict[str, Any]]
 
 
+class SimulationVisionQueueRequest(BaseModel):
+    frames: list[dict[str, Any]]
+
+
 class WorkspaceCalibrationRequest(BaseModel):
     image_b64: str | None = None
 
@@ -409,11 +443,49 @@ class TaskPreviewRequest(BaseModel):
     drop_zone: str | dict[str, Any] | None = None
     detection: dict[str, Any] | None = None
     settings: PathSettingsRequest | None = None
+    task_settings: dict[str, Any] | None = None
+    selected_detection_ids: list[str] | None = None
     branch: str = "auto"
 
 
 class TaskExecuteRequest(BaseModel):
     preview_id: str
+
+
+class TaskSelectionRequest(BaseModel):
+    run_id: str
+    detection_id: str
+
+
+class KinematicsCalibrationTargetsRequest(BaseModel):
+    rows: int = 3
+    columns: int = 4
+    margin_mm: float = 25.0
+    z_mm: float = 45.0
+    phi_deg: float = 0.0
+    apply_calibration: bool = False
+
+
+class KinematicsCalibrationSampleRequest(BaseModel):
+    intended_target: dict[str, Any]
+    command_target: dict[str, Any] | None = None
+    measured: dict[str, Any]
+    role: str = "fit"
+    quality: float = 1.0
+    measurement_source: dict[str, Any] | None = None
+    joint_source: str = "reported"
+    notes: str = ""
+
+
+class KinematicsCalibrationFitRequest(BaseModel):
+    model_type: str = "affine_xy_z_offset"
+    profile_key: str | None = None
+    enable_after_fit: bool = False
+
+
+class KinematicsCalibrationEnableRequest(BaseModel):
+    enabled: bool
+    profile_key: str | None = None
 
 
 def public_config() -> dict[str, Any]:
@@ -433,11 +505,15 @@ def public_config() -> dict[str, Any]:
         "color_profiles": color_profiles(config),
         "drop_zones": drop_zones(config),
         "task_defaults": task_defaults(config),
+        "tasks": {
+            "color_sorting": color_sorting_task_defaults(config),
+        },
         "path_defaults": default_path_settings(),
         "tool": tool_settings(config),
         "tools": tools_settings(config),
         "encoders": encoder_settings(config),
         "calibration": calibration_settings(config),
+        "kinematics_calibration": kinematics_calibration_summary(config),
         "geometry": geometry_settings(config),
         "validation": {
             "model_warnings": model_validation_warnings(config),
@@ -736,6 +812,64 @@ def request_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> d
     return merged
 
 
+def validated_task_path_settings(settings: PathSettingsRequest | dict[str, Any] | None) -> dict[str, Any]:
+    merged = request_settings(settings)
+    errors: list[str] = []
+
+    def positive_number(key: str) -> None:
+        value = merged.get(key)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be a finite positive number")
+            return
+        if not isfinite(number) or number <= 0.0:
+            errors.append(f"{key} must be a finite positive number")
+        else:
+            merged[key] = number
+
+    for key in ("global_speed_deg_s", "global_accel_deg_s2", "waypoint_rate_hz", "cartesian_step_mm"):
+        positive_number(key)
+
+    planner = str(merged.get("planner_type", "s_curve")).strip().lower().replace("-", "_")
+    if planner not in {"s_curve", "scurve", "linear", "none", "trapezoid"}:
+        errors.append("planner_type must be s_curve, trapezoid, or linear")
+    merged["planner_type"] = planner
+
+    for key in ("jerk_percent", "blend_percent"):
+        try:
+            number = float(merged.get(key))
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be between 0 and 100")
+            continue
+        if not isfinite(number) or not 0.0 <= number <= 100.0:
+            errors.append(f"{key} must be between 0 and 100")
+        else:
+            merged[key] = number
+
+    for key in ("per_joint_speed_deg_s", "per_joint_accel_deg_s2"):
+        values = merged.get(key)
+        if not isinstance(values, list) or len(values) != len(config.joints):
+            errors.append(f"{key} must contain exactly {len(config.joints)} positive values")
+            continue
+        normalized: list[float] = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = float("nan")
+            if not isfinite(number) or number <= 0.0:
+                errors.append(f"{key} must contain exactly {len(config.joints)} positive values")
+                break
+            normalized.append(number)
+        else:
+            merged[key] = normalized
+
+    if errors:
+        raise TaskSettingsError("; ".join(dict.fromkeys(errors)))
+    return merged
+
+
 def reset_cartesian_jog_runtime() -> None:
     global cartesian_jog_task
     try:
@@ -794,11 +928,12 @@ def _cartesian_servo_period_s() -> float:
 
 
 def _cartesian_servo_limits(settings: dict[str, Any]) -> CartesianServoLimits:
-    speed_limits, _ = _joint_limits_from_settings(settings)
+    speed_limits, accel_limits = _joint_limits_from_settings(settings)
     tcp_accel = float(settings.get("tcp_accel_mm_s2") or 360.0)
     phi_accel = float(settings.get("phi_accel_deg_s2") or 240.0)
     return CartesianServoLimits(
         joint_speed_deg_s=speed_limits,
+        joint_accel_deg_s2=accel_limits,
         tcp_accel_mm_s2=max(1.0, tcp_accel),
         phi_accel_deg_s2=max(1.0, phi_accel),
     )
@@ -816,6 +951,90 @@ def cancel_motion_tasks() -> None:
     cancel_task(task_task)
     reset_cartesian_jog_runtime()
     active_motion_run_id = None
+
+
+ACTIVE_TASK_STATUSES = {"queued", "running", "capturing", "planning", "executing", "waiting_for_selection", "stopping"}
+TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped"}
+
+
+def update_task_execution(**updates: Any) -> dict[str, Any]:
+    payload = dict(state.task_execution or {})
+    payload.update(updates)
+    payload["updated_at"] = time()
+    state.task_execution = payload
+    state.updated_at = time()
+    return payload
+
+
+def start_task_execution_state(
+    *,
+    run_id: str,
+    preview_id: str,
+    task: str,
+    strategy: str,
+    total_objects: int,
+    settings: dict[str, Any],
+) -> None:
+    state.task_execution = {
+        "run_id": run_id,
+        "preview_id": preview_id,
+        "task": task,
+        "strategy": strategy,
+        "status": "queued",
+        "phase": "queued",
+        "current_object": None,
+        "current_step": None,
+        "completed_count": 0,
+        "remaining_count": max(0, total_objects),
+        "total_count": max(0, total_objects),
+        "latest_capture": None,
+        "ignored_objects": [],
+        "candidate_objects": [],
+        "tool_feedback": {"available": False, "status": "not_implemented"},
+        "holding_uncertain": False,
+        "warnings": [],
+        "terminal_reason": None,
+        "settings": settings,
+        "started_at": time(),
+        "updated_at": time(),
+    }
+    state.updated_at = time()
+
+
+def finish_task_execution(status: str, reason: str, *, holding_uncertain: bool = False) -> None:
+    if not state.task_execution:
+        return
+    if state.task_execution.get("status") in TERMINAL_TASK_STATUSES:
+        return
+    update_task_execution(
+        status=status,
+        phase=status,
+        terminal_reason=reason,
+        holding_uncertain=holding_uncertain,
+        finished_at=time(),
+    )
+
+
+def task_active() -> bool:
+    return (state.task_execution or {}).get("status") in ACTIVE_TASK_STATUSES
+
+
+def task_motion_gate_reason() -> str | None:
+    if not state.simulation and not state.hardware_armed:
+        return "task execution requires the Armed toggle"
+    if not state.simulation:
+        ready, reason = hardware_ready_for_motion()
+        if not ready:
+            return reason
+        tool_errors = active_tool_hardware_errors()
+        if tool_errors:
+            return "; ".join(tool_errors)
+        if not calibration_settings(config).get("tool_dimensions_validated", False):
+            return "task execution requires validated active-tool dimensions"
+    can_move = validate_can_move(state)
+    if not can_move.ok:
+        return can_move.reason
+    return None
 
 
 def disable_live_motion(command: str | None = None) -> None:
@@ -1280,14 +1499,32 @@ def build_preview(
     settings: dict[str, Any],
     branch: str,
     source: str = "preview",
+    apply_calibration: bool = True,
+    program_revision: int | None = None,
 ) -> dict[str, Any]:
     mode = mode.lower()
     ik_result: dict[str, Any] | None = None
+    calibration_compatible = links == config.links
+    calibration_requested = bool(apply_calibration and calibration_compatible)
+    calibration_metadata: dict[str, Any] | list[dict[str, Any]] | None = None
+    command_target: dict[str, Any] = {}
 
     if waypoint_program:
+        prepared_program, corrections = correct_waypoint_program(
+            waypoint_program,
+            config,
+            apply_enabled=calibration_requested,
+        )
+        if apply_calibration and not calibration_compatible:
+            for correction in corrections:
+                correction["reason"] = "kinematics_override"
+                correction["warnings"] = [
+                    *correction.get("warnings", []),
+                    "Cartesian calibration is not applied while previewing overridden link geometry",
+                ]
         trajectory = build_program_trajectory(
             state.reported_angles_deg,
-            waypoint_program,
+            prepared_program,
             links,
             config.joints,
             settings,
@@ -1297,20 +1534,66 @@ def build_preview(
             return {
                 "ok": False,
                 "error": "; ".join(trajectory.get("errors", [])) or "program preview failed",
+                "diagnostic_category": "ik_reachability",
+                "calibration": corrections,
                 "trajectory": trajectory,
             }
+        if any(correction.get("applied") for correction in corrections):
+            trajectory["requested_cartesian_waypoints"] = [
+                correction["requested_target"] for correction in corrections
+            ]
+            trajectory["physical_cartesian_waypoints"] = [
+                predict_physical_pose(forward_kinematics(angles, links), config)
+                for angles in trajectory.get("waypoints", [])
+            ]
         preview_target = target or {}
         preview_mode = "program"
+        calibration_metadata = corrections
     else:
         if target is None:
             return {"ok": False, "error": "path preview requires target or waypoints"}
-        ik_result = inverse_kinematics(target, links, config.joints, state.reported_angles_deg, branch)
+        requested_target = deepcopy(target)
+        command_target, correction = correct_cartesian_target(
+            requested_target,
+            config,
+            apply_enabled=calibration_requested,
+        )
+        if apply_calibration and not calibration_compatible:
+            correction["reason"] = "kinematics_override"
+            correction["warnings"] = [
+                *correction.get("warnings", []),
+                "Cartesian calibration is not applied while previewing overridden link geometry",
+            ]
+        calibration_metadata = correction
+        ik_result = inverse_kinematics(
+            command_target,
+            links,
+            config.joints,
+            state.reported_angles_deg,
+            branch,
+        )
         if not ik_result["ok"] or not ik_result["selected"]:
-            return {"ok": False, "error": "IK target has no valid solution", "ik": ik_result}
+            return {
+                "ok": False,
+                "error": "IK target has no valid solution",
+                "diagnostic_category": "ik_reachability",
+                "requested_target": requested_target,
+                "command_target": command_target,
+                "calibration": correction,
+                "ik": ik_result,
+            }
 
-        resolved_target = dict(ik_result["target"])
+        resolved_command_target = dict(ik_result["target"])
+        resolved_target = deepcopy(requested_target)
+        resolved_target["x_mm"] = float(requested_target["x_mm"])
+        resolved_target["y_mm"] = float(requested_target["y_mm"])
+        resolved_target["z_mm"] = float(requested_target["z_mm"])
+        resolved_target["phi_deg"] = float(resolved_command_target["phi_deg"])
+        if bool(requested_target.get("phi_auto", False)) or requested_target.get("phi_deg") is None:
+            resolved_target["phi_auto"] = True
+        command_target = resolved_command_target
         if mode == "linear":
-            movement_target = dict(resolved_target)
+            movement_target = dict(resolved_command_target)
             movement_target["phi_auto"] = False
             trajectory = build_linear_cartesian_trajectory(
                 state.reported_angles_deg,
@@ -1332,9 +1615,19 @@ def build_preview(
             return {
                 "ok": False,
                 "error": "; ".join(trajectory.get("errors", [])) or "path preview failed",
+                "diagnostic_category": "ik_reachability",
+                "requested_target": resolved_target,
+                "command_target": resolved_command_target,
+                "calibration": correction,
                 "ik": ik_result,
                 "trajectory": trajectory,
             }
+        if correction.get("applied"):
+            trajectory["requested_cartesian_waypoints"] = [resolved_target]
+            trajectory["physical_cartesian_waypoints"] = [
+                predict_physical_pose(forward_kinematics(angles, links), config)
+                for angles in trajectory.get("waypoints", [])
+            ]
         preview_target = resolved_target
         preview_mode = mode
 
@@ -1345,11 +1638,15 @@ def build_preview(
         "source": source,
         "mode": preview_mode,
         "target": preview_target,
+        "command_target": command_target,
+        "calibration": calibration_metadata,
         "settings": settings,
         "ik": ik_result,
         "trajectory": trajectory,
         "completion_feedback": "timed + STATUS estimate for hardware",
     }
+    if preview_mode == "program":
+        preview["program_revision"] = program_revision
     path_previews[preview_id] = preview
     for stale_id, stale in list(path_previews.items()):
         if time() - stale.get("created_at", 0.0) > 600:
@@ -1604,9 +1901,23 @@ async def execute_joint_endpoint_move(preview: dict[str, Any]) -> None:
 async def execute_simulated_waypoint_trajectory(trajectory: dict[str, Any], run_id: str) -> None:
     global simulation_trajectory_active
     waypoints = [[float(value) for value in waypoint] for waypoint in trajectory.get("waypoints", [])]
-    if len(waypoints) < 2:
-        state.set_error("simulation trajectory requires at least two waypoints", fault=True)
-        finish_motion_diagnostics("failed", state.last_error, run_id)
+    if len(waypoints) == 1:
+        final_target = waypoints[0]
+        state.target_angles_deg = final_target.copy()
+        state.reported_angles_deg = final_target.copy()
+        state.fk = forward_kinematics(final_target, config.links)
+        limiter.reset(final_target)
+        state.motion_state = MotionState.IDLE
+        state.clear_error()
+        update_motion_diagnostics(
+            run_id,
+            execution_state="reached",
+            result="reached",
+            current_waypoint_index=1,
+            current_waypoint_total=1,
+            active_target_deg=final_target,
+        )
+        finish_motion_diagnostics("reached", run_id=run_id)
         await broadcast_state()
         return
 
@@ -1692,6 +2003,22 @@ async def execute_waypoint_path(preview: dict[str, Any]) -> None:
     if not waypoints:
         state.set_error("trajectory has no waypoints", fault=True)
         finish_motion_diagnostics("failed", state.last_error, run_id)
+        await broadcast_state()
+        return
+
+    if len(waypoints) == 1 and has_reached_target(
+        state.reported_angles_deg,
+        [float(value) for value in waypoints[0]],
+        tolerance_deg=0.08,
+    ):
+        final_target = [float(value) for value in waypoints[0]]
+        state.target_angles_deg = final_target.copy()
+        state.reported_angles_deg = final_target.copy()
+        state.fk = forward_kinematics(final_target, config.links)
+        limiter.reset(final_target)
+        state.motion_state = MotionState.IDLE
+        state.clear_error()
+        finish_motion_diagnostics("reached", run_id=run_id)
         await broadcast_state()
         return
 
@@ -1927,24 +2254,61 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
     return {"ok": True, "command": command, "state": state.to_dict()}
 
 
-async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, Any], branch: str) -> None:
+async def execute_task_sequence(
+    sequence: dict[str, Any],
+    settings: dict[str, Any],
+    branch: str,
+    *,
+    terminal_on_finish: bool = True,
+) -> dict[str, Any]:
+    failed_reason: str | None = None
+    stopped = False
+    cancelled = False
     try:
         steps = sequence.get("steps", [])
         for step_index, step in enumerate(steps, start=1):
             if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
                 log_event("task", "task aborted", state=state.motion_state.value)
+                stopped = True
                 break
             label = str(step.get("label", step.get("kind", "step")))
+            update_task_execution(
+                status="executing",
+                phase="executing_sequence",
+                current_step={
+                    "label": label,
+                    "index": step_index,
+                    "total": len(steps),
+                    "kind": step.get("kind"),
+                },
+                current_object={
+                    "index": step.get("object_index"),
+                    "detection_id": step.get("detection_id"),
+                    "color": step.get("color"),
+                    "drop_zone": step.get("drop_zone"),
+                    "grid_slot": step.get("grid_slot"),
+                },
+            )
+            await broadcast_state()
             log_event("task", label)
             if step.get("kind") == "tool":
                 result = await apply_tool_action(str(step.get("action", "open")), step.get("value"))
                 if not result["ok"]:
+                    failed_reason = result.get("error") or "tool action failed"
                     break
-                await asyncio.sleep(0.15)
+                update_task_execution(
+                    tool_feedback={
+                        "available": False,
+                        "status": state.tool_state,
+                        "commanded": True,
+                    }
+                )
+                await asyncio.sleep(max(0.0, float(settings.get("tool_action_delay_ms", 150)) / 1000.0))
                 continue
             waypoint = step.get("waypoint")
             if not isinstance(waypoint, dict):
                 state.set_error(f"task step {label} is missing a waypoint")
+                failed_reason = state.last_error
                 break
             preview_result = build_preview(
                 mode="program",
@@ -1957,6 +2321,7 @@ async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, An
             )
             if not preview_result["ok"]:
                 state.set_error(preview_result.get("error", f"task step {label} preview failed"))
+                failed_reason = state.last_error
                 break
             preview = preview_result["preview"]
             preview["task_step_label"] = label
@@ -1967,11 +2332,336 @@ async def execute_task_sequence(sequence: dict[str, Any], settings: dict[str, An
                 await execute_joint_endpoint_move(preview)
             else:
                 await execute_waypoint_path(preview)
+            if state.motion_state == MotionState.FAULT or state.motion_execution_state == "failed":
+                failed_reason = state.last_error or "task motion step failed"
+                break
+            if state.motion_state in {MotionState.ESTOP, MotionState.STOPPED}:
+                stopped = True
+                break
+
+            object_index = step.get("object_index")
+            next_object_index = (
+                steps[step_index].get("object_index")
+                if step_index < len(steps) and isinstance(steps[step_index], dict)
+                else None
+            )
+            if object_index is not None and next_object_index != object_index:
+                completed = max(
+                    int((state.task_execution or {}).get("completed_count", 0)),
+                    int(object_index),
+                )
+                total = int((state.task_execution or {}).get("total_count", completed))
+                update_task_execution(
+                    completed_count=completed,
+                    remaining_count=max(0, total - completed),
+                )
+        return {
+            "ok": failed_reason is None and not stopped and state.motion_state != MotionState.FAULT,
+            "error": failed_reason or (state.motion_state.value if stopped else ""),
+        }
     except asyncio.CancelledError:
+        cancelled = True
         log_event("task", "task cancelled")
+        if terminal_on_finish:
+            finish_task_execution("stopped", "task cancelled", holding_uncertain=True)
         raise
     finally:
+        if terminal_on_finish and not cancelled:
+            if failed_reason:
+                finish_task_execution("failed", failed_reason, holding_uncertain=True)
+            elif stopped:
+                finish_task_execution("stopped", state.motion_state.value, holding_uncertain=True)
+            elif state.motion_state == MotionState.FAULT:
+                finish_task_execution("failed", state.last_error or "task motion fault", holding_uncertain=True)
+            else:
+                total = int((state.task_execution or {}).get("total_count", 0))
+                update_task_execution(completed_count=total, remaining_count=0)
+                finish_task_execution("completed", "sequence complete")
         await broadcast_state()
+
+
+async def move_task_named_position(name: str, settings: dict[str, Any], branch: str, label: str) -> dict[str, Any]:
+    waypoint = named_position_waypoint(config, name)
+    if waypoint is None:
+        return {"ok": False, "error": f"named position {name} is missing"}
+    sequence = {
+        "ok": True,
+        "task": "task_position",
+        "steps": [{"kind": "move", "label": label, "waypoint": waypoint}],
+        "waypoints": [waypoint],
+    }
+    return await execute_task_sequence(sequence, settings, branch, terminal_on_finish=False)
+
+
+def simulation_vision_status() -> dict[str, Any]:
+    return {
+        "queued_frames": len(simulation_vision_queue),
+        "remaining_frames": len(simulation_vision_queue),
+        "simulation": state.simulation,
+    }
+
+
+def simulation_vision_payload(*, consume: bool) -> dict[str, Any]:
+    if not state.simulation:
+        raise RuntimeError("synthetic vision is available only in simulation")
+    if not simulation_vision_queue:
+        raise RuntimeError("simulation vision queue is empty")
+    frame = deepcopy(simulation_vision_queue[0])
+    if consume:
+        simulation_vision_queue.pop(0)
+    detections = frame.get("detections")
+    if not isinstance(detections, list):
+        raise RuntimeError("simulation vision frame detections must be a list")
+    workspace = frame.get("workspace")
+    if not isinstance(workspace, dict):
+        workspace = {
+            "status": "simulated",
+            "message": "synthetic simulation detections",
+            "visible_ids": [],
+            "missing_ids": [],
+        }
+    return {
+        "ok": True,
+        "captured_at": time(),
+        "detections": deepcopy(detections),
+        "workspace": deepcopy(workspace),
+        "provider": str(frame.get("provider") or "simulation_queue"),
+        "calibration_source": str(frame.get("calibration_source") or "simulation_queue"),
+        "synthetic": True,
+        "queue": simulation_vision_status(),
+    }
+
+
+async def closed_loop_capture() -> dict[str, Any]:
+    if state.simulation:
+        return simulation_vision_payload(consume=True)
+    camera = camera_settings(config)
+    image = await asyncio.to_thread(capture_camera_frame, camera)
+    result = vision_pipeline.process(image, camera, color_profiles(config))
+    return {
+        "ok": True,
+        "captured_at": time(),
+        "detections": result["detections"],
+        "workspace": result["workspace"],
+        "provider": result["provider"],
+        "calibration_source": result["calibration_source"],
+    }
+
+
+async def wait_for_manual_task_selection(run_id: str, candidates: list[dict[str, Any]]) -> str:
+    event = asyncio.Event()
+    task_selection_events[run_id] = event
+    update_task_execution(
+        status="waiting_for_selection",
+        phase="waiting_for_selection",
+        candidate_objects=candidates,
+        current_step={"label": "manual selection", "kind": "operator"},
+    )
+    await broadcast_state()
+    try:
+        await event.wait()
+        return task_selection_choices.pop(run_id, "")
+    finally:
+        task_selection_events.pop(run_id, None)
+
+
+async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
+    run_id = str((state.task_execution or {}).get("run_id") or uuid4())
+    task_settings = normalize_color_sorting_settings(config, preview.get("task_settings"))
+    path_settings = preview.get("settings", {})
+    branch = preview.get("branch", "auto")
+    completed = 0
+    grid_zone_counts: dict[str, int] = {}
+    terminal_reason = ""
+    try:
+        while completed < int(task_settings.get("max_objects", 1)):
+            gate_reason = task_motion_gate_reason()
+            if gate_reason:
+                state.set_error(gate_reason)
+                finish_task_execution("failed", gate_reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            update_task_execution(
+                status="running",
+                phase="moving_camera_clear",
+                completed_count=completed,
+                remaining_count=max(0, int(task_settings.get("max_objects", 1)) - completed),
+                current_step={"label": "camera clear", "kind": "move"},
+            )
+            await broadcast_state()
+            clear_result = await move_task_named_position(
+                str(task_settings.get("camera_clear_position") or task_settings.get("safe_position") or "safe"),
+                path_settings,
+                branch,
+                "camera clear",
+            )
+            if not clear_result.get("ok"):
+                reason = clear_result.get("error") or "camera-clear move failed"
+                state.set_error(reason)
+                finish_task_execution("failed", reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            await asyncio.sleep(max(0.0, float(task_settings.get("capture_settle_ms", 0)) / 1000.0))
+            update_task_execution(
+                status="capturing",
+                phase="capturing",
+                current_step={"label": "capture", "kind": "vision"},
+            )
+            await broadcast_state()
+            try:
+                capture = await closed_loop_capture()
+            except Exception as exc:
+                reason = f"closed-loop capture failed: {exc}"
+                state.set_error(reason)
+                finish_task_execution("failed", reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            update_task_execution(
+                status="planning",
+                phase="planning",
+                latest_capture={
+                    "captured_at": capture["captured_at"],
+                    "detection_count": len(capture.get("detections", [])),
+                    "provider": capture.get("provider"),
+                    "calibration_source": capture.get("calibration_source"),
+                    "workspace": capture.get("workspace"),
+                },
+            )
+            await broadcast_state()
+            plan = build_color_sorting_plan(
+                config,
+                capture.get("detections", []),
+                color_profiles(config),
+                task_settings={
+                    **task_settings,
+                    "execution_strategy": "closed_loop",
+                    "_initial_zone_counts": grid_zone_counts,
+                },
+            )
+            metadata = plan.get("task_preview", {})
+            if plan.get("selection_required"):
+                candidates = metadata.get("candidate_objects", [])
+                update_task_execution(
+                    ignored_objects=metadata.get("ignored_detections", []),
+                    candidate_objects=candidates,
+                    warnings=metadata.get("warnings", []),
+                )
+                if not candidates:
+                    terminal_reason = "empty scene"
+                    finish_task_execution("completed", terminal_reason)
+                    await broadcast_state()
+                    return
+                selected_id = await wait_for_manual_task_selection(run_id, candidates)
+                if not selected_id:
+                    terminal_reason = "manual selection cancelled"
+                    finish_task_execution("stopped", terminal_reason, holding_uncertain=True)
+                    await broadcast_state()
+                    return
+                plan = build_color_sorting_plan(
+                    config,
+                    capture.get("detections", []),
+                    color_profiles(config),
+                    task_settings={
+                        **task_settings,
+                        "execution_strategy": "closed_loop",
+                        "_initial_zone_counts": grid_zone_counts,
+                    },
+                    selected_detection_ids=[selected_id],
+                )
+                metadata = plan.get("task_preview", {})
+
+            update_task_execution(
+                ignored_objects=metadata.get("ignored_detections", []),
+                candidate_objects=metadata.get("candidate_objects", []),
+                warnings=metadata.get("warnings", []),
+                current_object=metadata.get("next_object"),
+            )
+            await broadcast_state()
+
+            if not plan.get("ok"):
+                errors = plan.get("errors", [])
+                if errors and "no calibrated detections match enabled color profiles" in errors[0]:
+                    terminal_reason = "empty scene"
+                    finish_task_execution("completed", terminal_reason)
+                    await broadcast_state()
+                    return
+                reason = "; ".join(errors) or plan.get("error") or "closed-loop planning failed"
+                state.set_error(reason)
+                finish_task_execution("failed", reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            gate_reason = task_motion_gate_reason()
+            if gate_reason:
+                state.set_error(gate_reason)
+                finish_task_execution("failed", gate_reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            preflight = build_preview(
+                mode="program",
+                target=None,
+                waypoint_program=plan.get("waypoints", []),
+                links=config.links,
+                settings=path_settings,
+                branch=branch,
+                source="task",
+            )
+            if not preflight.get("ok"):
+                reason = preflight.get("error", "closed-loop cycle preflight failed")
+                state.set_error(reason)
+                finish_task_execution("failed", reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            update_task_execution(
+                status="executing",
+                phase="executing_object",
+                current_object=metadata.get("next_object"),
+                remaining_count=max(0, int(task_settings.get("max_objects", 1)) - completed),
+            )
+            await broadcast_state()
+            result = await execute_task_sequence(
+                plan,
+                {**path_settings, "tool_action_delay_ms": task_settings.get("tool_action_delay_ms", 150)},
+                branch,
+                terminal_on_finish=False,
+            )
+            if not result.get("ok"):
+                reason = result.get("error") or state.last_error or "closed-loop cycle failed"
+                finish_task_execution("failed", reason, holding_uncertain=True)
+                await broadcast_state()
+                return
+
+            completed += 1
+            current_object = metadata.get("next_object") or {}
+            slot = current_object.get("grid_slot") if isinstance(current_object, dict) else None
+            zone_name = current_object.get("drop_zone") if isinstance(current_object, dict) else None
+            if zone_name and slot:
+                grid_zone_counts[str(zone_name)] = int(slot.get("index", 0)) + 1
+            update_task_execution(
+                status="running",
+                phase="cycle_complete",
+                completed_count=completed,
+                remaining_count=max(0, int(task_settings.get("max_objects", 1)) - completed),
+                current_step={"label": "cycle complete", "kind": "task"},
+            )
+            await broadcast_state()
+            await asyncio.sleep(max(0.0, float(task_settings.get("tool_settle_ms", 0)) / 1000.0))
+
+        terminal_reason = "max_objects reached"
+        finish_task_execution("completed", terminal_reason)
+        await broadcast_state()
+    except asyncio.CancelledError:
+        finish_task_execution("stopped", "task cancelled", holding_uncertain=True)
+        await broadcast_state()
+        raise
+    finally:
+        task_selection_events.pop(run_id, None)
+        task_selection_choices.pop(run_id, None)
 
 
 def reload_runtime_config() -> None:
@@ -1994,6 +2684,9 @@ def reload_runtime_config() -> None:
         preserve_frames=True,
     )
     vision_pipeline.configure(camera)
+    path_previews.clear()
+    task_previews.clear()
+    simulation_vision_queue.clear()
     if not state.simulation:
         apply_hardware_evaluation("stale", "runtime config changed; hardware sync required")
     else:
@@ -2122,6 +2815,7 @@ async def diagnostics(limit: int = 120) -> dict[str, Any]:
         },
         "encoders": encoder_settings(config),
         "kinematics": asdict(config.kinematics),
+        "kinematics_calibration": kinematics_calibration_summary(config),
         "motion": state.motion_diagnostics,
         "validation": {
             "model_warnings": model_validation_warnings(config),
@@ -2722,6 +3416,8 @@ async def detect_vision(request: VisionDetectRequest) -> dict[str, Any]:
 @app.get("/api/vision/frame")
 async def get_vision_frame() -> dict[str, Any]:
     try:
+        if state.simulation:
+            return simulation_vision_payload(consume=False)
         camera = camera_settings(config)
         image = await asyncio.to_thread(capture_camera_frame, camera)
         result = vision_pipeline.process(
@@ -2740,6 +3436,38 @@ async def get_vision_frame() -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "detections": []}
+
+
+@app.post("/api/simulation/vision/queue")
+async def set_simulation_vision_queue(request: SimulationVisionQueueRequest) -> dict[str, Any]:
+    if not state.simulation:
+        return {"ok": False, "error": "synthetic vision is available only in simulation"}
+    frames: list[dict[str, Any]] = []
+    for index, frame in enumerate(request.frames):
+        if not isinstance(frame, dict):
+            return {"ok": False, "error": f"frames[{index}] must be an object"}
+        detections = frame.get("detections")
+        if not isinstance(detections, list):
+            return {"ok": False, "error": f"frames[{index}].detections must be a list"}
+        frames.append(deepcopy(frame))
+    simulation_vision_queue.clear()
+    simulation_vision_queue.extend(frames)
+    return {"ok": True, "queue": simulation_vision_status()}
+
+
+@app.get("/api/simulation/vision/queue")
+async def get_simulation_vision_queue() -> dict[str, Any]:
+    if not state.simulation:
+        return {"ok": False, "error": "synthetic vision is available only in simulation"}
+    return {"ok": True, "queue": simulation_vision_status()}
+
+
+@app.delete("/api/simulation/vision/queue")
+async def clear_simulation_vision_queue() -> dict[str, Any]:
+    if not state.simulation:
+        return {"ok": False, "error": "synthetic vision is available only in simulation"}
+    simulation_vision_queue.clear()
+    return {"ok": True, "queue": simulation_vision_status()}
 
 
 @app.get("/api/vision/workspace/live")
@@ -2900,6 +3628,273 @@ async def save_dh_table(request: CalibrationRequest) -> dict[str, Any]:
     return {"ok": True, "config": public_config(), "state": state.to_dict()}
 
 
+def _persist_kinematics_calibration(settings: dict[str, Any]) -> None:
+    config_path = ensure_local_config()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        draft_path = Path(tmp_dir) / "robot.local.yaml"
+        shutil.copyfile(config_path, draft_path)
+        save_calibration_updates(draft_path, {"kinematics_calibration": settings})
+        load_config(draft_path)
+    save_calibration_updates(config_path, {"kinematics_calibration": settings})
+    reload_runtime_config()
+
+
+def _workspace_polygon() -> list[list[float]]:
+    camera = camera_settings(config)
+    calibration = camera.get("calibration") if isinstance(camera, dict) else None
+    workspace = calibration.get("workspace_aruco") if isinstance(calibration, dict) else None
+    polygon = workspace.get("workspace_polygon_robot_mm") if isinstance(workspace, dict) else None
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        raise ValueError("workspace polygon is not configured")
+    normalized: list[list[float]] = []
+    for point in polygon:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            raise ValueError("workspace polygon contains an invalid point")
+        x = float(point[0])
+        y = float(point[1])
+        if not isfinite(x) or not isfinite(y):
+            raise ValueError("workspace polygon contains a non-finite point")
+        normalized.append([x, y])
+    return normalized
+
+
+def _point_inside_polygon(x: float, y: float, polygon: list[list[float]]) -> bool:
+    inside = False
+    previous = polygon[-1]
+    for current in polygon:
+        x1, y1 = previous
+        x2, y2 = current
+        if (y1 > y) != (y2 > y):
+            crossing_x = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < crossing_x:
+                inside = not inside
+        previous = current
+    return inside
+
+
+@app.get("/api/kinematics-calibration")
+async def get_kinematics_calibration() -> dict[str, Any]:
+    return {"ok": True, **kinematics_calibration_summary(config)}
+
+
+@app.post("/api/kinematics-calibration/targets")
+async def generate_kinematics_calibration_targets(
+    request: KinematicsCalibrationTargetsRequest,
+) -> dict[str, Any]:
+    if not 1 <= request.rows <= 10 or not 1 <= request.columns <= 10:
+        return {"ok": False, "error": "rows and columns must be between 1 and 10"}
+    if not all(
+        isfinite(float(value))
+        for value in [request.margin_mm, request.z_mm, request.phi_deg]
+    ):
+        return {"ok": False, "error": "target generation values must be finite"}
+    try:
+        polygon = _workspace_polygon()
+        min_x = min(point[0] for point in polygon) + max(0.0, float(request.margin_mm))
+        max_x = max(point[0] for point in polygon) - max(0.0, float(request.margin_mm))
+        min_y = min(point[1] for point in polygon) + max(0.0, float(request.margin_mm))
+        max_y = max(point[1] for point in polygon) - max(0.0, float(request.margin_mm))
+        if min_x > max_x or min_y > max_y:
+            raise ValueError("margin leaves no usable workspace area")
+        points: list[dict[str, Any]] = []
+        for row in range(request.rows):
+            y = (min_y + max_y) * 0.5 if request.rows == 1 else min_y + (max_y - min_y) * row / (request.rows - 1)
+            columns = range(request.columns) if row % 2 == 0 else reversed(range(request.columns))
+            for column in columns:
+                x = (
+                    (min_x + max_x) * 0.5
+                    if request.columns == 1
+                    else min_x + (max_x - min_x) * column / (request.columns - 1)
+                )
+                if not _point_inside_polygon(x, y, polygon):
+                    continue
+                intended = {
+                    "x_mm": float(x),
+                    "y_mm": float(y),
+                    "z_mm": float(request.z_mm),
+                    "phi_deg": float(request.phi_deg),
+                }
+                command, correction = correct_cartesian_target(
+                    intended,
+                    config,
+                    apply_enabled=request.apply_calibration,
+                )
+                ik = inverse_kinematics(
+                    command,
+                    config.links,
+                    config.joints,
+                    state.reported_angles_deg,
+                )
+                points.append(
+                    {
+                        "index": len(points) + 1,
+                        "intended_target": intended,
+                        "command_target": command,
+                        "calibration": correction,
+                        "reachable": bool(ik.get("ok") and ik.get("selected")),
+                        "diagnostic_category": "reachable" if ik.get("ok") and ik.get("selected") else "ik_reachability",
+                        "ik_notes": ik.get("notes", []),
+                    }
+                )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    summary = kinematics_calibration_summary(config)
+    return {
+        "ok": True,
+        "points": points,
+        "workspace": kinematics_workspace_context(config),
+        "fit_quality": summary.get("fit_quality"),
+        "validation_quality": summary.get("validation_quality"),
+        "reachability": {
+            "reachable_count": sum(1 for point in points if point["reachable"]),
+            "unreachable_count": sum(1 for point in points if not point["reachable"]),
+        },
+    }
+
+
+@app.post("/api/kinematics-calibration/samples")
+async def save_kinematics_calibration_sample(
+    request: KinematicsCalibrationSampleRequest,
+) -> dict[str, Any]:
+    if state.motion_state == MotionState.MOVING:
+        return {"ok": False, "error": "wait for motion to stop before saving a calibration sample"}
+    if not state.simulation and (not state.connected or not state.known_pose):
+        return {"ok": False, "error": "hardware calibration samples require a connected robot with a known pose"}
+    try:
+        current_fk = forward_kinematics(state.reported_angles_deg, config.links)
+        sample = create_kinematics_calibration_sample(
+            request.__dict__,
+            config,
+            state.reported_angles_deg,
+            current_fk,
+        )
+        settings = kinematics_calibration_settings(config)
+        profile_key = sample["tool"]
+        profiles = settings.setdefault("profiles", {})
+        profile = deepcopy(profiles.get(profile_key) or {})
+        samples = profile.get("samples")
+        if not isinstance(samples, list):
+            samples = []
+        samples.append(sample)
+        profile.update(
+            {
+                "tool": profile_key,
+                "enabled": bool(profile.get("enabled", False)),
+                "model_type": str(profile.get("model_type") or settings.get("default_model") or "affine_xy_z_offset"),
+                "workspace": kinematics_workspace_context(config),
+                "samples": samples,
+            }
+        )
+        profiles[profile_key] = profile
+        settings["active_profile"] = profile_key
+        if sample["role"] == "fit":
+            profile.pop("result", None)
+            profile["enabled"] = False
+            settings["enabled"] = False
+        elif isinstance(profile.get("result"), dict):
+            settings, _ = fit_kinematics_calibration_profile(
+                settings,
+                config,
+                profile_key=profile_key,
+                model_type=str(profile.get("model_type") or settings.get("default_model")),
+            )
+        _persist_kinematics_calibration(settings)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "diagnostic_category": "invalid_sample"}
+    log_event("calibration", "TCP sample saved", sample_id=sample["id"], role=sample["role"])
+    return {
+        "ok": True,
+        "sample": sample,
+        "config": public_config(),
+        **kinematics_calibration_summary(config),
+    }
+
+
+@app.delete("/api/kinematics-calibration/samples/{sample_id}")
+async def delete_kinematics_calibration_sample(sample_id: str) -> dict[str, Any]:
+    settings = kinematics_calibration_settings(config)
+    profile_key = str(kinematics_calibration_summary(config).get("active_profile_key") or "")
+    profiles = settings.get("profiles")
+    profile = profiles.get(profile_key) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict):
+        return {"ok": False, "error": "active calibration profile not found"}
+    samples = profile.get("samples")
+    if not isinstance(samples, list):
+        return {"ok": False, "error": "calibration profile has no samples"}
+    retained = [sample for sample in samples if str(sample.get("id")) != sample_id]
+    if len(retained) == len(samples):
+        return {"ok": False, "error": "calibration sample not found"}
+    profile["samples"] = retained
+    profile.pop("result", None)
+    profile["enabled"] = False
+    settings["enabled"] = False
+    _persist_kinematics_calibration(settings)
+    log_event("calibration", "TCP sample deleted", sample_id=sample_id)
+    return {"ok": True, "config": public_config(), **kinematics_calibration_summary(config)}
+
+
+@app.post("/api/kinematics-calibration/fit")
+async def fit_kinematics_calibration(
+    request: KinematicsCalibrationFitRequest,
+) -> dict[str, Any]:
+    if state.motion_state == MotionState.MOVING:
+        return {"ok": False, "error": "stop motion before fitting calibration"}
+    try:
+        settings, result = fit_kinematics_calibration_profile(
+            kinematics_calibration_settings(config),
+            config,
+            profile_key=request.profile_key,
+            model_type=request.model_type,
+        )
+        profile_key = str(settings.get("active_profile"))
+        profile = settings["profiles"][profile_key]
+        profile["enabled"] = bool(request.enable_after_fit)
+        settings["enabled"] = bool(request.enable_after_fit)
+        _persist_kinematics_calibration(settings)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "diagnostic_category": "fit_quality"}
+    log_event(
+        "calibration",
+        "TCP calibration fitted",
+        model_type=request.model_type,
+        fit_status=result.get("fit", {}).get("status"),
+    )
+    return {
+        "ok": True,
+        "result": result,
+        "config": public_config(),
+        **kinematics_calibration_summary(config),
+    }
+
+
+@app.post("/api/kinematics-calibration/enable")
+async def enable_kinematics_calibration(
+    request: KinematicsCalibrationEnableRequest,
+) -> dict[str, Any]:
+    if state.motion_state == MotionState.MOVING:
+        return {"ok": False, "error": "stop motion before changing calibration state"}
+    settings = kinematics_calibration_settings(config)
+    profile_key = str(
+        request.profile_key
+        or kinematics_calibration_summary(config).get("active_profile_key")
+        or ""
+    )
+    profiles = settings.get("profiles")
+    profile = profiles.get(profile_key) if isinstance(profiles, dict) else None
+    if request.enabled and (not isinstance(profile, dict) or not isinstance(profile.get("result"), dict)):
+        return {"ok": False, "error": "fit and save a calibration result before enabling it"}
+    if isinstance(profile, dict):
+        profile["enabled"] = bool(request.enabled)
+    settings["active_profile"] = profile_key
+    settings["enabled"] = bool(request.enabled)
+    try:
+        _persist_kinematics_calibration(settings)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    log_event("calibration", "TCP calibration state changed", enabled=request.enabled, profile=profile_key)
+    return {"ok": True, "config": public_config(), **kinematics_calibration_summary(config)}
+
+
 @app.post("/api/ik/solve")
 async def solve_ik(request: IkSolveRequest) -> dict[str, Any]:
     links = links_from_override(request.links_mm)
@@ -2924,6 +3919,8 @@ async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
         settings=request_settings(request.settings),
         branch=request.branch,
         source="path",
+        apply_calibration=request.apply_calibration,
+        program_revision=request.program_revision,
     )
 
 
@@ -2933,6 +3930,11 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
     preview = path_previews.get(request.preview_id)
     if preview is None:
         state.set_error("path preview not found or expired")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    preview_revision = preview.get("program_revision")
+    if preview.get("mode") == "program" and preview_revision is not None and request.program_revision != preview_revision:
+        state.set_error("program changed since preview; preview the current sequence again")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if not state.simulation and not state.hardware_armed:
@@ -2974,44 +3976,130 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
 
 @app.post("/api/task/preview")
 async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
-    profiles = color_profiles(config)
-    if request.task in {"sorting", "color_sorting"}:
-        detections = request.detections or ([request.detection] if request.detection else [])
-        if len(detections) > 1:
-            sequence = build_batch_sorting_sequence(config, detections, profiles)
+    profiles = deepcopy(color_profiles(config))
+    task_settings_raw = request.task_settings or {}
+    profile_overrides = None
+    if isinstance(task_settings_raw, dict):
+        profile_overrides = (
+            task_settings_raw.get("color_profile_overrides")
+            or task_settings_raw.get("draft_color_profiles")
+            or task_settings_raw.get("color_profiles")
+        )
+    if isinstance(profile_overrides, dict):
+        for name, profile in profile_overrides.items():
+            normalized_name = str(name).strip().lower()
+            if normalized_name and isinstance(profile, dict):
+                merged = deepcopy(profiles.get(normalized_name, {}))
+                merged.update(deepcopy(profile))
+                profiles[normalized_name] = merged
+    try:
+        path_settings = validated_task_path_settings(request.settings)
+        if request.task in {"sorting", "color_sorting"}:
+            detections = request.detections or ([request.detection] if request.detection else [])
+            if not detections:
+                raise TaskSettingsError("refresh detections before previewing a color-sorting task")
+            sequence = build_color_sorting_plan(
+                config,
+                detections,
+                profiles,
+                task_settings=request.task_settings,
+                selected_detection_ids=request.selected_detection_ids,
+            )
         else:
-            detection = detections[0] if detections else {}
-            sequence = build_sorting_sequence(config, detection, profiles)
-    else:
-        target = request.object_target or request.detection or {}
-        sequence = build_pick_and_place_sequence(config, target, request.drop_zone)
+            target = request.object_target or request.detection or {}
+            if not target:
+                raise TaskSettingsError("pick-and-place preview requires an object target")
+            task_settings = normalize_color_sorting_settings(
+                config,
+                {"execution_strategy": "batch_once", **(request.task_settings or {})},
+            )
+            sequence = build_pick_and_place_sequence(config, target, request.drop_zone, task_settings=task_settings)
+            sequence["task_preview"] = {
+                "strategy": "batch_once",
+                "normalized_settings": task_settings,
+                "selected_objects": [
+                    {
+                        "index": 1,
+                        "color": None,
+                        "drop_zone": sequence.get("drop_zone"),
+                        "object_target": sequence.get("object_target"),
+                        "drop_target": sequence.get("drop_target"),
+                        "motion_modes": sequence.get("motion_modes"),
+                    }
+                ] if sequence.get("ok") else [],
+                "ignored_detections": [],
+                "assigned_targets": [
+                    {
+                        "drop_zone": sequence.get("drop_zone"),
+                        "target": sequence.get("drop_target"),
+                        "grid_slot": sequence.get("grid_slot"),
+                    }
+                ] if sequence.get("ok") else [],
+                "motion_modes": sequence.get("motion_modes", {}),
+                "warnings": [],
+                "estimated_duration_s": 0.0,
+            }
+    except TaskSettingsError as exc:
+        state.set_error(str(exc))
+        await broadcast_state()
+        return {
+            "ok": False,
+            "error": str(exc),
+            "sequence": {"ok": False, "steps": [], "waypoints": []},
+            "task_preview": {"warnings": [], "ignored_detections": [], "selected_objects": []},
+            "state": state.to_dict(),
+        }
     if not sequence["ok"]:
         state.set_error("; ".join(sequence.get("errors", [])) or "task preview failed")
         await broadcast_state()
-        return {"ok": False, "error": state.last_error, "sequence": sequence, "state": state.to_dict()}
+        return {
+            "ok": False,
+            "error": state.last_error,
+            "sequence": sequence,
+            "task_preview": sequence.get("task_preview", {}),
+            "state": state.to_dict(),
+        }
 
     preview_result = build_preview(
         mode="program",
         target=None,
         waypoint_program=sequence["waypoints"],
         links=config.links,
-        settings=request_settings(request.settings),
+        settings=path_settings,
         branch=request.branch,
         source="task",
     )
     if not preview_result["ok"]:
         state.set_error(preview_result.get("error", "task motion preview failed"))
         await broadcast_state()
-        return {**preview_result, "sequence": sequence, "state": state.to_dict()}
+        return {
+            **preview_result,
+            "sequence": sequence,
+            "task_preview": sequence.get("task_preview", {}),
+            "state": state.to_dict(),
+        }
     preview_id = preview_result["preview_id"]
+    task_preview = dict(sequence.get("task_preview", {}))
+    task_preview["estimated_duration_s"] = preview_result["preview"].get("trajectory", {}).get("duration_s", 0.0)
+    sequence["task_preview"] = task_preview
     task_previews[preview_id] = {
         "id": preview_id,
         "created_at": time(),
         "sequence": sequence,
-        "settings": request_settings(request.settings),
+        "task": sequence.get("task", request.task),
+        "strategy": sequence.get("strategy") or task_preview.get("strategy", "batch_once"),
+        "task_settings": task_preview.get("normalized_settings") or request.task_settings or {},
+        "task_preview": task_preview,
+        "settings": path_settings,
         "branch": request.branch,
+        "config_id": RUNNING_CONFIG_ID,
+        "consumed": False,
     }
+    for stale_id, stale in list(task_previews.items()):
+        if time() - float(stale.get("created_at", 0.0)) > TASK_PREVIEW_TTL_S:
+            task_previews.pop(stale_id, None)
     preview_result["sequence"] = sequence
+    preview_result["task_preview"] = task_preview
     log_event("task", f"{sequence['task']} preview", preview_id=preview_id)
     return preview_result
 
@@ -3024,33 +4112,120 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
         state.set_error("task preview not found or expired")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if not state.simulation and not state.hardware_armed:
-        state.set_error("task execution requires the Armed toggle")
+    if preview.get("consumed"):
+        state.set_error("task preview has already been executed; preview the task again")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if not state.simulation:
-        ready, reason = hardware_ready_for_motion()
-        if not ready:
-            state.set_error(reason)
-            await broadcast_state()
-            return {"ok": False, "error": reason, "state": state.to_dict()}
-    can_move = validate_can_move(state)
-    if not can_move.ok:
-        state.set_error(can_move.reason)
+    if time() - float(preview.get("created_at", 0.0)) > TASK_PREVIEW_TTL_S:
+        task_previews.pop(request.preview_id, None)
+        state.set_error("task preview expired; preview the task again")
         await broadcast_state()
-        return {"ok": False, "error": can_move.reason, "state": state.to_dict()}
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if preview.get("config_id") != RUNNING_CONFIG_ID:
+        state.set_error("robot configuration changed after preview; preview the task again")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    gate_reason = task_motion_gate_reason()
+    if gate_reason:
+        state.set_error(gate_reason)
+        await broadcast_state()
+        return {"ok": False, "error": gate_reason, "state": state.to_dict()}
     if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
         state.set_error("motion or task execution is already running")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
 
-    task_task = asyncio.create_task(
-        execute_task_sequence(preview["sequence"], preview.get("settings", {}), preview.get("branch", "auto"))
+    strategy = str(preview.get("strategy") or preview.get("task_preview", {}).get("strategy") or "batch_once")
+    task_settings = preview.get("task_settings", {})
+    if isinstance(task_settings, dict) and task_settings.get("_has_unsaved_color_profiles"):
+        state.set_error("save draft color profiles and drop preset mappings before starting the task")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if strategy == "closed_loop" and state.simulation and not simulation_vision_queue:
+        state.set_error("closed-loop simulation requires queued synthetic vision frames")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if strategy == "closed_loop" and not state.simulation and not camera_settings(config).get("enabled"):
+        state.set_error("closed-loop task execution requires an enabled camera")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    sequence = preview.get("sequence", {})
+    total_objects = int(
+        sequence.get("object_count")
+        or len(sequence.get("objects", []))
+        or len(preview.get("task_preview", {}).get("selected_objects", []))
+        or 1
     )
+    if strategy == "closed_loop":
+        total_objects = int(preview.get("task_settings", {}).get("max_objects", total_objects) or total_objects)
+    run_id = str(uuid4())
+    start_task_execution_state(
+        run_id=run_id,
+        preview_id=request.preview_id,
+        task=str(sequence.get("task") or preview.get("task") or "task"),
+        strategy=strategy,
+        total_objects=total_objects,
+        settings=preview.get("task_settings", {}),
+    )
+    preview["consumed"] = True
+    if strategy == "closed_loop":
+        task_task = asyncio.create_task(execute_closed_loop_sorting(preview))
+    else:
+        task_task = asyncio.create_task(
+            execute_task_sequence(
+                sequence,
+                {
+                    **preview.get("settings", {}),
+                    "tool_action_delay_ms": preview.get("task_settings", {}).get("tool_action_delay_ms", 150),
+                },
+                preview.get("branch", "auto"),
+            )
+        )
     state.last_command = f"TASK_EXECUTE {request.preview_id}"
     log_event("task", "task execution started", preview_id=request.preview_id)
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/task/select")
+async def select_task_detection(request: TaskSelectionRequest) -> dict[str, Any]:
+    execution = state.task_execution or {}
+    if execution.get("run_id") != request.run_id:
+        state.set_error("task selection run ID does not match the active task")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if execution.get("status") != "waiting_for_selection":
+        state.set_error("task is not waiting for a manual detection selection")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    event = task_selection_events.get(request.run_id)
+    if event is None:
+        state.set_error("manual selection waiter is not available")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    task_selection_choices[request.run_id] = request.detection_id
+    update_task_execution(
+        phase="selection_received",
+        current_step={"label": "selection received", "kind": "operator"},
+    )
+    event.set()
+    await broadcast_state()
+    return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/task/stop")
+async def stop_task() -> dict[str, Any]:
+    active_task = task_task
+    result = await stop()
+    if active_task is not None and active_task is not asyncio.current_task() and not active_task.done():
+        try:
+            await active_task
+        except asyncio.CancelledError:
+            pass
+    if state.task_execution and state.task_execution.get("status") in ACTIVE_TASK_STATUSES:
+        finish_task_execution("stopped", "task stop requested", holding_uncertain=True)
+    await broadcast_state()
+    return {"ok": bool(result.get("ok")), "state": state.to_dict()}
 
 
 @app.post("/api/live-motion")
@@ -3549,6 +4724,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
         await broadcast_state()
         return {"ok": True, "state": state.to_dict()}
 
+    simulation_vision_queue.clear()
     state.simulation = bool(request.simulation) if request.simulation is not None else False
     try:
         serial_client.connect(request.port, request.baud_rate)
@@ -3590,6 +4766,7 @@ async def connect(request: ConnectRequest) -> dict[str, Any]:
 @app.post("/api/disconnect")
 async def disconnect() -> dict[str, Any]:
     cancel_motion_tasks()
+    simulation_vision_queue.clear()
     if serial_client.is_connected and not state.simulation:
         try:
             serial_client.send_line(format_stop())
@@ -3653,6 +4830,8 @@ async def stop() -> dict[str, Any]:
     state.motion_state = MotionState.STOPPED
     state.last_command = format_stop()
     finish_motion_diagnostics("stopped", "STOP")
+    if task_active():
+        finish_task_execution("stopped", "STOP", holding_uncertain=True)
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_stop())
         refresh_serial_status()
@@ -3671,6 +4850,8 @@ async def estop() -> dict[str, Any]:
     state.live_motion_enabled = False
     state.last_command = format_estop()
     finish_motion_diagnostics("stopped", "ESTOP")
+    if task_active():
+        finish_task_execution("stopped", "ESTOP", holding_uncertain=True)
     if not state.simulation and serial_client.is_connected:
         serial_client.send_line(format_estop())
         refresh_serial_status()

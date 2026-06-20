@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from pytest import approx
 
 from app.config import (
@@ -167,7 +169,7 @@ def test_differential_ik_step_reports_low_authority_direction():
 
 
 def test_differential_ik_step_blocks_lateral_drift_direction():
-    config = load_config()
+    config = load_config(EXAMPLE_CONFIG_PATH)
 
     result = differential_ik_step(
         [0.0, 62.3, 0.0, 0.0],
@@ -236,6 +238,70 @@ def test_inverse_kinematics_auto_phi_chooses_reachable_orientation():
     assert selected_fk["x_mm"] == approx(target["x_mm"], abs=1e-6)
     assert selected_fk["y_mm"] == approx(target["y_mm"], abs=1e-6)
     assert selected_fk["z_mm"] == approx(target["z_mm"], abs=1e-6)
+
+
+def test_inverse_kinematics_auto_phi_prefers_closest_reachable_downward_angle():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    target = {
+        "x_mm": 120.0,
+        "y_mm": -50.0,
+        "z_mm": 80.0,
+        "phi_auto": True,
+        "preferred_phi_deg": -90.0,
+    }
+
+    result = inverse_kinematics(
+        target,
+        config.links,
+        config.joints,
+        [0.0, 35.0, 15.0, 0.0],
+    )
+
+    assert result["ok"], result["notes"]
+    assert result["selected"]["fk"]["tool_phi_deg"] == approx(-135.0, abs=1.0)
+
+
+def test_inverse_kinematics_auto_phi_refines_valid_limit_analytic_seed():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=42.69)
+        if row.joint_index == 1
+        else replace(row, a_mm=50.0)
+        if row.joint_index == 3
+        else row
+        for row in config.links.dh_rows
+    ]
+    links = replace(config.links, wrist_mm=50.0, dh_rows=rows)
+    joints = [
+        joint
+        if index == 0
+        else replace(
+            joint,
+            min_deg=0.0 if index == 1 else -120.0,
+            max_deg=180.0 if index == 1 else 120.0,
+        )
+        for index, joint in enumerate(config.joints)
+    ]
+
+    result = inverse_kinematics(
+        {
+            "x_mm": 120.0,
+            "y_mm": -50.0,
+            "z_mm": 80.0,
+            "phi_auto": True,
+            "preferred_phi_deg": -90.0,
+        },
+        links,
+        joints,
+        [0.0, 35.0, 15.0, 0.0],
+    )
+
+    assert result["ok"], result["notes"]
+    selected_fk = result["selected"]["fk"]
+    assert selected_fk["x_mm"] == approx(120.0, abs=1.0)
+    assert selected_fk["y_mm"] == approx(-50.0, abs=1.0)
+    assert selected_fk["z_mm"] == approx(80.0, abs=1.0)
+    assert selected_fk["tool_phi_deg"] == approx(-110.0, abs=1.0)
 
 
 def test_inverse_kinematics_filters_joint_limits():

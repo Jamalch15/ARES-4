@@ -771,7 +771,7 @@ def _target_requests_auto_phi(target: dict[str, Any]) -> bool:
     return target.get("phi_deg") is None and target.get("tool_phi_deg") is None
 
 
-def _auto_phi_values(current_phi_deg: float) -> list[float]:
+def _auto_phi_values(current_phi_deg: float, preferred_phi_deg: float | None = None) -> list[float]:
     values: list[float] = []
     seen: set[int] = set()
 
@@ -782,10 +782,25 @@ def _auto_phi_values(current_phi_deg: float) -> list[float]:
             values.append(normalized)
             seen.add(key)
 
+    if preferred_phi_deg is not None and isfinite(preferred_phi_deg):
+        for delta in [0, -5, 5, -10, 10, -15, 15, -20, 20, -30, 30, -45, 45, -60, 60]:
+            add(preferred_phi_deg + delta)
     for delta in [0, -10, 10, -20, 20, -30, 30, -45, 45, -60, 60, -90, 90, -120, 120, -150, 150, 180]:
         add(current_phi_deg + delta)
     for value in range(-180, 181, 15):
         add(float(value))
+    reference_phi = (
+        preferred_phi_deg
+        if preferred_phi_deg is not None and isfinite(preferred_phi_deg)
+        else current_phi_deg
+    )
+    values.sort(
+        key=lambda value: (
+            angle_distance_deg(value, reference_phi),
+            angle_distance_deg(value, current_phi_deg),
+            value,
+        )
+    )
     return values
 
 
@@ -862,8 +877,22 @@ def _inverse_kinematics_fixed_phi(
     }
 
 
-def _auto_phi_candidate_score(candidate: dict[str, Any], current: list[float], current_phi_deg: float) -> tuple[float, ...]:
+def _auto_phi_candidate_score(
+    candidate: dict[str, Any],
+    current: list[float],
+    current_phi_deg: float,
+    preferred_phi_deg: float | None = None,
+) -> tuple[float, ...]:
     phi_delta = angle_distance_deg(candidate["fk"]["tool_phi_deg"], current_phi_deg)
+    if preferred_phi_deg is not None and isfinite(preferred_phi_deg):
+        preferred_delta = angle_distance_deg(candidate["fk"]["tool_phi_deg"], preferred_phi_deg)
+        return (
+            preferred_delta,
+            _candidate_continuity_error(candidate, current),
+            0 if candidate["branch"] == "elbow_down" else 1,
+            candidate["position_error_mm"],
+            phi_delta,
+        )
     return (
         candidate["position_error_mm"],
         _candidate_continuity_error(candidate, current),
@@ -885,6 +914,10 @@ def _inverse_kinematics_auto_phi(
         "z_mm": float(target.get("z_mm", 0.0)),
         "phi_auto": True,
     }
+    preferred_raw = target.get("preferred_phi_deg", target.get("phi_preference_deg"))
+    preferred_phi = float(preferred_raw) if preferred_raw is not None else None
+    if preferred_phi is not None and isfinite(preferred_phi):
+        base_pose["preferred_phi_deg"] = preferred_phi
     if not all(isfinite(value) for value in [base_pose["x_mm"], base_pose["y_mm"], base_pose["z_mm"]]):
         return {
             "ok": False,
@@ -898,13 +931,22 @@ def _inverse_kinematics_auto_phi(
     current = [float(value) for value in (current_joints_deg or [joint.home_deg for joint in joints])]
     current_phi = float(forward_kinematics(current, links)["tool_phi_deg"])
     requested_branch = branch if branch in {"elbow_up", "elbow_down", "current_seed", "home_seed"} else "auto"
-    phi_values = _auto_phi_values(current_phi)
+    phi_values = _auto_phi_values(current_phi, preferred_phi)
     valid_candidates: list[dict[str, Any]] = []
     invalid_samples: list[dict[str, Any]] = []
-    notes: list[str] = ["auto_phi", f"searched {len(phi_values)} phi values"]
+    notes: list[str] = ["auto_phi"]
+    if preferred_phi is not None and isfinite(preferred_phi):
+        notes.append(f"preferred_phi {preferred_phi:.1f} deg")
     seed_notes: list[str] = []
+    searched_phi_values = 0
+    best_reference_delta: float | None = None
+    reference_phi = preferred_phi if preferred_phi is not None and isfinite(preferred_phi) else current_phi
 
     for phi in phi_values:
+        reference_delta = angle_distance_deg(phi, reference_phi)
+        if best_reference_delta is not None and reference_delta > best_reference_delta + 1e-9:
+            break
+        searched_phi_values += 1
         pose = {
             "x_mm": base_pose["x_mm"],
             "y_mm": base_pose["y_mm"],
@@ -918,9 +960,19 @@ def _inverse_kinematics_auto_phi(
         seeds = analytic_seeds
         if not seeds and abs(angle_distance_deg(phi, current_phi)) <= 1e-9:
             seeds = [("current_seed", current)]
+        phi_candidates: list[dict[str, Any]] = []
         for label, seed in seeds:
             if label in {"elbow_up", "elbow_down"}:
                 candidate = _candidate_from_angles(pose, links, joints, seed, label)
+                if not candidate["valid"] and not _joint_limit_reasons(joints, seed):
+                    candidate = _solve_from_seed(
+                        pose,
+                        links,
+                        joints,
+                        seed,
+                        label,
+                        max_iterations=40,
+                    )
             else:
                 candidate = _solve_from_seed(
                     pose,
@@ -934,8 +986,20 @@ def _inverse_kinematics_auto_phi(
             candidate["auto_phi"] = True
             if candidate["valid"]:
                 valid_candidates.append(candidate)
+                phi_candidates.append(candidate)
             elif len(invalid_samples) < 10:
                 invalid_samples.append(candidate)
+        selectable_phi_candidates = phi_candidates
+        if requested_branch != "auto":
+            selectable_phi_candidates = [
+                candidate
+                for candidate in phi_candidates
+                if candidate["branch"] == requested_branch
+            ]
+        if selectable_phi_candidates:
+            best_reference_delta = reference_delta
+
+    notes.insert(1, f"searched {searched_phi_values} phi values")
 
     selection_pool = valid_candidates
     if requested_branch != "auto":
@@ -945,7 +1009,7 @@ def _inverse_kinematics_auto_phi(
 
     selected = min(
         selection_pool,
-        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi),
+        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi, preferred_phi),
         default=None,
     )
     if selected is None:
@@ -954,7 +1018,7 @@ def _inverse_kinematics_auto_phi(
 
     visible_candidates = sorted(
         valid_candidates,
-        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi),
+        key=lambda candidate: _auto_phi_candidate_score(candidate, current, current_phi, preferred_phi),
     )[:12]
     if selected and all(candidate is not selected for candidate in visible_candidates):
         visible_candidates.insert(0, selected)

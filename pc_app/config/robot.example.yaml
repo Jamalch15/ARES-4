@@ -217,14 +217,14 @@ named_positions:
   pickup_test:
     type: cartesian
     target:
-      x_mm: 0.0
-      y_mm: 180.0
+      x_mm: -120.0
+      y_mm: 150.0
       z_mm: 45.0
       phi_deg: 0.0
   dropoff_a:
     type: cartesian
     target:
-      x_mm: -120.0
+      x_mm: -160.0
       y_mm: 180.0
       z_mm: 45.0
       phi_deg: 0.0
@@ -254,6 +254,8 @@ camera:
     morph_kernel_px: 5
     live_interval_ms: 450
   display:
+    # Mirror the captured image left-to-right before calibration and detection.
+    flip_x: false
     # When enabled, the dashboard warps each live camera frame through the
     # saved workspace homography and draws it over the robot workspace.
     project_live_view: false
@@ -371,15 +373,27 @@ color_profiles:
 
 drop_zones:
   dropoff_a:
-    x_mm: -120.0
+    x_mm: -160.0
     y_mm: 180.0
     z_mm: 45.0
     phi_deg: 0.0
+    grid:
+      rows: 2
+      columns: 3
+      x_spacing_mm: 24.0
+      y_spacing_mm: 24.0
+      order: row_major
   dropoff_b:
     x_mm: 120.0
     y_mm: 180.0
     z_mm: 45.0
     phi_deg: 0.0
+    grid:
+      rows: 2
+      columns: 3
+      x_spacing_mm: 24.0
+      y_spacing_mm: 24.0
+      order: row_major
 
 task_defaults:
   safe_position: safe
@@ -387,6 +401,45 @@ task_defaults:
   pickup_height_mm: 25.0
   dropoff_height_mm: 45.0
   default_drop_zone: dropoff_a
+
+tasks:
+  color_sorting:
+    execution_strategy: closed_loop
+    max_objects: 10
+    filters:
+      min_confidence: 0.0
+      min_area_px: 0.0
+      include_colors: []
+      require_robot_coordinates: true
+    ordering:
+      policy: nearest_to_safe
+      color_priority: [red, blue]
+    safe_position: safe
+    camera_clear_position: safe
+    pickup_z_mm: 25.0
+    dropoff_z_mm: 45.0
+    approach_clearance_mm: 55.0
+    drop_approach_clearance_mm: 35.0
+    pickup_phi_deg: 0.0
+    drop_phi_deg: 0.0
+    downward_phi_deg: -90.0
+    pickup_preferred_phi_deg: -90.0
+    drop_preferred_phi_deg: -90.0
+    orientation_policy: prefer_downward
+    motion_modes:
+      transfer: joint
+      pickup_approach: linear
+      pickup_descent: linear
+      lift: linear
+      drop_approach: linear
+      drop_descent: linear
+    missing_drop_zone_policy: error
+    unknown_color_policy: ignore
+    placement_policy: fixed
+    capture_settle_ms: 250
+    tool_settle_ms: 150
+    tool_action_delay_ms: 150
+    object_profiles: {}
 
 # Operator defaults used for new path previews and programs.
 path_defaults:
@@ -466,6 +519,28 @@ calibration:
   movement_tolerance_deg: 0.2
   tool_dimensions_validated: false
   last_validation: ""
+
+kinematics_calibration:
+  # Optional command-layer TCP correction. FK remains the unmodified robot
+  # model. Profiles are fitted and populated by the operator workflow.
+  schema_version: 1
+  enabled: false
+  active_profile: gripper
+  default_model: affine_xy_z_offset
+  thresholds:
+    good_xy_rmse_mm: 5.0
+    acceptable_xy_max_mm: 10.0
+    good_z_rmse_mm: 3.0
+    acceptable_z_max_mm: 5.0
+    warn_xy_rmse_mm: 8.0
+    warn_xy_max_mm: 15.0
+    warn_z_rmse_mm: 5.0
+    warn_z_max_mm: 8.0
+    minimum_sample_quality: 0.2
+    maximum_sample_residual_mm: 250.0
+    outlier_floor_mm: 5.0
+    outlier_mad_scale: 3.5
+  profiles: {}
 
 future_transport_notes:
   bluetooth: >

@@ -2,6 +2,9 @@
 
 This is a local control dashboard for the provisional 4DOF robot arm architecture.
 
+The operator-facing Cartesian TCP calibration workflow and its command-layer
+semantics are documented in [../docs/kinematics_calibration.md](../docs/kinematics_calibration.md).
+
 Current scope:
 
 - Python backend with FastAPI and WebSockets

@@ -97,40 +97,37 @@
               </section>
 
               <section id="operateTab" class="app-tab">
-                <section class="panel-section">
+                <section class="panel-section task-rail task-shell">
                   <div class="section-header">
                     <div>
-                      <h2>Task Panel</h2>
-                      <p class="hint">Choose task, inspect detections, preview, then execute</p>
+                      <h2>Color Sorting Workflow</h2>
+                      <p class="hint">Setup → Detect → Plan → Run. Motion only starts after preview.</p>
                     </div>
                     <span id="taskStatus" class="status-chip">No task</span>
                   </div>
-                  <div class="control-grid">
-                    <label>Task
-                      <select id="taskModeSelect">
-                        <option value="color_sorting">Color Sorting</option>
-                        <option value="pick_and_place">Pick and Place</option>
-                      </select>
-                    </label>
-                    <label>Drop zone
-                      <select id="dropZoneSelect"></select>
-                    </label>
-                    <label>Color profile
-                      <select id="sortColorSelect"></select>
-                    </label>
+                  <div id="taskWorkflowStepper" class="task-stepper" aria-label="Task workflow">
+                    <button class="active" type="button" data-task-step="setup">Setup</button>
+                    <button type="button" data-task-step="detect">Detect</button>
+                    <button type="button" data-task-step="plan">Plan</button>
+                    <button type="button" data-task-step="run">Run</button>
                   </div>
-                  <div class="button-row action-row">
-                    <button id="previewTaskBtn" class="primary" type="button">Preview Task</button>
-                    <button id="executeTaskBtn" type="button" disabled>Execute Task</button>
-                  </div>
-                  <div id="taskSummary" class="path-summary"></div>
                 </section>
 
-                <section class="panel-section">
+                <section class="panel-section task-rail task-step-panel" data-task-panel="setup">
                   <div class="section-header">
                     <div>
-                      <h2>Camera</h2>
-                      <p class="hint">Refresh color detection and read detected-object coordinates.</p>
+                      <h2>Setup</h2>
+                      <p class="hint">Warnings here do not block moving to Detect or Plan; motion is gated before Run.</p>
+                    </div>
+                  </div>
+                  <div id="taskSetupChecklist" class="setup-checklist"></div>
+                </section>
+
+                <section class="panel-section task-rail task-step-panel" data-task-panel="detect" hidden>
+                  <div class="section-header">
+                    <div>
+                      <h2>Detect</h2>
+                      <p class="hint">Use the existing camera popup and vision pipeline. Capture never starts motion.</p>
                     </div>
                   </div>
                   <div class="button-row action-row">
@@ -139,13 +136,146 @@
                   </div>
                   <div id="visionProfileList" class="path-summary"></div>
                   <div id="visionSummary" class="path-summary"></div>
+                  <div id="detectionList" class="task-detection-table"></div>
                 </section>
 
-                <section class="panel-section">
+                <section class="panel-section task-rail task-step-panel" data-task-panel="plan" hidden>
                   <div class="section-header">
-                    <h2>Detections</h2>
+                    <div>
+                      <h2>Plan</h2>
+                      <p class="hint">Task-specific policy only. Speed, acceleration, and path tuning stay in Motion settings.</p>
+                    </div>
                   </div>
-                  <div id="detectionList" class="program-list"></div>
+                  <div class="control-grid">
+                    <label>Task
+                      <select id="taskModeSelect">
+                        <option value="color_sorting">Color Sorting</option>
+                        <option value="pick_and_place" disabled>Pick and Place - later</option>
+                      </select>
+                    </label>
+                    <label>Strategy
+                      <select id="executionStrategySelect">
+                        <option value="closed_loop">Closed loop</option>
+                        <option value="batch_once">Batch once</option>
+                      </select>
+                    </label>
+                    <label>Ordering
+                      <select id="objectSelectionPolicySelect">
+                        <option value="nearest_to_safe">Nearest to safe</option>
+                        <option value="largest">Largest</option>
+                        <option value="left_to_right">Left to right</option>
+                        <option value="color_priority">Color priority</option>
+                        <option value="manual">Manual</option>
+                      </select>
+                    </label>
+                    <label>Max objects
+                      <input id="maxObjectsInput" type="number" min="1" step="1" />
+                    </label>
+                    <label>Min confidence
+                      <input id="minConfidenceInput" type="number" min="0" max="1" step="0.01" />
+                    </label>
+                    <label class="wide-field task-colors-field">Colors
+                      <select id="includeColorsSelect" multiple hidden></select>
+                      <div id="colorPresetMapping" class="color-preset-mapping"></div>
+                    </label>
+                    <label>Color priority
+                      <input id="colorPriorityInput" type="text" placeholder="red, blue" />
+                    </label>
+                    <label>Missing zone
+                      <select id="missingDropzonePolicySelect">
+                        <option value="error">Error</option>
+                        <option value="ignore">Ignore</option>
+                      </select>
+                    </label>
+                    <label>Unknown color
+                      <select id="unknownColorPolicySelect">
+                        <option value="ignore">Ignore</option>
+                        <option value="error">Error</option>
+                      </select>
+                    </label>
+                    <label>Placement
+                      <select id="placementPolicySelect">
+                        <option value="fixed">Fixed anchor</option>
+                        <option value="grid">Zone grid</option>
+                      </select>
+                    </label>
+                    <label class="task-legacy-field">Drop zone
+                      <select id="dropZoneSelect"></select>
+                    </label>
+                    <label class="task-legacy-field">Color profile
+                      <select id="sortColorSelect"></select>
+                    </label>
+                  </div>
+                  <details class="advanced-block task-advanced">
+                    <summary>
+                      <span>Advanced TCP Z, phi, and cycle modes</span>
+                      <small>Task-specific targets; path limits remain in Motion settings</small>
+                    </summary>
+                    <div class="advanced-block-body">
+                      <div class="control-grid">
+                        <label>Pickup Z <input id="pickupZInput" type="number" min="0" step="1" required /></label>
+                        <label>Dropoff Z <input id="dropoffZInput" type="number" min="0" step="1" required /></label>
+                        <label>Pickup clearance <input id="approachClearanceInput" type="number" min="0" step="1" /></label>
+                        <label>Drop clearance <input id="dropApproachClearanceInput" type="number" min="0" step="1" /></label>
+                        <label>Orientation
+                          <select id="orientationPolicySelect">
+                            <option value="prefer_downward">Prefer downward</option>
+                            <option value="fixed">Fixed</option>
+                            <option value="auto">Auto</option>
+                            <option value="per_color">Per color</option>
+                          </select>
+                        </label>
+                        <label>Pickup phi <input id="pickupPhiInput" type="number" step="1" /></label>
+                        <label>Drop phi <input id="dropPhiInput" type="number" step="1" /></label>
+                        <label>Transfer mode
+                          <select id="transferModeSelect">
+                            <option value="joint">Joint</option>
+                            <option value="linear">Linear</option>
+                          </select>
+                        </label>
+                        <label>Pickup descent
+                          <select id="pickupDescentModeSelect">
+                            <option value="linear">Linear</option>
+                            <option value="joint">Joint</option>
+                          </select>
+                        </label>
+                        <label>Lift
+                          <select id="liftModeSelect">
+                            <option value="linear">Linear</option>
+                            <option value="joint">Joint</option>
+                          </select>
+                        </label>
+                        <label>Drop descent
+                          <select id="dropDescentModeSelect">
+                            <option value="linear">Linear</option>
+                            <option value="joint">Joint</option>
+                          </select>
+                        </label>
+                        <label>Capture settle ms <input id="captureSettleInput" type="number" min="0" step="10" /></label>
+                        <label>Tool settle ms <input id="toolSettleInput" type="number" min="0" step="10" /></label>
+                        <label class="wide-field">Per-color object overrides
+                          <textarea id="objectProfilesInput" rows="4" spellcheck="false" placeholder='{"red":{"pickup_z_mm":25}}'></textarea>
+                        </label>
+                      </div>
+                    </div>
+                  </details>
+                  <div class="button-row action-row">
+                    <button id="previewTaskBtn" class="primary" type="button">Preview Task</button>
+                    <button id="executeTaskBtn" type="button" disabled>Start Task</button>
+                  </div>
+                  <div id="taskSummary" class="path-summary"></div>
+                  <div id="taskPlanPreview" class="task-plan-preview"></div>
+                </section>
+
+                <section class="panel-section task-rail task-step-panel" data-task-panel="run" hidden>
+                  <div class="section-header">
+                    <div>
+                      <h2>Run</h2>
+                      <p class="hint">Closed-loop progress, current step, capture status, and stop behavior.</p>
+                    </div>
+                    <button id="taskStopBtn" class="warn" type="button">Stop Task</button>
+                  </div>
+                  <div id="taskRunMonitor" class="task-run-monitor"></div>
                 </section>
               </section>
 
@@ -204,38 +334,95 @@
               </section>
 
               <section id="programTab" class="app-tab">
-                <section class="panel-section">
+                <section class="panel-section program-workflow-panel">
                   <div class="section-header">
                     <div>
-                      <h2>Program Sandbox</h2>
-                      <p class="hint">In-memory waypoints for experiments</p>
+                      <h2>Program builder</h2>
+                      <p class="hint">Build a motion sequence, preview its path and timing, then execute the exact validated version.</p>
                     </div>
-                    <span id="programStatus" class="status-chip">Empty</span>
+                    <span id="programStatus" class="status-chip program-status" data-state="empty">Empty</span>
                   </div>
-                  <div class="control-grid">
-                    <label>New waypoint type
-                      <select id="programWaypointType">
-                        <option value="cartesian">Cartesian x/y/z/phi</option>
-                        <option value="joint">Joint angles</option>
+                  <div id="programWorkflow" class="program-workflow" aria-label="Program workflow">
+                    <div class="program-workflow-step active" data-program-stage="build"><span>1</span><strong>Build</strong></div>
+                    <div class="program-workflow-line"></div>
+                    <div class="program-workflow-step" data-program-stage="preview"><span>2</span><strong>Preview</strong></div>
+                    <div class="program-workflow-line"></div>
+                    <div class="program-workflow-step" data-program-stage="execute"><span>3</span><strong>Execute</strong></div>
+                  </div>
+                  <p id="programStatusDetail" class="program-status-detail">Add the first motion step to begin.</p>
+                </section>
+
+                <section class="panel-section program-add-panel">
+                  <div class="section-header">
+                    <div>
+                      <h2>Add step</h2>
+                      <p class="hint">Choose a source. Move mode belongs to each step and can be edited below.</p>
+                    </div>
+                  </div>
+                  <div class="program-quick-add">
+                    <button type="button" data-program-quick-source="current_pose"><strong>Current pose</strong><span>Reported joints</span></button>
+                    <button type="button" data-program-quick-source="ik_target"><strong>IK target</strong><span>Current target</span></button>
+                  </div>
+                  <div class="program-add-grid">
+                    <label>Source
+                      <select id="programStepSource">
+                        <option value="named_position">Named position</option>
+                        <option value="manual_cartesian">Manual Cartesian</option>
+                        <option value="manual_joint">Manual joints</option>
+                        <option value="vision_detection">Vision object</option>
+                        <option value="drop_zone">Drop zone</option>
                       </select>
                     </label>
-                    <label>Move mode
-                      <select id="programMoveMode">
-                        <option value="joint">Joint</option>
-                        <option value="linear">Linear</option>
+                    <label id="programSourceItemField">Target
+                      <select id="programSourceItem"></select>
+                    </label>
+                    <label>Insert
+                      <select id="programInsertPosition">
+                        <option value="append">At end</option>
+                        <option value="before">Before selected</option>
+                        <option value="after">After selected</option>
                       </select>
                     </label>
+                    <button id="addProgramStepBtn" type="button" class="primary">Add step</button>
                   </div>
-                  <div class="button-row">
-                    <button id="addCurrentJointWaypointBtn" type="button">Add Current</button>
-                    <button id="addIkWaypointBtn" type="button">Add IK Target</button>
-                    <button id="clearProgramBtn" type="button" class="ghost">Clear</button>
+                  <p id="programAddHint" class="field-help">Named positions use the saved robot configuration.</p>
+                </section>
+
+                <section class="panel-section program-sequence-panel">
+                  <div class="section-header">
+                    <div>
+                      <h2>Sequence <span id="programStepCount" class="muted-count">(0 steps)</span></h2>
+                      <p class="hint">Select a row to edit it. Disabled steps remain in the program but are not planned.</p>
+                    </div>
+                    <span id="programEstimatedDuration" class="status-chip">No estimate</span>
                   </div>
-                  <div id="programList" class="program-list"></div>
-                  <div class="button-row action-row">
-                    <button id="previewProgramBtn" type="button" class="primary">Preview Program</button>
-                    <button id="executeProgramBtn" type="button" disabled>Execute Program</button>
+                  <div id="programList" class="program-list program-sequence-list"></div>
+                </section>
+
+                <section id="programInspectorSection" class="panel-section program-inspector-panel" hidden>
+                  <div class="section-header">
+                    <div>
+                      <h2 id="programInspectorTitle">Selected step</h2>
+                      <p class="hint">Edits immediately make the current preview stale.</p>
+                    </div>
                   </div>
+                  <div id="programInspector"></div>
+                </section>
+
+                <section class="panel-section program-preview-panel">
+                  <div class="section-header">
+                    <div>
+                      <h2>Preview summary</h2>
+                      <p class="hint">Execution stays locked until this exact sequence has a successful preview.</p>
+                    </div>
+                  </div>
+                  <div id="programPreviewSummary" class="program-preview-summary"></div>
+                  <div class="program-final-actions">
+                    <button id="clearProgramBtn" type="button" class="ghost">Clear program</button>
+                    <button id="previewProgramBtn" type="button" class="primary">Preview program</button>
+                    <button id="executeProgramBtn" type="button" disabled>Execute program</button>
+                  </div>
+                  <p id="programExecuteHint" class="program-execute-hint">Add and preview at least one enabled step before execution.</p>
                 </section>
               </section>
 
@@ -259,7 +446,9 @@
                     <button type="button" data-settings-target="settingsJoints">Joints</button>
                     <button type="button" data-settings-target="settingsMotion">Motion</button>
                     <button type="button" data-settings-target="settingsTooling">Tooling</button>
+                    <button type="button" data-settings-target="settingsTaskPresets">Task presets</button>
                     <button type="button" data-settings-target="settingsCamera">Camera</button>
+                    <button type="button" data-settings-target="settingsTcpCalibration">TCP calibration</button>
                     <button type="button" data-settings-target="settingsHardware">Hardware</button>
                   </nav>
                 </div>
@@ -356,6 +545,26 @@
                   <div id="toolCalibration" class="path-summary"></div>
                 </section>
 
+                <section class="panel-section settings-section" id="settingsTaskPresets">
+                  <div class="section-header">
+                    <div>
+                      <h2>Task presets</h2>
+                      <p class="hint">Named robot-frame drop positions and color-to-preset defaults used by color sorting.</p>
+                    </div>
+                    <button id="addDropPresetBtn" type="button">Add preset</button>
+                  </div>
+                  <div class="subsection-heading">
+                    <h3>Drop position presets</h3>
+                    <p class="hint">Coordinates are active-TCP robot-frame millimeters. Optional grids are finite row-major placement slots.</p>
+                  </div>
+                  <div id="dropPresetEditor" class="drop-preset-editor"></div>
+                  <div class="subsection-heading">
+                    <h3>Color defaults</h3>
+                    <p class="hint">Detected unknown colors appear here as drafts after detection and must be saved before running.</p>
+                  </div>
+                  <div id="colorProfileEditor" class="color-profile-editor"></div>
+                </section>
+
                 <section class="panel-section settings-section" id="settingsCamera">
                   <div class="section-header">
                     <div>
@@ -430,6 +639,99 @@
                       <div id="workspaceCalibrationDetections" class="program-list compact-list"></div>
                     </div>
                   </div>
+                </section>
+
+                <section class="panel-section settings-section" id="settingsTcpCalibration">
+                  <div class="section-header">
+                    <div>
+                      <h2>Cartesian TCP calibration</h2>
+                      <p class="hint">Fits a tool-specific command correction in the robot base frame. FK and joint-space commands remain unchanged.</p>
+                    </div>
+                    <span id="tcpCalibrationStatus" class="status-chip">Disabled</span>
+                  </div>
+
+                  <div class="tcp-calibration-status-grid">
+                    <div id="tcpCalibrationWorkspaceStatus" class="path-summary"></div>
+                    <div id="tcpCalibrationModelStatus" class="path-summary"></div>
+                  </div>
+
+                  <div class="subsection-heading">
+                    <h3>1. Generate and move to targets</h3>
+                    <p class="hint">Fit moves are intentionally uncorrected. Validation moves use the fitted correction.</p>
+                  </div>
+                  <div class="settings-field-grid tcp-calibration-grid">
+                    <label>Grid rows <input id="tcpCalRowsInput" type="number" min="1" max="10" step="1" value="3" /></label>
+                    <label>Grid columns <input id="tcpCalColumnsInput" type="number" min="1" max="10" step="1" value="4" /></label>
+                    <label>Workspace margin <span class="input-with-unit"><input id="tcpCalMarginInput" type="number" min="0" step="1" value="25" /><span>mm</span></span></label>
+                    <label>Target Z <span class="input-with-unit"><input id="tcpCalTargetZInput" type="number" step="1" value="45" /><span>mm</span></span></label>
+                    <label>Tool pitch <span class="input-with-unit"><input id="tcpCalTargetPhiInput" type="number" step="1" value="0" /><span>deg</span></span></label>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="tcpCalGenerateBtn" type="button">Generate targets</button>
+                  </div>
+                  <div id="tcpCalibrationTargetList" class="program-list compact-list"></div>
+
+                  <div class="settings-field-grid tcp-calibration-grid">
+                    <label>Target X <span class="input-with-unit"><input id="tcpCalXInput" type="number" step="1" /><span>mm</span></span></label>
+                    <label>Target Y <span class="input-with-unit"><input id="tcpCalYInput" type="number" step="1" /><span>mm</span></span></label>
+                    <label>Target Z <span class="input-with-unit"><input id="tcpCalZInput" type="number" step="1" /><span>mm</span></span></label>
+                    <label>Phi <span class="input-with-unit"><input id="tcpCalPhiInput" type="number" step="1" /><span>deg</span></span></label>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="tcpCalPreviewFitBtn" type="button">Preview fit move</button>
+                    <button id="tcpCalPreviewValidationBtn" type="button">Preview validation move</button>
+                    <button id="tcpCalExecuteBtn" class="primary" type="button" disabled>Execute preview</button>
+                  </div>
+                  <p id="tcpCalibrationMoveStatus" class="field-help">No calibration move previewed.</p>
+
+                  <div class="subsection-heading">
+                    <h3>2. Measure and save sample</h3>
+                    <p class="hint">Camera X/Y and manual or touch-off Z are noisy measurements. Confirm the marker and coordinate frame before saving.</p>
+                  </div>
+                  <div class="settings-field-grid tcp-calibration-grid">
+                    <label>TCP marker label <input id="tcpCalMarkerLabelInput" type="text" placeholder="optional color/ID" /></label>
+                    <label>Measured X <span class="input-with-unit"><input id="tcpCalMeasuredXInput" type="number" step="0.1" /><span>mm</span></span></label>
+                    <label>Measured Y <span class="input-with-unit"><input id="tcpCalMeasuredYInput" type="number" step="0.1" /><span>mm</span></span></label>
+                    <label>Measured Z <span class="input-with-unit"><input id="tcpCalMeasuredZInput" type="number" step="0.1" /><span>mm</span></span></label>
+                    <label>Sample role
+                      <select id="tcpCalRoleSelect">
+                        <option value="fit">Fit</option>
+                        <option value="validation">Validation</option>
+                      </select>
+                    </label>
+                    <label>Quality <input id="tcpCalQualityInput" type="number" min="0.2" max="1" step="0.05" value="1" /></label>
+                    <label>Known surface Z <span class="input-with-unit"><input id="tcpCalSurfaceZInput" type="number" step="0.1" value="0" /><span>mm</span></span></label>
+                    <label>TCP contact offset <span class="input-with-unit"><input id="tcpCalContactOffsetInput" type="number" step="0.1" value="0" /><span>mm</span></span></label>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="tcpCalCaptureXyBtn" type="button">Capture marker XY</button>
+                    <button id="tcpCalUseTouchOffBtn" type="button">Use touch-off height</button>
+                    <button id="tcpCalSaveSampleBtn" class="primary" type="button">Save sample</button>
+                  </div>
+                  <p id="tcpCalibrationMeasurementStatus" class="field-help">Manual XY entry is available if vision cannot isolate the TCP marker.</p>
+
+                  <div class="subsection-heading">
+                    <h3>3. Fit, enable, and validate</h3>
+                    <p class="hint">Affine XY plus Z offset needs at least four non-collinear fit samples. Constant XYZ needs at least two.</p>
+                  </div>
+                  <div class="settings-field-grid tcp-calibration-grid">
+                    <label>Calibration model
+                      <select id="tcpCalModelSelect">
+                        <option value="affine_xy_z_offset">Affine XY + Z offset</option>
+                        <option value="constant_xyz">Constant XYZ offset</option>
+                      </select>
+                    </label>
+                    <label class="toggle-label compact-toggle">
+                      <input id="tcpCalEnableInput" type="checkbox" />
+                      <span class="toggle-text">Enable fitted correction</span>
+                    </label>
+                  </div>
+                  <div class="button-row calibration-actions">
+                    <button id="tcpCalFitBtn" class="primary" type="button">Fit and save</button>
+                    <button id="tcpCalApplyEnableBtn" type="button">Apply enable state</button>
+                  </div>
+                  <div id="tcpCalibrationMetrics" class="path-summary"></div>
+                  <div id="tcpCalibrationSamples" class="program-list compact-list"></div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsHardware">

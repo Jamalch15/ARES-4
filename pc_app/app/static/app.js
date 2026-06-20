@@ -4,6 +4,7 @@ const { RobotView } = await import(`/static/robot_view.js?v=${encodeURIComponent
 const state = {
   config: null,
   robotState: null,
+  lastRobotStateUpdatedAt: 0,
   ws: null,
   commandTimer: null,
   pendingAngles: null,
@@ -28,11 +29,35 @@ const state = {
   liveTargetQueued: false,
   pendingLiveTarget: null,
   programWaypoints: [],
+  programSelectedId: null,
+  programRevision: 0,
+  programPreviewRevision: null,
+  programValidationRevision: null,
+  programPreview: null,
+  programPreviewFailure: null,
+  programPreviewPending: false,
+  programHasPreviewed: false,
+  programExecutionActive: false,
+  programExecutionAwaitingStart: false,
+  programExecutionFailed: false,
+  programExecutionError: "",
+  programLastEditReason: "",
+  programNextId: 1,
   hardwareDraftDirty: false,
   settingsDirtyScopes: new Set(),
   taskPreviewId: null,
+  taskPreviewCreatedAt: null,
+  taskLocalStatusAt: 0,
+  lastTaskPreview: null,
+  selectedDetectionIds: new Set(),
   selectedSerialPort: null,
   latestDetections: [],
+  taskDetectionsCapturedAt: null,
+  activeTaskStep: "setup",
+  taskProgressStep: "setup",
+  taskColorProfilesDraft: null,
+  taskDropZonesDraft: null,
+  unsavedColorProfiles: new Set(),
   cameraTimer: null,
   cameraInFlight: false,
   cameraLive: false,
@@ -58,6 +83,9 @@ const state = {
   cartesianJogStopInFlight: false,
   workspaceCalibrationBusy: false,
   workspaceCalibrationStatus: null,
+  tcpCalibrationTargets: [],
+  tcpCalibrationMove: null,
+  tcpCalibrationMeasurementSource: { xy: "manual", z: "manual" },
   versionTimer: null,
 };
 
@@ -165,6 +193,9 @@ const elements = {
   hardwareIo: $("#hardwareIo"),
   hardwareStatus: $("#hardwareStatus"),
   syncHardwareBtn: $("#syncHardwareBtn"),
+  addDropPresetBtn: $("#addDropPresetBtn"),
+  dropPresetEditor: $("#dropPresetEditor"),
+  colorProfileEditor: $("#colorProfileEditor"),
   saveCalibrationBtn: $("#saveCalibrationBtn"),
   discardSettingsBtn: $("#discardSettingsBtn"),
   settingsSaveStatus: $("#settingsSaveStatus"),
@@ -183,15 +214,26 @@ const elements = {
   ikCandidateList: $("#ikCandidateList"),
   ikPathSummary: $("#ikPathSummary"),
   previewStatus: $("#previewStatus"),
-  programWaypointType: $("#programWaypointType"),
-  programMoveMode: $("#programMoveMode"),
-  addCurrentJointWaypointBtn: $("#addCurrentJointWaypointBtn"),
-  addIkWaypointBtn: $("#addIkWaypointBtn"),
+  programWorkflow: $("#programWorkflow"),
+  programStatusDetail: $("#programStatusDetail"),
+  programStepSource: $("#programStepSource"),
+  programSourceItemField: $("#programSourceItemField"),
+  programSourceItem: $("#programSourceItem"),
+  programInsertPosition: $("#programInsertPosition"),
+  programAddHint: $("#programAddHint"),
+  addProgramStepBtn: $("#addProgramStepBtn"),
   clearProgramBtn: $("#clearProgramBtn"),
   previewProgramBtn: $("#previewProgramBtn"),
   executeProgramBtn: $("#executeProgramBtn"),
   programList: $("#programList"),
   programStatus: $("#programStatus"),
+  programStepCount: $("#programStepCount"),
+  programEstimatedDuration: $("#programEstimatedDuration"),
+  programInspectorSection: $("#programInspectorSection"),
+  programInspectorTitle: $("#programInspectorTitle"),
+  programInspector: $("#programInspector"),
+  programPreviewSummary: $("#programPreviewSummary"),
+  programExecuteHint: $("#programExecuteHint"),
   namedPositionsList: $("#namedPositionsList"),
   eventLog: $("#eventLog"),
   toolStatus: $("#toolStatus"),
@@ -207,10 +249,40 @@ const elements = {
   taskModeSelect: $("#taskModeSelect"),
   dropZoneSelect: $("#dropZoneSelect"),
   sortColorSelect: $("#sortColorSelect"),
+  taskWorkflowStepper: $("#taskWorkflowStepper"),
+  taskStepPanels: document.querySelectorAll("[data-task-panel]"),
+  taskSetupChecklist: $("#taskSetupChecklist"),
+  executionStrategySelect: $("#executionStrategySelect"),
+  objectSelectionPolicySelect: $("#objectSelectionPolicySelect"),
+  maxObjectsInput: $("#maxObjectsInput"),
+  minConfidenceInput: $("#minConfidenceInput"),
+  includeColorsSelect: $("#includeColorsSelect"),
+  colorPresetMapping: $("#colorPresetMapping"),
+  colorPriorityInput: $("#colorPriorityInput"),
+  missingDropzonePolicySelect: $("#missingDropzonePolicySelect"),
+  unknownColorPolicySelect: $("#unknownColorPolicySelect"),
+  placementPolicySelect: $("#placementPolicySelect"),
+  pickupZInput: $("#pickupZInput"),
+  dropoffZInput: $("#dropoffZInput"),
+  approachClearanceInput: $("#approachClearanceInput"),
+  dropApproachClearanceInput: $("#dropApproachClearanceInput"),
+  orientationPolicySelect: $("#orientationPolicySelect"),
+  pickupPhiInput: $("#pickupPhiInput"),
+  dropPhiInput: $("#dropPhiInput"),
+  transferModeSelect: $("#transferModeSelect"),
+  pickupDescentModeSelect: $("#pickupDescentModeSelect"),
+  liftModeSelect: $("#liftModeSelect"),
+  dropDescentModeSelect: $("#dropDescentModeSelect"),
+  captureSettleInput: $("#captureSettleInput"),
+  toolSettleInput: $("#toolSettleInput"),
+  objectProfilesInput: $("#objectProfilesInput"),
   previewTaskBtn: $("#previewTaskBtn"),
   executeTaskBtn: $("#executeTaskBtn"),
+  taskStopBtn: $("#taskStopBtn"),
   taskStatus: $("#taskStatus"),
   taskSummary: $("#taskSummary"),
+  taskPlanPreview: $("#taskPlanPreview"),
+  taskRunMonitor: $("#taskRunMonitor"),
   viewCameraBtn: $("#viewCameraBtn"),
   detectVisionBtn: $("#detectVisionBtn"),
   cameraPopup: $("#cameraPopup"),
@@ -249,6 +321,42 @@ const elements = {
   workspaceCalibrationPlaceholder: $("#workspaceCalibrationPlaceholder"),
   workspaceCalibrationMetrics: $("#workspaceCalibrationMetrics"),
   workspaceCalibrationDetections: $("#workspaceCalibrationDetections"),
+  tcpCalibrationStatus: $("#tcpCalibrationStatus"),
+  tcpCalibrationWorkspaceStatus: $("#tcpCalibrationWorkspaceStatus"),
+  tcpCalibrationModelStatus: $("#tcpCalibrationModelStatus"),
+  tcpCalRowsInput: $("#tcpCalRowsInput"),
+  tcpCalColumnsInput: $("#tcpCalColumnsInput"),
+  tcpCalMarginInput: $("#tcpCalMarginInput"),
+  tcpCalTargetZInput: $("#tcpCalTargetZInput"),
+  tcpCalTargetPhiInput: $("#tcpCalTargetPhiInput"),
+  tcpCalGenerateBtn: $("#tcpCalGenerateBtn"),
+  tcpCalibrationTargetList: $("#tcpCalibrationTargetList"),
+  tcpCalXInput: $("#tcpCalXInput"),
+  tcpCalYInput: $("#tcpCalYInput"),
+  tcpCalZInput: $("#tcpCalZInput"),
+  tcpCalPhiInput: $("#tcpCalPhiInput"),
+  tcpCalPreviewFitBtn: $("#tcpCalPreviewFitBtn"),
+  tcpCalPreviewValidationBtn: $("#tcpCalPreviewValidationBtn"),
+  tcpCalExecuteBtn: $("#tcpCalExecuteBtn"),
+  tcpCalibrationMoveStatus: $("#tcpCalibrationMoveStatus"),
+  tcpCalMarkerLabelInput: $("#tcpCalMarkerLabelInput"),
+  tcpCalMeasuredXInput: $("#tcpCalMeasuredXInput"),
+  tcpCalMeasuredYInput: $("#tcpCalMeasuredYInput"),
+  tcpCalMeasuredZInput: $("#tcpCalMeasuredZInput"),
+  tcpCalRoleSelect: $("#tcpCalRoleSelect"),
+  tcpCalQualityInput: $("#tcpCalQualityInput"),
+  tcpCalSurfaceZInput: $("#tcpCalSurfaceZInput"),
+  tcpCalContactOffsetInput: $("#tcpCalContactOffsetInput"),
+  tcpCalCaptureXyBtn: $("#tcpCalCaptureXyBtn"),
+  tcpCalUseTouchOffBtn: $("#tcpCalUseTouchOffBtn"),
+  tcpCalSaveSampleBtn: $("#tcpCalSaveSampleBtn"),
+  tcpCalibrationMeasurementStatus: $("#tcpCalibrationMeasurementStatus"),
+  tcpCalModelSelect: $("#tcpCalModelSelect"),
+  tcpCalEnableInput: $("#tcpCalEnableInput"),
+  tcpCalFitBtn: $("#tcpCalFitBtn"),
+  tcpCalApplyEnableBtn: $("#tcpCalApplyEnableBtn"),
+  tcpCalibrationMetrics: $("#tcpCalibrationMetrics"),
+  tcpCalibrationSamples: $("#tcpCalibrationSamples"),
 };
 
 function renderBuildStatus(version) {
@@ -330,8 +438,32 @@ function readNumber(input, fallback = 0) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function readRequiredNumber(input, label, options = {}) {
+  const raw = String(input?.value ?? "").trim();
+  if (!raw) throw new Error(`${label} is required`);
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new Error(`${label} must be a finite number`);
+  if (options.integer && !Number.isInteger(value)) throw new Error(`${label} must be an integer`);
+  if (options.min !== undefined && value < options.min) {
+    throw new Error(`${label} must be ${options.min} or greater`);
+  }
+  if (options.max !== undefined && value > options.max) {
+    throw new Error(`${label} must be ${options.max} or less`);
+  }
+  return value;
+}
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 async function postJson(url, body = {}) {
@@ -456,7 +588,7 @@ function clonePlain(value) {
   return JSON.parse(JSON.stringify(value || {}));
 }
 
-const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware"]);
+const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_presets"]);
 
 function savedSettingsDetail() {
   if (state.robotState?.simulation) return "Saved locally. Controller sync is not required in simulation.";
@@ -494,6 +626,9 @@ function updateSettingsSaveBar(options = {}) {
 
 function markSettingsDirty(scope, detail = null) {
   state.settingsDirtyScopes.add(scope);
+  if (["motion", "geometry", "tooling", "hardware", "camera"].includes(scope)) {
+    invalidateTaskDetections(`${scope} settings changed - refresh detections`);
+  }
   updateSettingsSaveBar({
     mode: "dirty",
     detail: detail || `${scope} settings changed. Save all settings to persist the draft.`,
@@ -1064,8 +1199,482 @@ function renderHardwareStatus(robotState = state.robotState) {
   });
 }
 
+function invalidateTaskPreview(reason = "") {
+  state.taskPreviewId = null;
+  state.taskPreviewCreatedAt = null;
+  state.lastTaskPreview = null;
+  state.taskLocalStatusAt = Date.now() / 1000;
+  if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = true;
+  if (elements.taskStatus && reason) elements.taskStatus.textContent = reason;
+  if (elements.taskPlanPreview) elements.taskPlanPreview.innerHTML = "";
+  state.view?.setTaskPreview?.(null);
+}
+
+function invalidateTaskDetections(reason = "Refresh detections before planning") {
+  state.latestDetections = [];
+  state.taskDetectionsCapturedAt = null;
+  state.selectedDetectionIds.clear();
+  state.view?.setObjectDetections([]);
+  renderDetectionList([]);
+  invalidateTaskPreview(reason);
+}
+
+function normalizedColorName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function detectionColor(detection) {
+  return normalizedColorName(detection?.label || detection?.color);
+}
+
+function ensureTaskPresetDrafts() {
+  if (!state.config) return;
+  if (!state.taskColorProfilesDraft) {
+    state.taskColorProfilesDraft = clonePlain(state.config.color_profiles || {});
+  }
+  if (!state.taskDropZonesDraft) {
+    state.taskDropZonesDraft = clonePlain(state.config.drop_zones || {});
+  }
+}
+
+function taskColorProfiles() {
+  ensureTaskPresetDrafts();
+  return state.taskColorProfilesDraft || {};
+}
+
+function taskDropZones() {
+  ensureTaskPresetDrafts();
+  return state.taskDropZonesDraft || {};
+}
+
+function defaultDropZoneName() {
+  const zones = taskDropZones();
+  return Object.keys(zones)[0] || "";
+}
+
+function taskPresetDraftChanged() {
+  if (!state.config) return false;
+  return (
+    JSON.stringify(state.taskColorProfilesDraft || state.config.color_profiles || {}) !== JSON.stringify(state.config.color_profiles || {})
+    || JSON.stringify(state.taskDropZonesDraft || state.config.drop_zones || {}) !== JSON.stringify(state.config.drop_zones || {})
+    || state.unsavedColorProfiles.size > 0
+  );
+}
+
+function ensureDetectedColorDrafts(detections = state.latestDetections, options = {}) {
+  ensureTaskPresetDrafts();
+  const profiles = taskColorProfiles();
+  let changed = false;
+  (detections || []).forEach((detection) => {
+    const color = detectionColor(detection);
+    if (!color || profiles[color]) return;
+    profiles[color] = {
+      enabled: true,
+      drop_zone: "",
+      draft: true,
+    };
+    state.unsavedColorProfiles.add(color);
+    changed = true;
+  });
+  if (changed) {
+    if (options.markDirty) {
+      markSettingsDirty("task_presets", "Detected new colors. Assign drop presets and save before running.");
+    }
+    renderColorPresetMapping();
+    renderTaskPresetEditors();
+  }
+  return changed;
+}
+
+function colorProfileOverridesPayload() {
+  const profiles = taskColorProfiles();
+  return Object.fromEntries(
+    Object.entries(profiles).map(([name, profile]) => [
+      normalizedColorName(name),
+      {
+        enabled: profile.enabled !== false,
+        drop_zone: profile.drop_zone || "",
+        draft: Boolean(profile.draft || state.unsavedColorProfiles.has(name)),
+      },
+    ])
+  );
+}
+
+function taskDraftBlocksRun() {
+  if (taskPresetDraftChanged()) return true;
+  const zones = taskDropZones();
+  return Object.entries(taskColorProfiles()).some(([, profile]) => {
+    if (profile.enabled === false) return false;
+    return !profile.drop_zone || !zones[profile.drop_zone];
+  });
+}
+
+function selectedColorFilters() {
+  const checked = [...document.querySelectorAll("[data-color-enabled]")]
+    .filter((input) => input.checked)
+    .map((input) => normalizedColorName(input.dataset.colorEnabled))
+    .filter((color) => Boolean(taskColorProfiles()[color]?.drop_zone))
+    .filter(Boolean);
+  if (elements.colorPresetMapping?.querySelector("[data-color-row]")) return checked.length ? checked : ["__none__"];
+  return [...(elements.includeColorsSelect?.selectedOptions || [])].map((option) => option.value);
+}
+
+function objectProfilesPayload() {
+  const raw = elements.objectProfilesInput?.value?.trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (error) {
+    throw new Error(`Object profile overrides must be valid JSON: ${error.message}`);
+  }
+}
+
+function taskSettingsPayload() {
+  return {
+    execution_strategy: elements.executionStrategySelect?.value || "closed_loop",
+    max_objects: readRequiredNumber(elements.maxObjectsInput, "Max objects", { min: 1, integer: true }),
+    filters: {
+      min_confidence: readRequiredNumber(elements.minConfidenceInput, "Min confidence", { min: 0, max: 1 }),
+      min_area_px: 0,
+      include_colors: selectedColorFilters(),
+      require_robot_coordinates: true,
+    },
+    ordering: {
+      policy: elements.objectSelectionPolicySelect?.value || "nearest_to_safe",
+      color_priority: (elements.colorPriorityInput?.value || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    },
+    missing_drop_zone_policy: elements.missingDropzonePolicySelect?.value || "error",
+    unknown_color_policy: elements.unknownColorPolicySelect?.value || "ignore",
+    placement_policy: elements.placementPolicySelect?.value || "fixed",
+    pickup_z_mm: readRequiredNumber(elements.pickupZInput, "Pickup Z", { min: 0 }),
+    dropoff_z_mm: readRequiredNumber(elements.dropoffZInput, "Dropoff Z", { min: 0 }),
+    approach_clearance_mm: readRequiredNumber(elements.approachClearanceInput, "Pickup clearance", { min: 0 }),
+    drop_approach_clearance_mm: readRequiredNumber(elements.dropApproachClearanceInput, "Drop clearance", { min: 0 }),
+    orientation_policy: elements.orientationPolicySelect?.value || "prefer_downward",
+    downward_phi_deg: -90,
+    pickup_preferred_phi_deg: -90,
+    drop_preferred_phi_deg: -90,
+    pickup_phi_deg: readRequiredNumber(elements.pickupPhiInput, "Pickup phi"),
+    drop_phi_deg: readRequiredNumber(elements.dropPhiInput, "Drop phi"),
+    motion_modes: {
+      transfer: elements.transferModeSelect?.value || "joint",
+      pickup_approach: "linear",
+      pickup_descent: elements.pickupDescentModeSelect?.value || "linear",
+      lift: elements.liftModeSelect?.value || "linear",
+      drop_approach: "linear",
+      drop_descent: elements.dropDescentModeSelect?.value || "linear",
+    },
+    capture_settle_ms: readRequiredNumber(elements.captureSettleInput, "Capture settle", { min: 0, integer: true }),
+    tool_settle_ms: readRequiredNumber(elements.toolSettleInput, "Tool settle", { min: 0, integer: true }),
+    object_profiles: objectProfilesPayload(),
+    color_profile_overrides: colorProfileOverridesPayload(),
+    _has_unsaved_color_profiles: taskDraftBlocksRun(),
+  };
+}
+
+function applyTaskSettingsControls() {
+  const defaults = state.config?.tasks?.color_sorting || {};
+  const filters = defaults.filters || {};
+  const ordering = defaults.ordering || {};
+  const modes = defaults.motion_modes || {};
+  const setValue = (element, value) => {
+    if (!element || value === undefined || value === null) return;
+    element.value = String(value);
+  };
+  setValue(elements.executionStrategySelect, defaults.execution_strategy || "closed_loop");
+  setValue(elements.objectSelectionPolicySelect, ordering.policy || "nearest_to_safe");
+  setValue(elements.maxObjectsInput, defaults.max_objects ?? 10);
+  setValue(elements.minConfidenceInput, filters.min_confidence ?? 0);
+  setValue(elements.colorPriorityInput, (ordering.color_priority || []).join(", "));
+  setValue(elements.missingDropzonePolicySelect, defaults.missing_drop_zone_policy || "error");
+  setValue(elements.unknownColorPolicySelect, defaults.unknown_color_policy || "ignore");
+  setValue(elements.placementPolicySelect, defaults.placement_policy || "fixed");
+  setValue(elements.pickupZInput, defaults.pickup_z_mm ?? 25);
+  setValue(elements.dropoffZInput, defaults.dropoff_z_mm ?? 45);
+  setValue(elements.approachClearanceInput, defaults.approach_clearance_mm ?? 55);
+  setValue(elements.dropApproachClearanceInput, defaults.drop_approach_clearance_mm ?? 35);
+  setValue(elements.orientationPolicySelect, defaults.orientation_policy || "prefer_downward");
+  setValue(elements.pickupPhiInput, defaults.pickup_phi_deg ?? 0);
+  setValue(elements.dropPhiInput, defaults.drop_phi_deg ?? 0);
+  setValue(elements.transferModeSelect, modes.transfer || "joint");
+  setValue(elements.pickupDescentModeSelect, modes.pickup_descent || "linear");
+  setValue(elements.liftModeSelect, modes.lift || "linear");
+  setValue(elements.dropDescentModeSelect, modes.drop_descent || "linear");
+  setValue(elements.captureSettleInput, defaults.capture_settle_ms ?? 250);
+  setValue(elements.toolSettleInput, defaults.tool_settle_ms ?? 150);
+  if (elements.objectProfilesInput) {
+    const objectProfiles = defaults.object_profiles || {};
+    elements.objectProfilesInput.value = Object.keys(objectProfiles).length
+      ? JSON.stringify(objectProfiles, null, 2)
+      : "";
+  }
+}
+
+function renderSetupChecklist() {
+  if (!elements.taskSetupChecklist) return;
+  const camera = state.config?.camera || {};
+  const calibration = state.config?.calibration || {};
+  const robot = state.robotState || {};
+  const profiles = state.config?.color_profiles || {};
+  const zones = state.config?.drop_zones || {};
+  const enabledProfiles = Object.entries(profiles).filter(([, profile]) => profile.enabled !== false);
+  const relevantZones = enabledProfiles
+    .map(([, profile]) => profile.drop_zone)
+    .filter(Boolean);
+  const missingZones = relevantZones.filter((zone) => !zones[zone]);
+  const checks = [
+    ["Robot connection", Boolean(robot.connected || robot.simulation), robot.simulation ? "simulation" : robot.connected ? "connected" : "not connected"],
+    ["Known pose", Boolean(robot.known_pose || robot.simulation), robot.pose_source || "-"],
+    ["Config sync", Boolean(robot.simulation || robot.config_sync_status === "synced"), robot.simulation ? "simulation" : robot.config_sync_status || "unknown"],
+    ["Active tool", Boolean(robot.active_tool), `${robot.active_tool || "-"} / ${robot.tool_type || "-"}`],
+    ["Camera", Boolean(camera.enabled), camera.enabled ? `enabled index ${camera.source_index}` : "disabled"],
+    ["Tool calibration", Boolean(calibration.tool_dimensions_validated), calibration.tool_dimensions_validated ? "validated" : "not validated"],
+    ["Safe pose", !state.config?.validation?.named_position_errors?.safe, state.config?.validation?.named_position_errors?.safe?.join("; ") || "valid"],
+    ["Drop zones", missingZones.length === 0, missingZones.length ? `missing ${missingZones.join(", ")}` : `${Object.keys(zones).length} configured`],
+  ];
+  elements.taskSetupChecklist.innerHTML = checks.map(([label, ok, detail]) => `
+    <div class="setup-check ${ok ? "ok" : "warn"}">
+      <span>${ok ? "✓" : "!"}</span>
+      <div><strong>${label}</strong><small>${detail}</small></div>
+    </div>
+  `).join("");
+}
+
+function colorStatusBadge(color, profile, zones) {
+  const savedProfile = state.config?.color_profiles?.[color];
+  const draft = profile?.draft || state.unsavedColorProfiles.has(color)
+    || JSON.stringify(savedProfile || null) !== JSON.stringify(profile || null);
+  if (!profile?.drop_zone || !zones[profile.drop_zone]) {
+    return `<span class="missing-badge">Needs preset</span>`;
+  }
+  return draft ? `<span class="draft-badge">Draft</span>` : `<span class="saved-badge">Saved</span>`;
+}
+
+function zoneOptionsHtml(selected = "") {
+  const zones = taskDropZones();
+  const options = [`<option value="">Choose preset</option>`];
+  Object.keys(zones).sort().forEach((name) => {
+    options.push(`<option value="${name}" ${name === selected ? "selected" : ""}>${name}</option>`);
+  });
+  return options.join("");
+}
+
+function renderColorPresetMapping() {
+  if (!elements.colorPresetMapping || !state.config) return;
+  ensureDetectedColorDrafts(state.latestDetections);
+  const profiles = taskColorProfiles();
+  const zones = taskDropZones();
+  const colors = new Set(Object.keys(profiles));
+  state.latestDetections.forEach((detection) => {
+    const color = detectionColor(detection);
+    if (color) colors.add(color);
+  });
+
+  if (elements.includeColorsSelect) {
+    elements.includeColorsSelect.innerHTML = "";
+  }
+  const sortedColors = [...colors].sort();
+  if (!sortedColors.length) {
+    elements.colorPresetMapping.innerHTML = `<div class="empty-state">No color profiles or detections yet.</div>`;
+    return;
+  }
+
+  elements.colorPresetMapping.innerHTML = sortedColors.map((color) => {
+    const profile = profiles[color] || { enabled: true, drop_zone: "" };
+    const enabled = profile.enabled !== false;
+    if (elements.includeColorsSelect) {
+      const option = document.createElement("option");
+      option.value = color;
+      option.textContent = color;
+      option.selected = enabled && Boolean(profile.drop_zone);
+      elements.includeColorsSelect.appendChild(option);
+    }
+    const detectedCount = state.latestDetections.filter((detection) => detectionColor(detection) === color).length;
+    return `
+      <div class="color-map-row" data-color-row="${color}">
+        <label class="toggle-label compact-toggle">
+          <input type="checkbox" data-color-enabled="${color}" ${enabled ? "checked" : ""} />
+          <span class="toggle-text">${color}</span>
+        </label>
+        <select data-color-drop-zone="${color}">
+          ${zoneOptionsHtml(profile.drop_zone || "")}
+        </select>
+        <div class="color-map-title">
+          <strong>${detectedCount ? `${detectedCount} detected` : "Configured"}</strong>
+          <small>${profile.drop_zone || "no preset assigned"}</small>
+        </div>
+        ${colorStatusBadge(color, profile, zones)}
+      </div>
+    `;
+  }).join("");
+}
+
+function renderTaskPresetEditors() {
+  if (!state.config) return;
+  ensureTaskPresetDrafts();
+  const zones = taskDropZones();
+  if (elements.dropPresetEditor) {
+    const names = Object.keys(zones).sort();
+    elements.dropPresetEditor.innerHTML = names.length
+      ? names.map((name) => {
+          const zone = zones[name] || {};
+          const grid = zone.grid || {};
+          return `
+            <div class="drop-preset-row" data-drop-preset="${name}">
+              <div class="drop-preset-title">
+                <strong>${name}</strong>
+                <small>${grid.rows && grid.columns ? `${grid.rows}x${grid.columns} grid` : "fixed anchor"}</small>
+              </div>
+              <label>X <input type="number" step="1" data-drop-zone-field="x_mm" data-drop-zone="${name}" value="${format(zone.x_mm ?? 0, 1)}" /></label>
+              <label>Y <input type="number" step="1" data-drop-zone-field="y_mm" data-drop-zone="${name}" value="${format(zone.y_mm ?? 0, 1)}" /></label>
+              <label>Z <input type="number" step="1" data-drop-zone-field="z_mm" data-drop-zone="${name}" value="${format(zone.z_mm ?? 0, 1)}" /></label>
+              <div class="drop-grid-fields">
+                <label>Rows <input type="number" min="0" step="1" data-drop-zone-field="grid.rows" data-drop-zone="${name}" value="${grid.rows ?? ""}" /></label>
+                <label>Cols <input type="number" min="0" step="1" data-drop-zone-field="grid.columns" data-drop-zone="${name}" value="${grid.columns ?? ""}" /></label>
+                <label>dX <input type="number" step="1" data-drop-zone-field="grid.x_spacing_mm" data-drop-zone="${name}" value="${grid.x_spacing_mm ?? ""}" /></label>
+                <label>dY <input type="number" step="1" data-drop-zone-field="grid.y_spacing_mm" data-drop-zone="${name}" value="${grid.y_spacing_mm ?? ""}" /></label>
+              </div>
+              <button class="danger ghost" type="button" data-drop-zone-delete="${name}">Delete</button>
+            </div>
+          `;
+        }).join("")
+      : `<div class="empty-state">No drop presets configured.</div>`;
+  }
+
+  if (elements.colorProfileEditor) {
+    const profiles = taskColorProfiles();
+    const colors = Object.keys(profiles).sort();
+    elements.colorProfileEditor.innerHTML = colors.length
+      ? colors.map((color) => {
+          const profile = profiles[color] || {};
+          return `
+            <div class="color-profile-row" data-color-profile="${color}">
+              <label class="toggle-label compact-toggle">
+                <input type="checkbox" data-settings-color-enabled="${color}" ${profile.enabled === false ? "" : "checked"} />
+                <span class="toggle-text">${color}</span>
+              </label>
+              <select data-settings-color-drop-zone="${color}">
+                ${zoneOptionsHtml(profile.drop_zone || "")}
+              </select>
+              ${colorStatusBadge(color, profile, taskDropZones())}
+            </div>
+          `;
+        }).join("")
+      : `<div class="empty-state">No color profiles yet. Run detection to create drafts.</div>`;
+  }
+}
+
+function markTaskPresetDraftDirty(detail = "Task presets changed. Save all settings before running.") {
+  markSettingsDirty("task_presets", detail);
+  invalidateTaskDetections("Task presets changed - refresh detections");
+  renderColorPresetMapping();
+  renderTaskPresetEditors();
+}
+
+function updateColorProfileDraft(color, patch, detail = "Color preset mapping changed. Save all settings before running.") {
+  const name = normalizedColorName(color);
+  if (!name) return;
+  const profiles = taskColorProfiles();
+  profiles[name] = {
+    ...(profiles[name] || { enabled: true }),
+    ...patch,
+  };
+  if (!state.config?.color_profiles?.[name]) {
+    profiles[name].draft = true;
+    state.unsavedColorProfiles.add(name);
+  }
+  markTaskPresetDraftDirty(detail);
+}
+
+function updateDropZoneDraft(name, field, rawValue) {
+  const zones = taskDropZones();
+  if (!zones[name]) return;
+  if (field.startsWith("grid.")) {
+    const key = field.slice("grid.".length);
+    const value = String(rawValue || "").trim() === "" ? null : Number(rawValue);
+    if (value === null || !Number.isFinite(value) || value <= 0) {
+      if (zones[name].grid) delete zones[name].grid[key];
+    } else {
+      zones[name].grid = zones[name].grid || { order: "row_major" };
+      zones[name].grid[key] = key === "rows" || key === "columns" ? Math.round(value) : value;
+    }
+    if (zones[name].grid && (!zones[name].grid.rows || !zones[name].grid.columns)) {
+      delete zones[name].grid;
+    }
+  } else {
+    const value = Number(rawValue);
+    zones[name][field] = Number.isFinite(value) ? value : 0;
+  }
+  markSettingsDirty("task_presets", "Drop preset changed. Save all settings before running.");
+  invalidateTaskDetections("Drop presets changed - refresh detections");
+  renderColorPresetMapping();
+}
+
+function addDropPreset() {
+  const zones = taskDropZones();
+  let index = Object.keys(zones).length + 1;
+  let name = `preset_${index}`;
+  while (zones[name]) {
+    index += 1;
+    name = `preset_${index}`;
+  }
+  const fk = state.robotState?.fk || {};
+  zones[name] = {
+    x_mm: Number(fk.x_mm ?? 0),
+    y_mm: Number(fk.y_mm ?? 180),
+    z_mm: Number(fk.z_mm ?? 45),
+  };
+  markTaskPresetDraftDirty("Added a drop preset. Set coordinates and save all settings before running.");
+}
+
+function deleteDropPreset(name) {
+  const zones = taskDropZones();
+  delete zones[name];
+  Object.values(taskColorProfiles()).forEach((profile) => {
+    if (profile.drop_zone === name) profile.drop_zone = "";
+  });
+  markTaskPresetDraftDirty("Deleted a drop preset. Review color mappings and save before running.");
+}
+
+function renderWorkflowStepper(phase = "setup") {
+  if (!elements.taskWorkflowStepper) return;
+  const order = ["setup", "detect", "plan", "run"];
+  const aliases = {
+    queued: "run",
+    running: "run",
+    capturing: "run",
+    planning: "run",
+    executing: "run",
+    waiting_for_selection: "run",
+    completed: "run",
+    failed: "run",
+    stopped: "run",
+    preview: "plan",
+  };
+  const progress = aliases[phase] || phase;
+  if (order.includes(progress)) state.taskProgressStep = progress;
+  if (!order.includes(state.activeTaskStep)) state.activeTaskStep = state.taskProgressStep || "setup";
+  const active = state.activeTaskStep;
+  const activeIndex = Math.max(0, order.indexOf(active));
+  const progressIndex = Math.max(0, order.indexOf(state.taskProgressStep || active));
+  [...elements.taskWorkflowStepper.children].forEach((item, index) => {
+    const step = item.dataset.taskStep || order[index];
+    item.classList.toggle("active", index === activeIndex);
+    item.classList.toggle("done", index < progressIndex);
+    item.setAttribute("aria-current", step === active ? "step" : "false");
+  });
+  elements.taskStepPanels?.forEach((panel) => {
+    panel.hidden = panel.dataset.taskPanel !== active;
+  });
+}
+
 function renderOperatorPanels() {
   if (!state.config) return;
+  ensureTaskPresetDrafts();
   const positions = state.config.named_positions || {};
   if (elements.namedPositionsList) {
     elements.namedPositionsList.innerHTML = "";
@@ -1092,7 +1701,7 @@ function renderOperatorPanels() {
 
   if (elements.dropZoneSelect) {
     elements.dropZoneSelect.innerHTML = "";
-    Object.keys(state.config.drop_zones || {}).forEach((name) => {
+    Object.keys(taskDropZones()).forEach((name) => {
       const option = document.createElement("option");
       option.value = name;
       option.textContent = name;
@@ -1101,6 +1710,7 @@ function renderOperatorPanels() {
   }
 
   if (elements.sortColorSelect) elements.sortColorSelect.innerHTML = "";
+  if (elements.includeColorsSelect) elements.includeColorsSelect.innerHTML = "";
   if (elements.visionProfileList) elements.visionProfileList.innerHTML = "";
   if (elements.visionProfileList) {
     const camera = state.config.camera || {};
@@ -1113,12 +1723,20 @@ function renderOperatorPanels() {
     line.innerHTML = `<span>Task vision</span><code>${camera.detection?.provider || "workspace_color"} | tags ${dictionaries}</code>`;
     elements.visionProfileList.appendChild(line);
   }
-  Object.entries(state.config.color_profiles || {}).forEach(([name, profile]) => {
+  ensureDetectedColorDrafts(state.latestDetections);
+  Object.entries(taskColorProfiles()).forEach(([name, profile]) => {
     if (elements.sortColorSelect) {
       const option = document.createElement("option");
       option.value = name;
       option.textContent = name;
       elements.sortColorSelect.appendChild(option);
+    }
+    if (elements.includeColorsSelect) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      option.selected = profile.enabled !== false;
+      elements.includeColorsSelect.appendChild(option);
     }
     if (elements.visionProfileList) {
       const line = document.createElement("div");
@@ -1127,7 +1745,12 @@ function renderOperatorPanels() {
       elements.visionProfileList.appendChild(line);
     }
   });
+  renderColorPresetMapping();
+  renderTaskPresetEditors();
+  applyTaskSettingsControls();
+  renderSetupChecklist();
   renderToolControls();
+  renderTcpCalibration();
 }
 
 function renderToolControls(activeOverride = null) {
@@ -1389,45 +2012,137 @@ async function flushToolSliderLiveSet() {
 function renderTaskSummary(sequence, preview) {
   const steps = sequence?.steps || [];
   const trajectory = preview?.trajectory || {};
+  const taskPreview = sequence?.task_preview || state.lastTaskPreview || {};
+  const warnings = taskPreview.warnings || [];
+  const normalized = taskPreview.normalized_settings || {};
+  const motionSettings = preview?.settings || {};
+  const calibrationApplied = Array.isArray(preview?.calibration)
+    && preview.calibration.some((item) => item.applied);
+  const orientation = normalized.orientation_policy === "fixed"
+    ? `${format(normalized.pickup_phi_deg)}° / ${format(normalized.drop_phi_deg)}°`
+    : normalized.orientation_policy || "-";
   elements.taskSummary.innerHTML = `
     <div class="log-line"><span>Steps</span><code>${steps.length}</code></div>
     <div class="log-line"><span>Moves</span><code>${sequence?.waypoints?.length || 0}</code></div>
     <div class="log-line"><span>Duration</span><code>${format(trajectory.duration_s, 2)} s</code></div>
-    <div class="log-line"><span>Drop zone</span><code>${sequence?.drop_zone || "-"}</code></div>
+    <div class="log-line"><span>TCP correction</span><code>${calibrationApplied ? "enabled for Cartesian task targets" : "not applied"}</code></div>
+    <div class="log-line"><span>Strategy</span><code>${taskPreview.strategy || sequence?.strategy || "-"}</code></div>
+    <div class="log-line"><span>Objects</span><code>${taskPreview.selected_objects?.length || sequence?.object_count || 0}</code></div>
+    <div class="log-line"><span>TCP Z</span><code>pick ${format(normalized.pickup_z_mm)} / drop ${format(normalized.dropoff_z_mm)} mm</code></div>
+    <div class="log-line"><span>Orientation</span><code>${orientation}</code></div>
+    <div class="log-line"><span>Motion limits</span><code>${format(motionSettings.global_speed_deg_s)} deg/s / ${format(motionSettings.global_accel_deg_s2)} deg/s²</code></div>
+    <div class="log-line"><span>Warnings</span><code>${warnings.length ? warnings.join("; ") : "-"}</code></div>
+  `;
+}
+
+function renderTaskPlanPreview(taskPreview = {}, sequence = {}) {
+  if (!elements.taskPlanPreview) return;
+  const objects = taskPreview.selected_objects || sequence.objects || [];
+  const ignored = taskPreview.ignored_detections || sequence.ignored_detections || [];
+  const assigned = taskPreview.assigned_targets || [];
+  const modes = taskPreview.motion_modes || {};
+  if (!objects.length && !ignored.length) {
+    elements.taskPlanPreview.innerHTML = `<div class="empty-state">No planned objects yet.</div>`;
+    return;
+  }
+  elements.taskPlanPreview.innerHTML = `
+    <div class="task-preview-grid">
+      <div>
+        <h3>Object order</h3>
+        <div class="task-object-queue">
+          ${objects.map((object) => `
+            <div class="task-object-row">
+              <span>${object.index || "-"}</span>
+              <strong>${object.color || "object"}</strong>
+              <code>${object.object_target ? `pick ${format(object.object_target.x_mm)}, ${format(object.object_target.y_mm)}, z ${format(object.object_target.z_mm)}` : "-"}</code>
+              <code>${object.drop_target ? `drop ${format(object.drop_target.x_mm)}, ${format(object.drop_target.y_mm)}, z ${format(object.drop_target.z_mm)}` : object.drop_zone || "-"}</code>
+              <small>${object.grid_slot ? `slot r${object.grid_slot.row + 1} c${object.grid_slot.column + 1}` : "fixed anchor"}</small>
+            </div>
+          `).join("") || `<div class="empty-state">Closed-loop preview is waiting for a manual selection.</div>`}
+        </div>
+      </div>
+      <div>
+        <h3>Motion modes</h3>
+        <div class="path-summary compact-summary">
+          <div class="log-line"><span>Transfer</span><code>${modes.transfer || "-"}</code></div>
+          <div class="log-line"><span>Pickup</span><code>${modes.pickup_descent || modes.pickup_approach || "-"}</code></div>
+          <div class="log-line"><span>Lift</span><code>${modes.lift || "-"}</code></div>
+          <div class="log-line"><span>Drop</span><code>${modes.drop_descent || modes.drop_approach || "-"}</code></div>
+        </div>
+        <h3>Ignored</h3>
+        <div class="ignored-list">
+          ${ignored.slice(0, 8).map((item) => `<div><span>${item.color || item.detection_id}</span><code>${item.reason || item.reason_code}</code></div>`).join("") || `<div class="empty-state">None</div>`}
+        </div>
+      </div>
+    </div>
+    ${assigned.length ? `<div class="assigned-targets">${assigned.map((item) => `<span>${item.color || "object"} → ${item.drop_zone}${item.grid_slot ? ` / slot ${item.grid_slot.index + 1}` : ""}</span>`).join("")}</div>` : ""}
   `;
 }
 
 async function previewTask() {
+  state.taskLocalStatusAt = Date.now() / 1000;
   elements.taskStatus.textContent = "Previewing...";
-  const task = elements.taskModeSelect.value;
-  const objectTarget = ikTargetPayload();
+  const task = "color_sorting";
+  if (elements.taskModeSelect) elements.taskModeSelect.value = "color_sorting";
+  const selectedIds = [...state.selectedDetectionIds];
+  let taskSettings;
+  try {
+    taskSettings = taskSettingsPayload();
+  } catch (error) {
+    elements.taskStatus.textContent = error.message;
+    invalidateTaskPreview(error.message);
+    return;
+  }
+  if (!state.taskDetectionsCapturedAt || !state.latestDetections.length) {
+    invalidateTaskPreview("Refresh detections before previewing a task");
+    return;
+  }
+  let motionSettings;
+  try {
+    motionSettings = taskPathSettingsPayload();
+  } catch (error) {
+    invalidateTaskPreview(error.message);
+    return;
+  }
   const request =
     task === "color_sorting"
       ? {
           task,
-          detections: state.latestDetections.length
-            ? state.latestDetections
-            : [{ color: elements.sortColorSelect.value, robot: objectTarget, ok: true }],
-          settings: pathSettings(),
+          detections: state.latestDetections,
+          task_settings: taskSettings,
+          selected_detection_ids: selectedIds,
+          settings: motionSettings,
           branch: elements.ikBranchSelect.value,
         }
       : {
           task,
-          object_target: objectTarget,
+          object_target: ikTargetPayload(),
           drop_zone: elements.dropZoneSelect.value,
-          settings: pathSettings(),
+          task_settings: taskSettings,
+          settings: motionSettings,
           branch: elements.ikBranchSelect.value,
         };
   const payload = await postJson("/api/task/preview", request);
   if (payload.ok) {
     renderPreview(payload.preview);
     state.taskPreviewId = payload.preview_id;
+    state.taskPreviewCreatedAt = Date.now() / 1000;
+    state.taskLocalStatusAt = state.taskPreviewCreatedAt;
+    state.lastTaskPreview = payload.task_preview || payload.sequence?.task_preview || null;
     renderTaskSummary(payload.sequence, payload.preview);
-    elements.executeTaskBtn.disabled = false;
-    elements.taskStatus.textContent = "Preview ready";
+    renderTaskPlanPreview(state.lastTaskPreview, payload.sequence);
+    state.view?.setTaskPreview?.(state.lastTaskPreview);
+    const blockedByDraft = taskDraftBlocksRun();
+    elements.executeTaskBtn.disabled = blockedByDraft;
+    elements.taskStatus.textContent = blockedByDraft ? "Preview ready - save mappings before Run" : "Preview ready";
+    renderWorkflowStepper("preview");
   } else {
     renderPreviewFailure(payload);
+    state.lastTaskPreview = payload.task_preview || payload.sequence?.task_preview || null;
+    renderTaskPlanPreview(state.lastTaskPreview, payload.sequence);
+    state.view?.setTaskPreview?.(state.lastTaskPreview);
     elements.taskStatus.textContent = payload.error || "Task preview failed";
+    state.taskLocalStatusAt = Date.now() / 1000;
   }
   await refreshDiagnostics();
 }
@@ -1440,13 +2155,37 @@ async function executeTask() {
     state.previewId = null;
     state.previewAngles = null;
     state.taskPreviewId = null;
+    state.taskPreviewCreatedAt = null;
+    state.taskDetectionsCapturedAt = null;
+    state.latestDetections = [];
+    state.selectedDetectionIds.clear();
+    state.view?.setObjectDetections([]);
     state.ikUserEdited = false;
   }
   if (payload.state) renderState(payload.state);
   else syncJointControls();
   updateDisabledState();
   elements.taskStatus.textContent = payload.ok ? "Task running" : payload.error || "Task failed";
+  state.taskLocalStatusAt = Date.now() / 1000;
+  if (payload.ok) state.activeTaskStep = "run";
+  renderWorkflowStepper(payload.ok ? "run" : "plan");
   await refreshDiagnostics();
+}
+
+async function stopTask() {
+  const payload = await postJson("/api/task/stop", {});
+  if (payload.state) renderState(payload.state);
+  elements.taskStatus.textContent = payload.ok ? "Task stopped" : payload.error || "Stop failed";
+  state.taskLocalStatusAt = Date.now() / 1000;
+  await refreshDiagnostics();
+}
+
+async function selectRuntimeDetection(detectionId) {
+  const runId = state.robotState?.task_execution?.run_id;
+  if (!runId) return;
+  const payload = await postJson("/api/task/select", { run_id: runId, detection_id: detectionId });
+  if (payload.state) renderState(payload.state);
+  if (!payload.ok) showLocalError(payload.error || "Manual selection failed.");
 }
 
 function setCameraPopupVisible(visible) {
@@ -1557,15 +2296,21 @@ async function detectVision() {
       if (elements.cameraPopupStatus) elements.cameraPopupStatus.textContent = payload.error || "Detection failed";
       return;
     }
-    state.latestDetections = (payload.detections || []).filter((detection) => detection.ok);
+    state.latestDetections = payload.detections || [];
+    state.taskDetectionsCapturedAt = Date.now() / 1000;
+    ensureDetectedColorDrafts(state.latestDetections, { markDirty: true });
+    state.selectedDetectionIds.clear();
+    invalidateTaskPreview("Detections refreshed");
     if (payload.image_b64 && elements.cameraFrame) {
       elements.cameraFrame.src = payload.image_b64;
       elements.cameraFrame.hidden = false;
       if (elements.cameraPlaceholder) elements.cameraPlaceholder.hidden = true;
     }
     renderDetectionList(payload.detections || []);
+    renderColorPresetMapping();
+    renderTaskPresetEditors();
     if (state.view) {
-      state.view.setObjectDetections(state.latestDetections);
+      state.view.setObjectDetections(state.latestDetections.filter((detection) => detection.ok && detection.robot));
     }
     const workspace = payload.workspace || {};
     const visibleTags = (workspace.visible_ids || []).join(", ") || "none";
@@ -1872,35 +2617,375 @@ async function verifyWorkspaceCalibration() {
   }
 }
 
-function renderDetectionList(detections) {
-  if (!elements.detectionList) return;
-  elements.detectionList.innerHTML = "";
-  if (!detections.length) {
-    const empty = document.createElement("div");
-    empty.className = "program-item";
-    empty.textContent = "No colored objects detected inside the workspace.";
-    elements.detectionList.appendChild(empty);
+function tcpCalibrationSummary() {
+  return state.config?.kinematics_calibration || {};
+}
+
+function tcpCalibrationTarget() {
+  return {
+    x_mm: readRequiredNumber(elements.tcpCalXInput, "Calibration target X"),
+    y_mm: readRequiredNumber(elements.tcpCalYInput, "Calibration target Y"),
+    z_mm: readRequiredNumber(elements.tcpCalZInput, "Calibration target Z"),
+    phi_deg: readRequiredNumber(elements.tcpCalPhiInput, "Calibration target phi"),
+  };
+}
+
+function setTcpCalibrationTarget(target = {}) {
+  if (!elements.tcpCalXInput) return;
+  elements.tcpCalXInput.value = format(target.x_mm ?? 0, 2);
+  elements.tcpCalYInput.value = format(target.y_mm ?? 0, 2);
+  elements.tcpCalZInput.value = format(target.z_mm ?? 0, 2);
+  elements.tcpCalPhiInput.value = format(target.phi_deg ?? 0, 2);
+}
+
+function tcpMetricText(metrics) {
+  if (!metrics || !metrics.count) return "not run";
+  return `XY ${format(metrics.xy_rmse_mm, 2)} RMSE / ${format(metrics.xy_max_mm, 2)} max; Z ${format(metrics.z_rmse_mm, 2)} RMSE / ${format(metrics.z_max_abs_mm, 2)} max`;
+}
+
+function renderTcpCalibrationTargets() {
+  if (!elements.tcpCalibrationTargetList) return;
+  elements.tcpCalibrationTargetList.innerHTML = "";
+  if (!state.tcpCalibrationTargets.length) {
+    elements.tcpCalibrationTargetList.innerHTML = `<div class="empty-state">Generate a workspace grid or enter one target manually.</div>`;
     return;
   }
-  detections.forEach((detection, index) => {
+  state.tcpCalibrationTargets.forEach((point, index) => {
+    const target = point.intended_target || {};
     const item = document.createElement("div");
-    item.className = `program-item ${detection.ok ? "" : "invalid"}`;
-    const label = detection.label || detection.color || "object";
-    const objectId = detection.object_id || index + 1;
-    const quality = detection.confidence == null ? "" : ` | q ${format(detection.confidence, 2)}`;
-    const pixel = detection.center_px
-      ? `px ${format(detection.center_px.x, 0)}, ${format(detection.center_px.y, 0)}`
-      : "px -";
-    const coordinates = detection.robot
-      ? `x ${format(detection.robot.x_mm)} mm, y ${format(detection.robot.y_mm)} mm, z ${format(detection.robot.z_mm)} mm`
-      : `${pixel} | ${detection.projection_error || detection.coordinate_source || "not calibrated"}`;
-    const status = detection.robot ? "robot coordinates" : detection.ok ? "image coordinates" : "ignored";
+    item.className = `program-item ${point.reachable ? "" : "invalid"}`;
     item.innerHTML = `
-      <div class="program-title"><span>${objectId}. ${label}</span><span>${status}</span></div>
-      <code>${detection.ok ? `${coordinates}${quality}` : detection.reason || "not usable"}</code>
+      <div class="program-title">
+        <span>Point ${index + 1}</span>
+        <span>${point.reachable ? "reachable" : "IK blocked"}</span>
+      </div>
+      <code>x ${format(target.x_mm, 1)}, y ${format(target.y_mm, 1)}, z ${format(target.z_mm, 1)}, phi ${format(target.phi_deg, 1)}</code>
+      <div class="button-row"><button type="button" class="ghost" data-tcp-cal-target="${index}">Load target</button></div>
     `;
-    elements.detectionList.appendChild(item);
+    elements.tcpCalibrationTargetList.appendChild(item);
   });
+}
+
+function renderTcpCalibration() {
+  if (!elements.tcpCalibrationStatus) return;
+  const summary = tcpCalibrationSummary();
+  const settings = summary.settings || {};
+  const profile = summary.active_profile || {};
+  const result = profile.result || null;
+  const workspace = summary.workspace || {};
+  const samples = Array.isArray(profile.samples) ? profile.samples : [];
+  const enabled = Boolean(summary.enabled);
+  elements.tcpCalibrationStatus.textContent = enabled ? "Enabled" : result ? "Fitted, disabled" : "Not fitted";
+  elements.tcpCalibrationStatus.classList.toggle("ready", enabled);
+  elements.tcpCalibrationStatus.classList.toggle("warning", !enabled && Boolean(result));
+  elements.tcpCalEnableInput.checked = Boolean(settings.enabled && profile.enabled);
+  elements.tcpCalModelSelect.value = profile.model_type || settings.default_model || "affine_xy_z_offset";
+
+  elements.tcpCalibrationWorkspaceStatus.innerHTML = `
+    <div class="log-line"><span>Workspace map</span><code>${workspace.calibrated ? "saved" : "not calibrated"}</code></div>
+    <div class="log-line"><span>Source</span><code>${workspace.source || "-"}</code></div>
+    <div class="log-line"><span>Tool profile</span><code>${summary.active_profile_key || state.config?.tools?.active || "-"}</code></div>
+    <div class="log-line"><span>Frame</span><code>robot base XYZ, mm; +Z upward</code></div>
+  `;
+  elements.tcpCalibrationModelStatus.innerHTML = `
+    <div class="log-line"><span>Model</span><code>${profile.model_type || "not fitted"}</code></div>
+    <div class="log-line"><span>Fit samples</span><code>${samples.filter((sample) => sample.role !== "validation").length}</code></div>
+    <div class="log-line"><span>Validation samples</span><code>${samples.filter((sample) => sample.role === "validation").length}</code></div>
+    <div class="log-line"><span>Result</span><code>${result?.fit?.status || "not run"}</code></div>
+  `;
+
+  const fit = result?.fit || summary.fit_quality;
+  const validation = result?.validation || summary.validation_quality;
+  const diagnostics = result?.diagnostics || [];
+  elements.tcpCalibrationMetrics.innerHTML = `
+    <div class="log-line"><span>Before correction</span><code>${tcpMetricText(fit?.before)}</code></div>
+    <div class="log-line"><span>Fit residual</span><code>${tcpMetricText(fit?.after_model)} (${fit?.status || "not run"})</code></div>
+    <div class="log-line"><span>Validation landing</span><code>${tcpMetricText(validation?.landing)} (${validation?.status || "not run"})</code></div>
+    <div class="log-line"><span>Worst fit</span><code>${(fit?.worst_samples || []).slice(0, 3).map((item) => `${item.id}: ${format(item.error_xy_mm, 1)} XY`).join(" | ") || "-"}</code></div>
+    <div class="log-line"><span>Diagnostics</span><code>${diagnostics.join(" | ") || "No fitted diagnostics yet."}</code></div>
+  `;
+
+  elements.tcpCalibrationSamples.innerHTML = "";
+  if (!samples.length) {
+    elements.tcpCalibrationSamples.innerHTML = `<div class="empty-state">No TCP samples saved for the active tool.</div>`;
+  } else {
+    samples.slice().reverse().forEach((sample) => {
+      const model = sample.residuals?.model_mm || {};
+      const landing = sample.residuals?.landing_mm || {};
+      const item = document.createElement("div");
+      item.className = "program-item";
+      item.innerHTML = `
+        <div class="program-title"><span>${sample.role || "fit"} sample</span><span>q ${format(sample.quality, 2)}</span></div>
+        <code>${sample.id} | model XY ${format(model.xy, 2)}, Z ${format(model.z, 2)} | landing XY ${format(landing.xy, 2)}</code>
+        <div class="button-row"><button type="button" class="ghost danger" data-tcp-cal-delete="${sample.id}">Delete</button></div>
+      `;
+      elements.tcpCalibrationSamples.appendChild(item);
+    });
+  }
+}
+
+async function generateTcpCalibrationTargets() {
+  const payload = await postJson("/api/kinematics-calibration/targets", {
+    rows: readRequiredNumber(elements.tcpCalRowsInput, "Grid rows", { min: 1, max: 10, integer: true }),
+    columns: readRequiredNumber(elements.tcpCalColumnsInput, "Grid columns", { min: 1, max: 10, integer: true }),
+    margin_mm: readRequiredNumber(elements.tcpCalMarginInput, "Workspace margin", { min: 0 }),
+    z_mm: readRequiredNumber(elements.tcpCalTargetZInput, "Target Z"),
+    phi_deg: readRequiredNumber(elements.tcpCalTargetPhiInput, "Tool pitch"),
+    apply_calibration: false,
+  });
+  if (!payload.ok) return;
+  state.tcpCalibrationTargets = payload.points || [];
+  renderTcpCalibrationTargets();
+  const firstReachable = state.tcpCalibrationTargets.find((point) => point.reachable);
+  if (firstReachable) setTcpCalibrationTarget(firstReachable.intended_target);
+  elements.tcpCalibrationMoveStatus.textContent = `${payload.reachability?.reachable_count || 0} reachable; ${payload.reachability?.unreachable_count || 0} blocked by IK.`;
+}
+
+async function previewTcpCalibrationMove(applyCalibration, role) {
+  let target;
+  try {
+    target = tcpCalibrationTarget();
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+    return;
+  }
+  elements.tcpCalibrationMoveStatus.textContent = "Previewing calibration move...";
+  const payload = await postJson("/api/path/preview", {
+    target,
+    mode: "joint",
+    branch: "auto",
+    settings: pathSettings(),
+    apply_calibration: Boolean(applyCalibration),
+  });
+  if (!payload.ok) {
+    elements.tcpCalibrationMoveStatus.textContent = `${payload.diagnostic_category || "preview"}: ${payload.error || "failed"}`;
+    return;
+  }
+  renderPreview(payload.preview);
+  state.tcpCalibrationMove = {
+    role,
+    intended_target: payload.preview.target || target,
+    command_target: payload.preview.command_target || target,
+    calibration: payload.preview.calibration || {},
+    preview_id: payload.preview_id,
+    executed: false,
+  };
+  elements.tcpCalRoleSelect.value = role;
+  elements.tcpCalExecuteBtn.disabled = false;
+  elements.tcpCalibrationMoveStatus.textContent = applyCalibration
+    ? "Validation preview uses the fitted correction. Execute when the path is safe."
+    : "Fit preview is uncorrected. Execute when the path is safe.";
+}
+
+async function executeTcpCalibrationMove() {
+  const move = state.tcpCalibrationMove;
+  if (!move?.preview_id) return;
+  const payload = await postJson("/api/path/execute", { preview_id: move.preview_id });
+  if (!payload.ok) {
+    elements.tcpCalibrationMoveStatus.textContent = payload.error || "Calibration move could not start.";
+    return;
+  }
+  move.executed = true;
+  elements.tcpCalExecuteBtn.disabled = true;
+  elements.tcpCalibrationMoveStatus.textContent = "Move started. Wait for idle before capturing the sample.";
+  if (payload.state) renderState(payload.state);
+}
+
+async function captureTcpCalibrationXy() {
+  elements.tcpCalibrationMeasurementStatus.textContent = "Capturing TCP marker...";
+  const response = await fetch(`/api/vision/frame?t=${Date.now()}`, { cache: "no-store" });
+  const payload = await response.json();
+  if (!payload.ok) {
+    elements.tcpCalibrationMeasurementStatus.textContent = payload.error || "Vision capture failed.";
+    return;
+  }
+  const requestedLabel = String(elements.tcpCalMarkerLabelInput.value || "").trim().toLowerCase();
+  const candidates = (payload.detections || [])
+    .filter((detection) => detection.ok && detection.robot)
+    .filter((detection) => {
+      if (!requestedLabel) return true;
+      return [detection.id, detection.label, detection.color, detection.object_id]
+        .some((value) => String(value ?? "").toLowerCase() === requestedLabel);
+    })
+    .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  if (!candidates.length) {
+    elements.tcpCalibrationMeasurementStatus.textContent = requestedLabel
+      ? `No calibrated detection matched "${requestedLabel}".`
+      : "No calibrated TCP marker detection was available.";
+    return;
+  }
+  const marker = candidates[0];
+  elements.tcpCalMeasuredXInput.value = format(marker.robot.x_mm, 3);
+  elements.tcpCalMeasuredYInput.value = format(marker.robot.y_mm, 3);
+  if (marker.confidence != null) elements.tcpCalQualityInput.value = String(clamp(Number(marker.confidence), 0.2, 1));
+  state.tcpCalibrationMeasurementSource.xy = {
+    type: "vision",
+    provider: payload.provider,
+    calibration_source: payload.calibration_source,
+    detection_id: marker.id || marker.object_id,
+    label: marker.label || marker.color,
+  };
+  elements.tcpCalibrationMeasurementStatus.textContent = `Captured ${marker.label || marker.id || "marker"} at X ${format(marker.robot.x_mm, 2)}, Y ${format(marker.robot.y_mm, 2)} mm.`;
+}
+
+function useTcpCalibrationTouchOff() {
+  try {
+    const surface = readRequiredNumber(elements.tcpCalSurfaceZInput, "Known surface Z");
+    const offset = readRequiredNumber(elements.tcpCalContactOffsetInput, "TCP contact offset");
+    const measuredZ = surface + offset;
+    elements.tcpCalMeasuredZInput.value = format(measuredZ, 3);
+    state.tcpCalibrationMeasurementSource.z = {
+      type: "touch_off",
+      surface_z_mm: surface,
+      contact_offset_mm: offset,
+    };
+    elements.tcpCalibrationMeasurementStatus.textContent = `Touch-off Z set to ${format(measuredZ, 2)} mm. No automatic contact motion was performed.`;
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+  }
+}
+
+async function saveTcpCalibrationSample() {
+  let intended;
+  let measured;
+  try {
+    intended = state.tcpCalibrationMove?.intended_target || tcpCalibrationTarget();
+    measured = {
+      x_mm: readRequiredNumber(elements.tcpCalMeasuredXInput, "Measured X"),
+      y_mm: readRequiredNumber(elements.tcpCalMeasuredYInput, "Measured Y"),
+      z_mm: readRequiredNumber(elements.tcpCalMeasuredZInput, "Measured Z"),
+    };
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+    return;
+  }
+  const payload = await postJson("/api/kinematics-calibration/samples", {
+    intended_target: intended,
+    command_target: state.tcpCalibrationMove?.command_target || intended,
+    measured,
+    role: elements.tcpCalRoleSelect.value,
+    quality: readNumber(elements.tcpCalQualityInput, 1),
+    measurement_source: state.tcpCalibrationMeasurementSource,
+    joint_source: state.robotState?.encoder_available?.includes?.("1") ? "reported_encoder" : "reported_or_commanded",
+    notes: state.tcpCalibrationMove?.executed ? "captured after calibration workflow move" : "captured without confirmed workflow execution",
+  });
+  if (!payload.ok) {
+    elements.tcpCalibrationMeasurementStatus.textContent = payload.error || "Sample was rejected.";
+    return;
+  }
+  if (payload.config) applyConfig(payload.config);
+  state.tcpCalibrationMove = null;
+  elements.tcpCalibrationMeasurementStatus.textContent = `Saved ${payload.sample.role} sample ${payload.sample.id}.`;
+}
+
+async function fitTcpCalibration() {
+  elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Status</span><code>Fitting...</code></div>`;
+  const payload = await postJson("/api/kinematics-calibration/fit", {
+    model_type: elements.tcpCalModelSelect.value,
+    enable_after_fit: Boolean(elements.tcpCalEnableInput.checked),
+  });
+  if (!payload.ok) {
+    elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Fit error</span><code>${payload.error || "failed"}</code></div>`;
+    return;
+  }
+  if (payload.config) applyConfig(payload.config);
+}
+
+async function applyTcpCalibrationEnableState() {
+  const payload = await postJson("/api/kinematics-calibration/enable", {
+    enabled: Boolean(elements.tcpCalEnableInput.checked),
+  });
+  if (payload.ok && payload.config) applyConfig(payload.config);
+}
+
+async function deleteTcpCalibrationSample(sampleId) {
+  const response = await fetch(`/api/kinematics-calibration/samples/${encodeURIComponent(sampleId)}`, {
+    method: "DELETE",
+  });
+  const payload = await response.json();
+  if (!payload.ok) {
+    showLocalError(payload.error || "Sample could not be deleted.");
+    return;
+  }
+  if (payload.config) applyConfig(payload.config);
+}
+
+function renderDetectionList(detections) {
+  if (!elements.detectionList) return;
+  if (!detections.length) {
+    elements.detectionList.innerHTML = "";
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "No colored objects detected inside the workspace.";
+    elements.detectionList.appendChild(empty);
+    renderProgramSourceOptions();
+    return;
+  }
+  const waitingRun = state.robotState?.task_execution?.status === "waiting_for_selection";
+  const candidateIds = new Set((state.robotState?.task_execution?.candidate_objects || []).map((item) => String(item.detection_id)));
+  let table = elements.detectionList.querySelector("table");
+  if (!table) {
+    elements.detectionList.innerHTML = "";
+    table = document.createElement("table");
+    table.innerHTML = `
+      <thead>
+        <tr>
+          <th>Use</th>
+          <th>Color</th>
+          <th>Conf</th>
+          <th>Area</th>
+          <th>Robot X/Y</th>
+          <th>Eligibility</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    `;
+    elements.detectionList.appendChild(table);
+  }
+  const tbody = table.querySelector("tbody");
+  const seen = new Set();
+  detections.forEach((detection, index) => {
+    const detectionId = String(detection.id || detection.detection_id || detection.object_id || `detection-${index + 1}`);
+    seen.add(detectionId);
+    let row = tbody.querySelector(`tr[data-detection-row="${CSS.escape(detectionId)}"]`);
+    if (!row) {
+      row = document.createElement("tr");
+      row.dataset.detectionRow = detectionId;
+    }
+    const label = detection.label || detection.color || "object";
+    const area = detection.area_px ?? (detection.bbox_px ? Number(detection.bbox_px.width || 0) * Number(detection.bbox_px.height || 0) : null);
+    const robot = detection.robot
+      ? `${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}`
+      : "-";
+    const eligible = Boolean(detection.ok && detection.robot);
+    const selected = state.selectedDetectionIds.has(detectionId);
+    row.className = `${eligible ? "" : "invalid"} ${selected ? "selected" : ""}`;
+    row.innerHTML = `
+      <td>
+        <input type="checkbox" data-detection-select="${detectionId}" ${selected ? "checked" : ""} ${eligible ? "" : "disabled"} />
+      </td>
+      <td><strong>${label}</strong><small>${detectionId}</small></td>
+      <td>${detection.confidence == null ? "-" : format(detection.confidence, 2)}</td>
+      <td>${area == null ? "-" : format(area, 0)}</td>
+      <td>${robot}</td>
+      <td>${eligible ? "eligible" : "ignored"}</td>
+      <td>${detection.projection_error || detection.reason || detection.coordinate_source || "-"}</td>
+    `;
+    if (waitingRun && candidateIds.has(detectionId)) {
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "ghost compact-action";
+      action.textContent = "Pick";
+      action.dataset.runtimeSelect = detectionId;
+      row.children[0].appendChild(action);
+    }
+    tbody.appendChild(row);
+  });
+  [...tbody.querySelectorAll("tr[data-detection-row]")].forEach((row) => {
+    if (!seen.has(row.dataset.detectionRow)) row.remove();
+  });
+  renderProgramSourceOptions();
 }
 
 function hardwareDraftState(index, actuator) {
@@ -2115,6 +3200,21 @@ function pathSettings() {
   };
 }
 
+function taskPathSettingsPayload() {
+  const settings = pathSettings();
+  settings.global_speed_deg_s = readRequiredNumber(elements.globalSpeedInput, "Global speed", { min: 0.001 });
+  settings.global_accel_deg_s2 = readRequiredNumber(elements.globalAccelInput, "Global acceleration", { min: 0.001 });
+  settings.waypoint_rate_hz = readRequiredNumber(elements.waypointRateInput, "Waypoint rate", { min: 0.001 });
+  settings.cartesian_step_mm = readRequiredNumber(elements.cartesianStepInput, "Cartesian step", { min: 0.001 });
+  settings.jerk_percent = readRequiredNumber(elements.jerkPercentInput, "Jerk percent", { min: 0, max: 100 });
+  settings.blend_percent = readRequiredNumber(elements.blendPercentInput, "Blend percent", { min: 0, max: 100 });
+  settings.per_joint_speed_deg_s = [...document.querySelectorAll(".joint-speed-limit")]
+    .map((input, index) => readRequiredNumber(input, `Joint ${index + 1} speed`, { min: 0.001 }));
+  settings.per_joint_accel_deg_s2 = [...document.querySelectorAll(".joint-accel-limit")]
+    .map((input, index) => readRequiredNumber(input, `Joint ${index + 1} acceleration`, { min: 0.001 }));
+  return settings;
+}
+
 function normalizeJointAngles(values) {
   const expectedCount = state.config?.joints?.length || state.robotState?.reported_angles_deg?.length || 4;
   if (!Array.isArray(values) || values.length !== expectedCount) return null;
@@ -2234,6 +3334,56 @@ function renderMotionExecution(robotState) {
   if (progressLine) progressLine.textContent = `${executionState} - ${progressText}`;
 }
 
+function renderTaskExecution(robotState = state.robotState) {
+  const execution = robotState?.task_execution || {};
+  if (!elements.taskRunMonitor) return;
+  const executionUpdatedAt = Number(execution.updated_at || 0);
+  const localStatusIsNewer = state.taskLocalStatusAt > executionUpdatedAt;
+  if (!execution.status) {
+    elements.taskRunMonitor.innerHTML = `<div class="empty-state">No task running. Preview first, then start.</div>`;
+    if (elements.taskStatus && !localStatusIsNewer) {
+      const currentStatus = elements.taskStatus.textContent || "";
+      const keepLocalStatus = /preview|task settings|detection|preset|mapping|save|ik|waypoint|unreachable|failed/i.test(currentStatus);
+      if (state.taskPreviewId && !keepLocalStatus) {
+        elements.taskStatus.textContent = "Preview ready";
+      } else if (!keepLocalStatus) {
+        elements.taskStatus.textContent = "No task";
+      }
+    }
+    if (!localStatusIsNewer) renderWorkflowStepper(state.taskPreviewId ? "preview" : "setup");
+    return;
+  }
+  const current = execution.current_object || {};
+  const step = execution.current_step || {};
+  const latest = execution.latest_capture || {};
+  const candidates = execution.candidate_objects || [];
+  const ignored = execution.ignored_objects || [];
+  const warnings = execution.warnings || [];
+  if (!localStatusIsNewer) {
+    elements.taskStatus.textContent = `${execution.status}: ${execution.phase || "-"}`;
+    renderWorkflowStepper(execution.status);
+  }
+  elements.taskRunMonitor.innerHTML = `
+    <div class="task-run-grid">
+      <div class="run-metric"><span>Status</span><strong>${execution.status}</strong><small>${execution.terminal_reason || execution.phase || "-"}</small></div>
+      <div class="run-metric"><span>Completed</span><strong>${execution.completed_count || 0}</strong><small>remaining ${execution.remaining_count ?? "-"}</small></div>
+      <div class="run-metric"><span>Current</span><strong>${current.color || "-"}</strong><small>${current.detection_id || current.drop_zone || "-"}</small></div>
+      <div class="run-metric"><span>Step</span><strong>${step.index && step.total ? `${step.index}/${step.total}` : "-"}</strong><small>${step.label || "-"}</small></div>
+      <div class="run-metric"><span>Capture</span><strong>${latest.detection_count ?? "-"}</strong><small>${latest.provider || latest.calibration_source || "-"}</small></div>
+      <div class="run-metric"><span>Tool feedback</span><strong>${execution.tool_feedback?.status || "unknown"}</strong><small>${execution.holding_uncertain ? "holding uncertain" : "no hold feedback"}</small></div>
+    </div>
+    ${execution.status === "waiting_for_selection" ? `<div class="task-waiting">Manual mode: choose a candidate with the Pick button in the detection table.</div>` : ""}
+    <div class="task-object-queue compact">
+      ${candidates.slice(0, 8).map((item) => `<div class="task-object-row"><span>${item.detection_id}</span><strong>${item.color}</strong><code>x ${format(item.robot?.x_mm)}, y ${format(item.robot?.y_mm)}</code><small>${item.drop_zone || "-"}</small>${execution.status === "waiting_for_selection" ? `<button type="button" class="ghost compact-action" data-runtime-select="${item.detection_id}">Pick</button>` : ""}</div>`).join("") || `<div class="empty-state">No candidate queue exposed.</div>`}
+    </div>
+    <div class="ignored-list">
+      ${ignored.slice(0, 6).map((item) => `<div><span>${item.color || item.detection_id}</span><code>${item.reason || item.reason_code}</code></div>`).join("")}
+      ${warnings.map((warning) => `<div><span>warning</span><code>${warning}</code></div>`).join("")}
+    </div>
+  `;
+  renderDetectionList(state.latestDetections);
+}
+
 function liveRealEnabled() {
   return Boolean(elements.liveRealToggle.checked && state.robotState?.live_motion_enabled);
 }
@@ -2281,10 +3431,9 @@ function axisVelocityPayload(key, velocity) {
   return previous;
 }
 
-function cartesianJogPayload(dtS = null) {
+function cartesianJogPayload() {
   return {
     ...state.cartesianJogVelocity,
-    dt_s: dtS,
     tcp_speed_mm_s: readNumber(elements.cartesianJogSpeedInput, 60),
     phi_speed_deg_s: readNumber(elements.cartesianJogPhiSpeedInput, 45),
     settings: pathSettings(),
@@ -2328,14 +3477,11 @@ async function sendCartesianJog() {
   }
   state.cartesianJogTimer = null;
   const requestEpoch = state.cartesianJogEpoch;
-  const now = performance.now();
-  const previous = state.cartesianJogLastSentMs || now;
-  const dtS = clamp((now - previous) / 1000, 0.01, 0.08);
-  state.cartesianJogLastSentMs = now;
+  state.cartesianJogLastSentMs = performance.now();
   state.cartesianJogInFlight = true;
   state.cartesianJogQueued = false;
   try {
-    const payload = await postJson("/api/cartesian-jog", cartesianJogPayload(dtS));
+    const payload = await postJson("/api/cartesian-jog", cartesianJogPayload());
     if (requestEpoch !== state.cartesianJogEpoch) return;
     if (payload.ok) {
       if (payload.state) renderState(payload.state);
@@ -2436,6 +3582,37 @@ async function setCurrentPoseKnown() {
   if (payload.state) renderState(payload.state);
 }
 
+function programMotionGateReason(robotState = state.robotState) {
+  if (!robotState) return "Robot state is not available.";
+  if (robotState.motion_state === "estop") return "Clear the emergency stop before execution.";
+  if (robotState.motion_state === "fault") return "Clear the robot fault before execution.";
+  if (robotState.simulation) return "";
+  if (!robotState.connected) return "Connect to the robot before execution.";
+  if (!robotState.hardware_armed) return "Enable the Armed toggle before execution.";
+  if (!robotState.known_pose) return "Set or read a known robot pose before execution.";
+  if (robotState.hardware_mode === "invalid") return "Fix the hardware configuration before execution.";
+  if (robotState.hardware_mode === "simulated") return "No hardware axes are enabled.";
+  if (robotState.config_sync_status !== "synced") {
+    return `Sync the hardware configuration before execution (${robotState.config_sync_status || "unknown"}).`;
+  }
+  return "";
+}
+
+function programPreviewIsFresh() {
+  return Boolean(
+    state.programPreview &&
+    state.programPreviewRevision === state.programRevision &&
+    state.previewId === state.programPreview.id &&
+    state.latestPreview?.mode === "program"
+  );
+}
+
+function programSelectedSourceIsReady() {
+  const source = elements.programStepSource?.value;
+  if (!["named_position", "vision_detection", "drop_zone"].includes(source)) return true;
+  return Boolean(elements.programSourceItem?.value);
+}
+
 function updateDisabledState() {
   const enabled = isMoveEnabled();
   elements.jointControls.querySelectorAll("input").forEach((input) => {
@@ -2451,7 +3628,25 @@ function updateDisabledState() {
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
   elements.hardwareArmToggle.disabled = !state.robotState?.connected || state.robotState?.simulation;
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
-  elements.executeProgramBtn.disabled = !state.previewId || !enabled || state.latestPreview?.mode !== "program";
+  const enabledProgramSteps = state.programWaypoints.filter((step) => step.enabled !== false).length;
+  const programGateReason = programMotionGateReason();
+  elements.previewProgramBtn.disabled =
+    state.programPreviewPending ||
+    state.programExecutionActive ||
+    enabledProgramSteps === 0;
+  elements.executeProgramBtn.disabled =
+    !programPreviewIsFresh() ||
+    Boolean(programGateReason) ||
+    state.programPreviewPending ||
+    state.programExecutionActive;
+  elements.clearProgramBtn.disabled = state.programWaypoints.length === 0 || state.programExecutionActive;
+  elements.addProgramStepBtn.disabled = state.programExecutionActive || !programSelectedSourceIsReady();
+  elements.programStepSource.disabled = state.programExecutionActive;
+  elements.programSourceItem.disabled = state.programExecutionActive;
+  elements.programInsertPosition.disabled = state.programExecutionActive;
+  document.querySelectorAll("[data-program-quick-source]").forEach((button) => {
+    button.disabled = state.programExecutionActive;
+  });
   if (elements.cartesianJogToggle) elements.cartesianJogToggle.disabled = !enabled;
   if (elements.cartesianJogSpeedInput) elements.cartesianJogSpeedInput.disabled = !enabled;
   if (elements.cartesianJogPhiSpeedInput) elements.cartesianJogPhiSpeedInput.disabled = !enabled;
@@ -2461,10 +3656,17 @@ function updateDisabledState() {
     fader.setAttribute("aria-disabled", disabled ? "true" : "false");
   });
   if (elements.previewTaskBtn) elements.previewTaskBtn.disabled = !state.config;
-  if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = !state.taskPreviewId || !enabled;
+  if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = !state.taskPreviewId || !enabled || taskDraftBlocksRun();
+  if (elements.taskStopBtn) {
+    const taskStatus = state.robotState?.task_execution?.status;
+    elements.taskStopBtn.disabled = !["queued", "running", "capturing", "planning", "executing", "waiting_for_selection"].includes(taskStatus);
+  }
 }
 
 function renderState(robotState) {
+  const incomingUpdatedAt = Number(robotState?.updated_at || 0);
+  if (incomingUpdatedAt && incomingUpdatedAt < state.lastRobotStateUpdatedAt) return;
+  state.lastRobotStateUpdatedAt = Math.max(state.lastRobotStateUpdatedAt, incomingUpdatedAt);
   state.robotState = robotState;
   setBadge(elements.connectionBadge, robotState.connected ? "Connected" : "Disconnected", robotState.connected ? "badge-ok" : "badge-danger");
   setBadge(elements.modeBadge, robotState.simulation ? "Simulation" : "Hardware", robotState.simulation ? "badge-warn" : "badge-ok");
@@ -2512,9 +3714,14 @@ function renderState(robotState) {
   elements.portStatus.textContent = robotState.serial_port || (robotState.simulation ? "simulation" : "-");
   elements.hardwareArmToggle.checked = Boolean(robotState.hardware_armed);
   renderHardwareStatus(robotState);
+  renderSetupChecklist();
   const hardwareSuffix = robotState.simulation ? "" : ` - ${robotState.hardware_mode}/${robotState.config_sync_status}`;
   elements.statusPill.textContent = robotState.last_error || `${robotState.motion_state}${robotState.live_motion_enabled ? " - live real" : ""}${hardwareSuffix}`;
   renderMotionExecution(robotState);
+  renderTaskExecution(robotState);
+  syncProgramExecutionState(robotState);
+  renderProgramWorkflowStatus();
+  renderProgramPreviewSummary();
   if (state.cartesianJogActiveAxes.size === 0) setIkTargetFromFk(fk);
   updateDisabledState();
   if (!state.settingsDirtyScopes.size) updateSettingsSaveBar();
@@ -2531,7 +3738,6 @@ function renderPreview(preview) {
   const trajectory = preview.trajectory || {};
   const candidates = ik.candidates || [];
   elements.previewStatus.textContent = `Preview ready: ${preview.mode}`;
-  elements.programStatus.textContent = preview.mode === "program" ? `Ready - ${trajectory.waypoint_count || 0} pts` : elements.programStatus.textContent;
   elements.ikCandidateList.innerHTML = "";
 
   if (!candidates.length) {
@@ -2564,6 +3770,10 @@ function renderPreview(preview) {
 
   const segments = trajectory.segments || [];
   const segmentText = segments.length ? segments.map((segment) => `${segment.type}/${segment.mode}:${segment.waypoint_count}`).join(", ") : "-";
+  const calibrationApplied = Array.isArray(preview.calibration)
+    ? preview.calibration.some((item) => item.applied)
+    : Boolean(preview.calibration?.applied);
+  const commandTarget = preview.command_target || {};
   elements.ikPathSummary.innerHTML = `
     <h3>Path</h3>
     <div class="log-line"><span>Mode</span><code>${trajectory.mode || preview.mode || "-"}</code></div>
@@ -2573,6 +3783,8 @@ function renderPreview(preview) {
     <div class="log-line"><span>Waypoints</span><code>${trajectory.waypoint_count || 0}</code></div>
     <div class="log-line"><span>Branch</span><code>${ik.selected_branch || "-"}</code></div>
     <div class="log-line"><span>Target phi</span><code>${preview.target?.phi_auto ? `auto -> ${format(preview.target.phi_deg, 2)} deg` : `${format(preview.target?.phi_deg, 2)} deg`}</code></div>
+    <div class="log-line"><span>TCP calibration</span><code>${calibrationApplied ? "applied at Cartesian command layer" : "not applied"}</code></div>
+    <div class="log-line"><span>Model command</span><code>${commandTarget.x_mm !== undefined ? `x ${format(commandTarget.x_mm, 2)}, y ${format(commandTarget.y_mm, 2)}, z ${format(commandTarget.z_mm, 2)}` : preview.mode === "program" ? "per Cartesian waypoint" : "-"}</code></div>
     <div class="log-line"><span>Execute</span><code id="motionProgressLine">idle - 0%</code></div>
     <div class="log-line"><span>Segments</span><code>${segmentText}</code></div>
   `;
@@ -2581,7 +3793,10 @@ function renderPreview(preview) {
 
   const target = preview.target?.x_mm !== undefined ? preview.target : trajectory.cartesian_waypoints?.[trajectory.cartesian_waypoints.length - 1];
   state.view.setTargetPoint(target || null);
-  state.view.setPathWaypoints(trajectory.waypoints || []);
+  state.view.setPathWaypoints(
+    trajectory.waypoints || [],
+    trajectory.physical_cartesian_waypoints || null
+  );
   elements.targetHud.textContent = target ? `x ${format(target.x_mm)}, y ${format(target.y_mm)}, z ${format(target.z_mm)}` : "none";
   elements.pathHud.textContent = `${trajectory.waypoint_count || 0} pts`;
   syncJointControls();
@@ -2714,82 +3929,717 @@ async function executePreview() {
   updateDisabledState();
 }
 
-function renderProgramList() {
-  elements.programList.innerHTML = "";
-  elements.programStatus.textContent = `${state.programWaypoints.length} waypoint${state.programWaypoints.length === 1 ? "" : "s"}`;
-  if (!state.programWaypoints.length) {
-    const empty = document.createElement("div");
-    empty.className = "program-item";
-    empty.textContent = "No waypoints yet.";
-    elements.programList.appendChild(empty);
+function nextProgramStepId() {
+  const id = `program-step-${state.programNextId}`;
+  state.programNextId += 1;
+  return id;
+}
+
+function selectedProgramIndex() {
+  return state.programWaypoints.findIndex((step) => step.id === state.programSelectedId);
+}
+
+function selectedProgramStep() {
+  const index = selectedProgramIndex();
+  return index >= 0 ? state.programWaypoints[index] : null;
+}
+
+function uniqueProgramLabel(baseLabel) {
+  const base = String(baseLabel || "Motion step").trim() || "Motion step";
+  const labels = new Set(state.programWaypoints.map((step) => String(step.label || "").toLowerCase()));
+  if (!labels.has(base.toLowerCase())) return base;
+  let suffix = 2;
+  while (labels.has(`${base} ${suffix}`.toLowerCase())) suffix += 1;
+  return `${base} ${suffix}`;
+}
+
+function programDetectionEntries() {
+  return state.latestDetections
+    .map((detection, index) => {
+      const id = String(detection.id || detection.detection_id || detection.object_id || `detection-${index + 1}`);
+      return { id, detection };
+    })
+    .filter(({ detection }) => Boolean(detection.ok && detection.robot));
+}
+
+function programSourceOptions(source = elements.programStepSource.value) {
+  if (source === "named_position") {
+    return Object.keys(state.config?.named_positions || {}).sort().map((name) => ({ value: name, label: name }));
+  }
+  if (source === "vision_detection") {
+    return programDetectionEntries().map(({ id, detection }) => ({
+      value: id,
+      label: `${detection.label || detection.color || "object"} · ${id}`,
+    }));
+  }
+  if (source === "drop_zone") {
+    return Object.keys(taskDropZones()).sort().map((name) => ({ value: name, label: name }));
+  }
+  return [];
+}
+
+function programSourceHint(source = elements.programStepSource.value, optionCount = null) {
+  const count = optionCount ?? programSourceOptions(source).length;
+  if (source === "named_position") return count ? "Adds a saved joint or Cartesian named position." : "No named positions are configured.";
+  if (source === "manual_cartesian") return "Starts from the current IK target. Edit X, Y, Z, phi, and move mode after adding.";
+  if (source === "manual_joint") return "Starts from the reported joint pose. Edit each joint after adding.";
+  if (source === "vision_detection") return count ? "Uses the selected detection's robot-frame coordinates." : "Refresh detections in Tasks before adding a vision target.";
+  if (source === "drop_zone") return count ? "Adds a configured Cartesian drop-zone anchor." : "No drop zones are configured.";
+  return "";
+}
+
+function renderProgramSourceOptions() {
+  if (!elements.programStepSource || !state.config) return;
+  const source = elements.programStepSource.value;
+  const previous = elements.programSourceItem.value;
+  const options = programSourceOptions(source);
+  elements.programSourceItem.innerHTML = "";
+  options.forEach(({ value, label }) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    elements.programSourceItem.appendChild(option);
+  });
+  if (options.some((option) => option.value === previous)) elements.programSourceItem.value = previous;
+  const needsItem = ["named_position", "vision_detection", "drop_zone"].includes(source);
+  elements.programSourceItemField.hidden = !needsItem;
+  elements.programAddHint.textContent = programSourceHint(source, options.length);
+}
+
+function reportedProgramAngles() {
+  return (
+    normalizeJointAngles(state.robotState?.reported_angles_deg) ||
+    normalizeJointAngles(jointControlAngles()) ||
+    normalizeJointAngles(state.config?.home_pose) ||
+    []
+  );
+}
+
+function createProgramStep(source, sourceItem = "") {
+  const base = {
+    id: nextProgramStepId(),
+    enabled: true,
+    source,
+    source_label: sourceItem || source.replaceAll("_", " "),
+    branch: elements.ikBranchSelect.value || "auto",
+  };
+  if (source === "current_pose" || source === "manual_joint") {
+    const angles = reportedProgramAngles();
+    if (!angles.length) return null;
+    return {
+      ...base,
+      label: uniqueProgramLabel(source === "current_pose" ? "Current pose" : "Joint target"),
+      type: "joint",
+      mode: "joint",
+      angles_deg: angles.slice(),
+    };
+  }
+  if (source === "ik_target" || source === "manual_cartesian") {
+    return {
+      ...base,
+      label: uniqueProgramLabel(source === "ik_target" ? "IK target" : "Cartesian target"),
+      type: "cartesian",
+      mode: source === "manual_cartesian" ? "linear" : (elements.ikModeSelect.value === "linear" ? "linear" : "joint"),
+      target: clonePlain(ikTargetPayload()),
+    };
+  }
+  if (source === "named_position") {
+    const waypoint = namedPositionWaypoint(sourceItem);
+    if (!waypoint) return null;
+    return {
+      ...base,
+      ...clonePlain(waypoint),
+      label: uniqueProgramLabel(sourceItem),
+      mode: waypoint.type === "joint" ? "joint" : (waypoint.mode || "joint"),
+    };
+  }
+  if (source === "vision_detection") {
+    const entry = programDetectionEntries().find(({ id }) => id === sourceItem);
+    const detection = entry?.detection;
+    if (!detection?.robot) return null;
+    const robot = detection.robot;
+    const fallbackZ = Number(state.config?.task_defaults?.pickup_height_mm ?? 0);
+    return {
+      ...base,
+      label: uniqueProgramLabel(`${detection.label || detection.color || "Object"} target`),
+      type: "cartesian",
+      mode: "linear",
+      target: {
+        x_mm: Number(robot.x_mm),
+        y_mm: Number(robot.y_mm),
+        z_mm: Number.isFinite(Number(robot.z_mm)) ? Number(robot.z_mm) : fallbackZ,
+        phi_deg: Number.isFinite(Number(robot.phi_deg)) ? Number(robot.phi_deg) : 0,
+      },
+    };
+  }
+  if (source === "drop_zone") {
+    const zone = taskDropZones()[sourceItem];
+    if (!zone) return null;
+    return {
+      ...base,
+      label: uniqueProgramLabel(sourceItem),
+      type: "cartesian",
+      mode: "joint",
+      target: {
+        x_mm: Number(zone.x_mm),
+        y_mm: Number(zone.y_mm),
+        z_mm: Number(zone.z_mm),
+        phi_deg: Number(zone.phi_deg ?? 0),
+      },
+    };
+  }
+  return null;
+}
+
+function clearActiveProgramPreview() {
+  if (state.latestPreview?.mode !== "program") return;
+  state.previewId = null;
+  state.latestPreview = null;
+  state.previewAngles = null;
+  state.viewPreviewSource = null;
+  state.view?.clearPreview();
+  elements.targetHud.textContent = "none";
+  elements.pathHud.textContent = "0 pts";
+  syncJointControls();
+}
+
+function markProgramEdited(reason = "Program edited", options = {}) {
+  state.programRevision += 1;
+  state.programLastEditReason = reason;
+  state.programExecutionFailed = false;
+  state.programExecutionAwaitingStart = false;
+  state.programExecutionError = "";
+  clearActiveProgramPreview();
+  renderProgramBuilder({ inspector: options.inspector !== false });
+}
+
+function insertProgramStep(step) {
+  if (!step) {
+    showLocalError("The selected program source is not available.");
     return;
   }
-  state.programWaypoints.forEach((waypoint, index) => {
-    const item = document.createElement("div");
-    item.className = "program-item";
-    const label =
-      waypoint.type === "joint"
-        ? waypoint.angles_deg.map((value) => format(value, 1)).join(", ")
-        : formatCartesianTarget(waypoint.target);
-    item.innerHTML = `
-      <div class="program-title">
-        <span>${index + 1}. ${waypoint.type} / ${waypoint.mode}</span>
-        <span>${waypoint.type === "joint" ? "deg" : "mm"}</span>
+  const selectedIndex = selectedProgramIndex();
+  const position = elements.programInsertPosition.value;
+  let insertIndex = state.programWaypoints.length;
+  if (selectedIndex >= 0 && position === "before") insertIndex = selectedIndex;
+  if (selectedIndex >= 0 && position === "after") insertIndex = selectedIndex + 1;
+  state.programWaypoints.splice(insertIndex, 0, step);
+  state.programSelectedId = step.id;
+  markProgramEdited(`Added ${step.label}`);
+}
+
+function addProgramStep(source = elements.programStepSource.value) {
+  const options = programSourceOptions(source);
+  const sourceItem = ["named_position", "vision_detection", "drop_zone"].includes(source)
+    ? (source === elements.programStepSource.value ? elements.programSourceItem.value : options[0]?.value)
+    : "";
+  insertProgramStep(createProgramStep(source, sourceItem || ""));
+}
+
+function duplicateProgramStep(index) {
+  const original = state.programWaypoints[index];
+  if (!original) return;
+  const duplicate = clonePlain(original);
+  duplicate.id = nextProgramStepId();
+  duplicate.label = uniqueProgramLabel(`${original.label || `Step ${index + 1}`} copy`);
+  state.programWaypoints.splice(index + 1, 0, duplicate);
+  state.programSelectedId = duplicate.id;
+  markProgramEdited(`Duplicated ${original.label || `step ${index + 1}`}`);
+}
+
+function deleteProgramStep(index) {
+  const [removed] = state.programWaypoints.splice(index, 1);
+  if (!removed) return;
+  const next = state.programWaypoints[Math.min(index, state.programWaypoints.length - 1)];
+  state.programSelectedId = next?.id || null;
+  markProgramEdited(`Deleted ${removed.label || `step ${index + 1}`}`);
+}
+
+function moveProgramStep(index, direction) {
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= state.programWaypoints.length) return;
+  const [step] = state.programWaypoints.splice(index, 1);
+  state.programWaypoints.splice(nextIndex, 0, step);
+  state.programSelectedId = step.id;
+  markProgramEdited(`Reordered ${step.label || "step"}`);
+}
+
+function programStepClientValidation(step, index) {
+  if (step.enabled === false) return { ok: true, status: "disabled", errors: [] };
+  const errors = [];
+  if (!String(step.label || "").trim()) errors.push("label is required");
+  if (step.type === "joint") {
+    const expected = state.config?.joints?.length || 4;
+    if (!Array.isArray(step.angles_deg) || step.angles_deg.length !== expected) {
+      errors.push(`expected ${expected} joint angles`);
+    } else {
+      step.angles_deg.forEach((value, jointIndex) => {
+        if (!Number.isFinite(Number(value))) {
+          errors.push(`J${jointIndex + 1} must be a number`);
+          return;
+        }
+        const joint = state.config?.joints?.[jointIndex];
+        if (joint && (Number(value) < joint.min_deg || Number(value) > joint.max_deg)) {
+          errors.push(`J${jointIndex + 1} is outside ${format(joint.min_deg, 1)}..${format(joint.max_deg, 1)} deg`);
+        }
+      });
+    }
+  } else {
+    const target = step.target || {};
+    ["x_mm", "y_mm", "z_mm"].forEach((key) => {
+      if (!Number.isFinite(Number(target[key]))) errors.push(`${key.replace("_mm", "").toUpperCase()} must be a number`);
+    });
+    if (!target.phi_auto && !Number.isFinite(Number(target.phi_deg))) errors.push("Phi must be a number or Auto");
+    if (!["joint", "linear"].includes(step.mode)) errors.push("move mode must be joint or linear");
+  }
+  return {
+    ok: errors.length === 0,
+    status: errors.length ? "invalid" : "unvalidated",
+    errors: errors.map((error) => `Step ${index + 1}: ${error}`),
+  };
+}
+
+function latestProgramTrajectory() {
+  if (state.programPreviewFailure) return state.programPreviewFailure.trajectory || {};
+  return state.programPreview?.trajectory || {};
+}
+
+function programStepResult(index) {
+  return (latestProgramTrajectory().step_results || []).find((result) => Number(result.index) === index) || null;
+}
+
+function programStepValues(step) {
+  if (step.type === "joint") {
+    return (step.angles_deg || []).map((value, index) => `J${index + 1} ${format(value, 1)}°`).join(" · ");
+  }
+  return formatCartesianTarget(step.target || {});
+}
+
+function conciseProgramError(error) {
+  const message = String(error || "").trim();
+  const stepPrefix = message.match(/^Step \d+:/i)?.[0] || "";
+  const prefix = stepPrefix ? `${stepPrefix} ` : "";
+  if (/no valid position\/orientation IK solution/i.test(message)) {
+    return `${prefix}No valid IK solution for this path point. Adjust the target position, orientation, or move mode.`;
+  }
+  if (/no valid IK solution/i.test(message)) {
+    return `${prefix}No valid IK solution at the requested target. Adjust the position, orientation, or IK branch.`;
+  }
+  if (/outside .* reach/i.test(message)) {
+    return `${prefix}Target is outside the configured robot reach.`;
+  }
+  return message.length > 220 ? `${message.slice(0, 217)}…` : message;
+}
+
+function renderProgramList() {
+  elements.programList.innerHTML = "";
+  const stepCount = state.programWaypoints.length;
+  elements.programStepCount.textContent = `(${stepCount} step${stepCount === 1 ? "" : "s"})`;
+  const trajectory = latestProgramTrajectory();
+  const stale = state.programValidationRevision !== null && state.programValidationRevision !== state.programRevision;
+  elements.programEstimatedDuration.textContent = Number.isFinite(Number(trajectory.duration_s))
+    ? `${stale ? "Stale · " : ""}${format(trajectory.duration_s, 2)} s`
+    : "No estimate";
+  if (!stepCount) {
+    elements.programList.innerHTML = `
+      <div class="program-empty-state">
+        <strong>Build the first move</strong>
+        <p>Add the reported robot pose or the current IK target, then select the step to edit its values and move mode.</p>
+        <div class="program-empty-actions">
+          <button type="button" data-program-quick-source="current_pose">Add current pose</button>
+          <button type="button" data-program-quick-source="ik_target">Add IK target</button>
+        </div>
       </div>
-      <code>${label}</code>
-      <div class="button-row">
-        <button type="button" class="ghost" data-program-action="up" data-program-index="${index}">Up</button>
-        <button type="button" class="ghost" data-program-action="down" data-program-index="${index}">Down</button>
-        <button type="button" class="danger" data-program-action="delete" data-program-index="${index}">Delete</button>
+    `;
+    return;
+  }
+
+  state.programWaypoints.forEach((step, index) => {
+    const client = programStepClientValidation(step, index);
+    const result = programStepResult(index);
+    const currentValidation = state.programValidationRevision === state.programRevision;
+    const status = step.enabled === false
+      ? "disabled"
+      : !client.ok
+        ? "invalid"
+        : currentValidation
+          ? result?.status || "unvalidated"
+          : stale && result
+            ? "stale"
+            : "unvalidated";
+    const errors = !client.ok ? client.errors : (currentValidation ? result?.errors || [] : []);
+    const duration = result && Number.isFinite(Number(result.duration_s)) ? `${format(result.duration_s, 2)} s` : "—";
+    const item = document.createElement("div");
+    item.className = `program-step-row ${state.programSelectedId === step.id ? "selected" : ""} ${status}`;
+    item.dataset.programSelect = String(index);
+    item.innerHTML = `
+      <div class="program-step-main">
+        <label class="program-step-enable" title="${step.enabled === false ? "Enable step" : "Disable step"}">
+          <input type="checkbox" data-program-action="toggle" data-program-index="${index}" ${step.enabled === false ? "" : "checked"} ${state.programExecutionActive ? "disabled" : ""} />
+          <span>${index + 1}</span>
+        </label>
+        <div class="program-step-copy">
+          <div class="program-step-heading">
+            <strong>${escapeHtml(step.label || `Step ${index + 1}`)}</strong>
+            <span class="program-validation ${status}">${status === "valid" ? "Valid" : status === "invalid" ? "Invalid" : status === "disabled" ? "Disabled" : status === "stale" ? "Stale" : "Not previewed"}</span>
+          </div>
+          <div class="program-step-meta">
+            <span>${step.type === "joint" ? "Joint target" : "Cartesian target"}</span>
+            <span class="program-mode ${step.mode === "linear" ? "linear" : "joint"}">${step.mode === "linear" ? "Linear TCP" : "Joint move"}</span>
+            <span>${duration}</span>
+          </div>
+          <code>${escapeHtml(programStepValues(step))}</code>
+          ${errors.length ? `<div class="program-step-error" title="${escapeHtml(errors[0])}">${escapeHtml(conciseProgramError(errors[0]))}</div>` : ""}
+        </div>
+      </div>
+      <div class="program-step-actions">
+        <button type="button" class="ghost" data-program-action="up" data-program-index="${index}" ${index === 0 || state.programExecutionActive ? "disabled" : ""} aria-label="Move step up">↑</button>
+        <button type="button" class="ghost" data-program-action="down" data-program-index="${index}" ${index === stepCount - 1 || state.programExecutionActive ? "disabled" : ""} aria-label="Move step down">↓</button>
+        <button type="button" class="ghost" data-program-action="duplicate" data-program-index="${index}" ${state.programExecutionActive ? "disabled" : ""}>Duplicate</button>
+        <button type="button" class="ghost danger-text" data-program-action="delete" data-program-index="${index}" ${state.programExecutionActive ? "disabled" : ""}>Delete</button>
       </div>
     `;
     elements.programList.appendChild(item);
   });
 }
 
-function addCurrentJointWaypoint() {
-  const angles = jointControlAngles() || [];
-  if (angles.length !== state.config.joints.length) return;
-  state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: angles });
-  renderProgramList();
+function renderProgramInspector() {
+  const step = selectedProgramStep();
+  const index = selectedProgramIndex();
+  elements.programInspectorSection.hidden = !step;
+  if (!step) {
+    elements.programInspector.innerHTML = "";
+    return;
+  }
+  elements.programInspectorTitle.textContent = `Selected step ${index + 1} of ${state.programWaypoints.length}`;
+  const disabled = state.programExecutionActive ? "disabled" : "";
+  const valueFields = step.type === "joint"
+    ? `<div class="program-value-grid">
+        ${(step.angles_deg || []).map((value, jointIndex) => `
+          <label>J${jointIndex + 1} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(value)) ? value : ""}" data-program-field="angle" data-program-value-index="${jointIndex}" ${disabled} /><span>deg</span></span></label>
+        `).join("")}
+      </div>`
+    : `<div class="program-value-grid">
+        ${[
+          ["x_mm", "X", "mm"],
+          ["y_mm", "Y", "mm"],
+          ["z_mm", "Z", "mm"],
+          ["phi_deg", "Phi", "deg"],
+        ].map(([key, label, unit]) => `
+          <label>${label} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(step.target?.[key])) ? step.target[key] : ""}" data-program-field="target" data-program-target-key="${key}" ${key === "phi_deg" && step.target?.phi_auto ? "disabled" : disabled} /><span>${unit}</span></span></label>
+        `).join("")}
+      </div>
+      <label class="toggle-label compact-toggle program-auto-phi">
+        <input type="checkbox" data-program-field="phi_auto" ${step.target?.phi_auto ? "checked" : ""} ${disabled} />
+        <span>Choose phi automatically during IK</span>
+      </label>`;
+
+  elements.programInspector.innerHTML = `
+    <div class="program-inspector-grid">
+      <label>Label <input type="text" value="${escapeHtml(step.label || "")}" data-program-field="label" ${disabled} /></label>
+      <label>Move mode
+        <select data-program-field="mode" ${step.type === "joint" || state.programExecutionActive ? "disabled" : ""}>
+          <option value="joint" ${step.mode === "joint" ? "selected" : ""}>Joint move</option>
+          <option value="linear" ${step.mode === "linear" ? "selected" : ""}>Linear Cartesian move</option>
+        </select>
+      </label>
+    </div>
+    <div class="program-inspector-type"><span>Type</span><strong>${step.type === "joint" ? "Joint target" : "Cartesian target"}</strong></div>
+    ${valueFields}
+    <details class="program-advanced">
+      <summary>Advanced</summary>
+      <div class="program-inspector-grid">
+        <label>IK branch
+          <select data-program-field="branch" ${step.type === "joint" || state.programExecutionActive ? "disabled" : ""}>
+            <option value="auto" ${step.branch === "auto" ? "selected" : ""}>Auto nearest</option>
+            <option value="elbow_up" ${step.branch === "elbow_up" ? "selected" : ""}>Elbow up</option>
+            <option value="elbow_down" ${step.branch === "elbow_down" ? "selected" : ""}>Elbow down</option>
+          </select>
+        </label>
+        <div class="program-source-readout"><span>Source</span><strong>${escapeHtml(step.source_label || step.source || "manual")}</strong></div>
+      </div>
+      <p class="field-help">Per-step speed and tool actions are not part of the current motion-only program API. The step shape keeps source and settings fields available for later extension.</p>
+    </details>
+    <div class="program-inspector-actions">
+      <button type="button" class="ghost" data-program-inspector-action="duplicate" ${disabled}>Duplicate step</button>
+      <button type="button" class="ghost danger-text" data-program-inspector-action="delete" ${disabled}>Delete step</button>
+    </div>
+  `;
 }
 
-function addIkWaypoint() {
-  const type = elements.programWaypointType.value;
-  const mode = elements.programMoveMode.value;
-  if (type === "joint") {
-    const selected = state.latestPreview?.ik?.selected?.angles_deg;
-    const fallback = jointControlAngles();
-    const angles = normalizeJointAngles(selected) || fallback;
-    if (!angles) return;
-    state.programWaypoints.push({ type: "joint", mode: "joint", angles_deg: angles });
-  } else {
-    state.programWaypoints.push({
-      type: "cartesian",
-      mode,
-      target: ikTargetPayload(),
-      branch: elements.ikBranchSelect.value,
-    });
+function programWorkflowState() {
+  if (state.programExecutionActive) return "running";
+  if (!state.programWaypoints.length) return "empty";
+  if (
+    state.programExecutionFailed ||
+    (state.programPreviewFailure && state.programValidationRevision === state.programRevision)
+  ) return "failed";
+  if (programPreviewIsFresh()) return "preview_valid";
+  if (state.programHasPreviewed || state.programValidationRevision !== null) return "needs_preview";
+  return "editing";
+}
+
+function renderProgramWorkflowStatus() {
+  const workflowState = programWorkflowState();
+  const labels = {
+    empty: "Empty",
+    editing: "Editing",
+    needs_preview: "Needs preview",
+    preview_valid: "Preview valid",
+    running: "Running",
+    failed: "Failed",
+  };
+  elements.programStatus.textContent = labels[workflowState];
+  elements.programStatus.dataset.state = workflowState;
+  const diagnostics = state.robotState?.motion_diagnostics || {};
+  const details = {
+    empty: "Add the first motion step to begin.",
+    editing: "Build the sequence, select each step to edit it, then run Preview.",
+    needs_preview: `${state.programLastEditReason || "The sequence changed"}. Preview the current version before execution.`,
+    preview_valid: "This exact sequence passed preview and is ready when the robot safety gates are satisfied.",
+    running: `Executing ${diagnostics.current_waypoint_total ? `waypoint ${diagnostics.current_waypoint_index || 0} of ${diagnostics.current_waypoint_total}` : "the validated program"}.`,
+    failed: state.programExecutionError || state.programPreviewFailure?.error || "Preview or execution failed. Inspect the affected step below.",
+  };
+  elements.programStatusDetail.textContent = details[workflowState];
+
+  const activeStage = workflowState === "running" || state.programExecutionFailed
+    ? "execute"
+    : ["preview_valid", "failed"].includes(workflowState)
+      ? "preview"
+      : "build";
+  const completed = new Set();
+  if (["preview_valid", "running"].includes(workflowState)) completed.add("build");
+  if (workflowState === "running") completed.add("preview");
+  elements.programWorkflow.querySelectorAll("[data-program-stage]").forEach((stage) => {
+    stage.classList.toggle("active", stage.dataset.programStage === activeStage);
+    stage.classList.toggle("done", completed.has(stage.dataset.programStage));
+  });
+}
+
+function currentProgramErrors() {
+  const errors = [];
+  state.programWaypoints.forEach((step, index) => {
+    errors.push(...programStepClientValidation(step, index).errors);
+  });
+  if (state.programValidationRevision === state.programRevision && state.programPreviewFailure) {
+    const stepErrors = (state.programPreviewFailure.trajectory?.step_results || [])
+      .filter((result) => result.status === "invalid")
+      .flatMap((result) => (result.errors || []).map((error) => `Step ${Number(result.index) + 1}: ${error}`));
+    if (stepErrors.length) errors.push(...stepErrors.map(conciseProgramError));
+    else if (state.programPreviewFailure.error) errors.push(conciseProgramError(state.programPreviewFailure.error));
   }
+  return [...new Set(errors)];
+}
+
+function renderProgramPreviewSummary() {
+  const trajectory = latestProgramTrajectory();
+  const stepCount = state.programWaypoints.length;
+  const moveCount = state.programWaypoints.filter((step) => step.enabled !== false).length;
+  const fresh = programPreviewIsFresh();
+  const stale = state.programValidationRevision !== null && state.programValidationRevision !== state.programRevision;
+  const status = state.programExecutionActive
+    ? "Running"
+    : fresh
+      ? "Valid"
+      : state.programPreviewPending
+      ? "Checking"
+      : state.programPreviewFailure && state.programValidationRevision === state.programRevision
+        ? "Failed"
+        : stale
+          ? "Stale"
+          : "Not previewed";
+  const errors = currentProgramErrors();
+  const calibrationWarnings = Array.isArray(state.programPreview?.calibration)
+    ? state.programPreview.calibration.flatMap((item) => item.warnings || [])
+    : state.programPreview?.calibration?.warnings || [];
+  elements.programPreviewSummary.innerHTML = `
+    <div class="program-summary-grid">
+      <div><span>Steps</span><strong>${stepCount}</strong></div>
+      <div><span>Moves</span><strong>${moveCount}</strong></div>
+      <div><span>Duration</span><strong>${Number.isFinite(Number(trajectory.duration_s)) ? `${format(trajectory.duration_s, 2)} s` : "—"}</strong></div>
+      <div><span>Preview</span><strong class="program-summary-status ${status.toLowerCase().replace(" ", "-")}">${status}</strong></div>
+    </div>
+    <div class="program-summary-messages">
+      ${stale ? `<div class="program-summary-message warning"><strong>Preview is stale</strong><span>${escapeHtml(state.programLastEditReason || "The sequence changed after preview.")}</span></div>` : ""}
+      ${errors.slice(0, 5).map((error) => `<div class="program-summary-message error"><strong>Needs attention</strong><span>${escapeHtml(error)}</span></div>`).join("")}
+      ${calibrationWarnings.slice(0, 3).map((warning) => `<div class="program-summary-message warning"><strong>Warning</strong><span>${escapeHtml(warning)}</span></div>`).join("")}
+      ${fresh && !errors.length ? `<div class="program-summary-message success"><strong>Preview matches</strong><span>${trajectory.waypoint_count || 0} planned path points are ready for execution.</span></div>` : ""}
+      ${!stepCount ? `<div class="program-summary-message neutral"><strong>No sequence yet</strong><span>Add a motion step above. Editing never sends a robot command.</span></div>` : ""}
+    </div>
+  `;
+  const gateReason = programMotionGateReason();
+  if (state.programExecutionActive) {
+    elements.programExecuteHint.textContent = "Program execution is in progress. Editing is locked until it finishes or is stopped.";
+  } else if (fresh && gateReason) {
+    elements.programExecuteHint.textContent = `Preview is valid, but execution is blocked: ${gateReason}`;
+  } else if (fresh) {
+    elements.programExecuteHint.textContent = "Ready to execute the exact previewed sequence.";
+  } else {
+    elements.programExecuteHint.textContent = "Run a fresh preview with no errors before execution.";
+  }
+}
+
+function renderProgramBuilder(options = {}) {
+  renderProgramSourceOptions();
   renderProgramList();
+  if (options.inspector !== false) renderProgramInspector();
+  renderProgramWorkflowStatus();
+  renderProgramPreviewSummary();
+  updateDisabledState();
+}
+
+function updateProgramStepFromControl(control) {
+  const step = selectedProgramStep();
+  if (!step || !control?.dataset?.programField) return;
+  const field = control.dataset.programField;
+  if (field === "label") step.label = control.value;
+  if (field === "mode") step.mode = control.value === "linear" && step.type === "cartesian" ? "linear" : "joint";
+  if (field === "branch") step.branch = control.value;
+  if (field === "phi_auto") {
+    step.target = step.target || {};
+    step.target.phi_auto = control.checked;
+  }
+  if (field === "target") {
+    step.target = step.target || {};
+    step.target[control.dataset.programTargetKey] = control.value === "" ? Number.NaN : Number(control.value);
+  }
+  if (field === "angle") {
+    const valueIndex = Number(control.dataset.programValueIndex);
+    step.angles_deg[valueIndex] = control.value === "" ? Number.NaN : Number(control.value);
+  }
+  markProgramEdited(`Edited ${step.label || "selected step"}`, { inspector: false });
 }
 
 async function previewProgram() {
-  if (!state.programWaypoints.length) {
-    elements.programStatus.textContent = "Add waypoints first";
+  const enabledSteps = state.programWaypoints.filter((step) => step.enabled !== false);
+  if (!enabledSteps.length || state.programPreviewPending) {
+    renderProgramBuilder();
     return;
   }
-  elements.programStatus.textContent = "Previewing...";
+  const revision = state.programRevision;
+  const clientErrors = currentProgramErrors();
+  state.programHasPreviewed = true;
+  if (clientErrors.length) {
+    state.programPreviewRevision = null;
+    state.programValidationRevision = revision;
+    state.programPreviewFailure = {
+      ok: false,
+      error: clientErrors[0],
+      trajectory: {
+        step_count: state.programWaypoints.length,
+        move_count: enabledSteps.length,
+        step_results: state.programWaypoints.map((step, index) => {
+          const validation = programStepClientValidation(step, index);
+          return {
+            index,
+            label: step.label,
+            type: step.type,
+            mode: step.mode,
+            enabled: step.enabled !== false,
+            status: validation.status,
+            duration_s: 0,
+            waypoint_count: 0,
+            errors: validation.errors.map((error) => error.replace(/^Step \d+:\s*/, "")),
+          };
+        }),
+      },
+    };
+    clearActiveProgramPreview();
+    renderProgramBuilder();
+    return;
+  }
+
+  state.programPreviewPending = true;
+  state.programPreviewFailure = null;
+  renderProgramBuilder({ inspector: false });
   const payload = await postJson("/api/path/preview", {
     mode: "program",
     branch: elements.ikBranchSelect.value,
     settings: pathSettings(),
-    waypoints: state.programWaypoints,
+    waypoints: clonePlain(state.programWaypoints),
+    program_revision: revision,
   });
-  if (payload.ok) renderPreview(payload.preview);
-  else {
+  state.programPreviewPending = false;
+  if (revision !== state.programRevision) {
+    renderProgramBuilder();
+    return;
+  }
+  state.programValidationRevision = revision;
+  if (payload.ok) {
+    renderPreview(payload.preview);
+    state.programPreview = payload.preview;
+    state.programPreviewRevision = revision;
+    state.programPreviewFailure = null;
+    state.programExecutionFailed = false;
+  } else {
+    state.programPreviewRevision = null;
+    state.programPreviewFailure = payload;
     renderPreviewFailure(payload);
-    elements.programStatus.textContent = payload.error || "Program preview failed";
+  }
+  renderProgramBuilder();
+}
+
+async function executeProgram() {
+  if (!programPreviewIsFresh()) {
+    showLocalError("Preview the current program successfully before execution.");
+    return;
+  }
+  const gateReason = programMotionGateReason();
+  if (gateReason) {
+    showLocalError(gateReason);
+    renderProgramBuilder({ inspector: false });
+    return;
+  }
+  const previewId = state.previewId;
+  state.programExecutionActive = true;
+  state.programExecutionAwaitingStart = true;
+  state.programExecutionFailed = false;
+  state.programExecutionError = "";
+  renderProgramBuilder({ inspector: false });
+  const payload = await postJson("/api/path/execute", {
+    preview_id: previewId,
+    program_revision: state.programRevision,
+  });
+  if (payload.ok) {
+    releaseJointControlIntent();
+    state.previewId = null;
+    state.previewAngles = null;
+    state.taskPreviewId = null;
+    state.ikUserEdited = false;
+    state.programPreviewRevision = null;
+    state.programLastEditReason = "The previous preview was consumed by execution";
+  } else {
+    state.programExecutionActive = false;
+    state.programExecutionAwaitingStart = false;
+    state.programExecutionFailed = true;
+    state.programExecutionError = payload.error || "Program execution failed.";
+  }
+  if (payload.state) renderState(payload.state);
+  renderProgramBuilder({ inspector: false });
+}
+
+function syncProgramExecutionState(robotState) {
+  if (!state.programExecutionActive) return;
+  const diagnostics = robotState?.motion_diagnostics || {};
+  const result = String(diagnostics.result || robotState?.motion_execution_state || "").toLowerCase();
+  if (state.programExecutionAwaitingStart) {
+    if (["queued", "executing", "uploading", "accepted", "command_sent"].includes(result)) {
+      state.programExecutionAwaitingStart = false;
+    } else {
+      return;
+    }
+  }
+  if (result === "failed" || result === "stopped") {
+    state.programExecutionActive = false;
+    state.programExecutionAwaitingStart = false;
+    state.programExecutionFailed = true;
+    state.programExecutionError = diagnostics.error || robotState?.last_error || `Program ${result}.`;
+  } else if (result === "reached") {
+    state.programExecutionActive = false;
+    state.programExecutionAwaitingStart = false;
+    state.programExecutionFailed = false;
+    state.programExecutionError = "";
+    state.programLastEditReason = "Execution finished";
   }
 }
 
@@ -2841,6 +4691,15 @@ function readCalibrationPayload() {
     geometry: readGeometryPayload(),
     tools: readToolsPayload(),
     joints,
+    color_profiles: taskColorProfiles(),
+    drop_zones: taskDropZones(),
+    tasks: {
+      ...(state.config.tasks || {}),
+      color_sorting: {
+        ...(state.config.tasks?.color_sorting || {}),
+        orientation_policy: elements.orientationPolicySelect?.value || state.config.tasks?.color_sorting?.orientation_policy || "prefer_downward",
+      },
+    },
     path_defaults: pathSettings(),
     motion: {
       command_rate_limit_hz: readNumber(elements.waypointRateInput, state.config.motion.command_rate_limit_hz),
@@ -2941,9 +4800,15 @@ async function discardSettingsChanges() {
 }
 
 function applyConfig(config) {
+  const previousConfigId = state.config?.app_version?.running_config_id;
+  const nextConfigId = config?.app_version?.running_config_id;
+  const replacingConfig = Boolean(state.config && previousConfigId !== nextConfigId);
   state.config = config;
   state.linkDraft = null;
   state.dhDraftRows = null;
+  state.taskColorProfilesDraft = clonePlain(config.color_profiles || {});
+  state.taskDropZonesDraft = clonePlain(config.drop_zones || {});
+  state.unsavedColorProfiles.clear();
   state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
   elements.commandRate.textContent = `${format(state.config.motion.command_rate_limit_hz, 0)} Hz command limit`;
@@ -2968,7 +4833,7 @@ function applyConfig(config) {
   buildIkTargetControls();
   buildSliderRanges();
   updatePhiControlState();
-  renderProgramList();
+  renderProgramBuilder();
   state.view.setConfig(state.config);
   syncJointControls();
   renderCameraIntrinsics(state.config.camera);
@@ -2982,6 +4847,10 @@ function applyConfig(config) {
     scheduleWorkspaceProjection(0);
   }
   updateSettingsSaveBar();
+  if (replacingConfig) invalidateTaskDetections("Robot configuration changed - refresh detections");
+  if (replacingConfig && state.programWaypoints.length && !state.programExecutionActive) {
+    markProgramEdited("Robot configuration changed", { inspector: false });
+  }
 }
 
 function clearViewPreview() {
@@ -2991,6 +4860,7 @@ function clearViewPreview() {
   state.taskPreviewId = null;
   state.viewPreviewSource = null;
   if (state.view) state.view.clearPreview();
+  state.view?.setTaskPreview?.(null);
   elements.targetHud.textContent = "none";
   elements.pathHud.textContent = "0 pts";
   syncJointControls();
@@ -3265,12 +5135,12 @@ function bindActions() {
         scheduleIkPreview(0);
       }
       if (target === "operate") {
-        detectVision();
+        renderDetectionList(state.latestDetections);
+        renderWorkflowStepper(state.taskPreviewId ? "preview" : "detect");
       } else {
         setCameraPopupVisible(false);
         setCameraLive(false);
-        state.latestDetections = [];
-        state.view?.setObjectDetections([]);
+        invalidateTaskDetections("Refresh detections after returning to Tasks");
       }
       if (target === "settings") {
         loadWorkspaceCalibrationStatus();
@@ -3438,11 +5308,20 @@ function bindActions() {
     elements.jerkPercentInput,
     elements.blendPercentInput,
   ].forEach((input) => {
-    input?.addEventListener("input", () => markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them."));
-    input?.addEventListener("change", () => markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them."));
+    const handleMotionSettingsChange = () => {
+      markSettingsDirty("motion", "Motion defaults changed. Save all settings to persist them.");
+      if (state.programWaypoints.length && !state.programExecutionActive) {
+        markProgramEdited("Motion settings changed", { inspector: false });
+      }
+    };
+    input?.addEventListener("input", handleMotionSettingsChange);
   });
-  elements.perJointTuning?.addEventListener("input", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
-  elements.perJointTuning?.addEventListener("change", () => markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them."));
+  elements.perJointTuning?.addEventListener("input", () => {
+    markSettingsDirty("motion", "Per-joint motion limits changed. Save all settings to persist them.");
+    if (state.programWaypoints.length && !state.programExecutionActive) {
+      markProgramEdited("Per-joint motion limits changed", { inspector: false });
+    }
+  });
   [
     elements.cameraEnabledInput,
     elements.cameraSourceInput,
@@ -3544,8 +5423,109 @@ function bindActions() {
   elements.toolCloseBtn.addEventListener("click", () => sendTool("close"));
   elements.toolOnBtn.addEventListener("click", () => sendTool("on"));
   elements.toolOffBtn.addEventListener("click", () => sendTool("off"));
+  elements.taskWorkflowStepper?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-task-step]");
+    if (!button) return;
+    state.activeTaskStep = button.dataset.taskStep;
+    renderWorkflowStepper(state.taskProgressStep || state.activeTaskStep);
+  });
+  elements.colorPresetMapping?.addEventListener("change", (event) => {
+    const enabledInput = event.target.closest("[data-color-enabled]");
+    const zoneSelect = event.target.closest("[data-color-drop-zone]");
+    if (enabledInput) {
+      updateColorProfileDraft(enabledInput.dataset.colorEnabled, { enabled: enabledInput.checked });
+    }
+    if (zoneSelect) {
+      updateColorProfileDraft(zoneSelect.dataset.colorDropZone, { drop_zone: zoneSelect.value });
+    }
+  });
+  elements.dropPresetEditor?.addEventListener("input", (event) => {
+    const input = event.target.closest("[data-drop-zone-field]");
+    if (!input) return;
+    updateDropZoneDraft(input.dataset.dropZone, input.dataset.dropZoneField, input.value);
+  });
+  elements.dropPresetEditor?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-drop-zone-delete]");
+    if (!button) return;
+    deleteDropPreset(button.dataset.dropZoneDelete);
+  });
+  elements.colorProfileEditor?.addEventListener("change", (event) => {
+    const enabledInput = event.target.closest("[data-settings-color-enabled]");
+    const zoneSelect = event.target.closest("[data-settings-color-drop-zone]");
+    if (enabledInput) {
+      updateColorProfileDraft(enabledInput.dataset.settingsColorEnabled, { enabled: enabledInput.checked });
+    }
+    if (zoneSelect) {
+      updateColorProfileDraft(zoneSelect.dataset.settingsColorDropZone, { drop_zone: zoneSelect.value });
+    }
+  });
+  elements.addDropPresetBtn?.addEventListener("click", addDropPreset);
+  [
+    elements.taskModeSelect,
+    elements.executionStrategySelect,
+    elements.objectSelectionPolicySelect,
+    elements.maxObjectsInput,
+    elements.minConfidenceInput,
+    elements.includeColorsSelect,
+    elements.colorPriorityInput,
+    elements.missingDropzonePolicySelect,
+    elements.unknownColorPolicySelect,
+    elements.placementPolicySelect,
+    elements.dropZoneSelect,
+    elements.sortColorSelect,
+    elements.pickupZInput,
+    elements.dropoffZInput,
+    elements.approachClearanceInput,
+    elements.dropApproachClearanceInput,
+    elements.orientationPolicySelect,
+    elements.pickupPhiInput,
+    elements.dropPhiInput,
+    elements.transferModeSelect,
+    elements.pickupDescentModeSelect,
+    elements.liftModeSelect,
+    elements.dropDescentModeSelect,
+    elements.captureSettleInput,
+    elements.toolSettleInput,
+    elements.objectProfilesInput,
+  ].forEach((input) => input?.addEventListener("input", () => invalidateTaskPreview("Task settings changed")));
+  [
+    elements.taskModeSelect,
+    elements.executionStrategySelect,
+    elements.objectSelectionPolicySelect,
+    elements.includeColorsSelect,
+    elements.missingDropzonePolicySelect,
+    elements.unknownColorPolicySelect,
+    elements.placementPolicySelect,
+    elements.dropZoneSelect,
+    elements.sortColorSelect,
+    elements.orientationPolicySelect,
+    elements.transferModeSelect,
+    elements.pickupDescentModeSelect,
+    elements.liftModeSelect,
+    elements.dropDescentModeSelect,
+  ].forEach((input) => input?.addEventListener("change", () => invalidateTaskPreview("Task settings changed")));
+  elements.detectionList?.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-detection-select]");
+    if (!input) return;
+    const id = String(input.dataset.detectionSelect);
+    if (input.checked) state.selectedDetectionIds.add(id);
+    else state.selectedDetectionIds.delete(id);
+    invalidateTaskPreview("Detection selection changed");
+    renderDetectionList(state.latestDetections);
+  });
+  elements.detectionList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-runtime-select]");
+    if (!button) return;
+    selectRuntimeDetection(button.dataset.runtimeSelect);
+  });
+  elements.taskRunMonitor?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-runtime-select]");
+    if (!button) return;
+    selectRuntimeDetection(button.dataset.runtimeSelect);
+  });
   elements.previewTaskBtn.addEventListener("click", previewTask);
   elements.executeTaskBtn.addEventListener("click", executeTask);
+  elements.taskStopBtn?.addEventListener("click", stopTask);
   elements.viewCameraBtn?.addEventListener("click", () => {
     setCameraPopupVisible(true);
     detectVision();
@@ -3556,6 +5536,25 @@ function bindActions() {
   elements.cameraLiveToggle?.addEventListener("change", () => setCameraLive(elements.cameraLiveToggle.checked));
   elements.calibrateWorkspaceBtn?.addEventListener("click", calibrateWorkspace);
   elements.verifyWorkspaceCalibrationBtn?.addEventListener("click", verifyWorkspaceCalibration);
+  elements.tcpCalGenerateBtn?.addEventListener("click", generateTcpCalibrationTargets);
+  elements.tcpCalPreviewFitBtn?.addEventListener("click", () => previewTcpCalibrationMove(false, "fit"));
+  elements.tcpCalPreviewValidationBtn?.addEventListener("click", () => previewTcpCalibrationMove(true, "validation"));
+  elements.tcpCalExecuteBtn?.addEventListener("click", executeTcpCalibrationMove);
+  elements.tcpCalCaptureXyBtn?.addEventListener("click", captureTcpCalibrationXy);
+  elements.tcpCalUseTouchOffBtn?.addEventListener("click", useTcpCalibrationTouchOff);
+  elements.tcpCalSaveSampleBtn?.addEventListener("click", saveTcpCalibrationSample);
+  elements.tcpCalFitBtn?.addEventListener("click", fitTcpCalibration);
+  elements.tcpCalApplyEnableBtn?.addEventListener("click", applyTcpCalibrationEnableState);
+  elements.tcpCalibrationTargetList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-tcp-cal-target]");
+    if (!button) return;
+    const point = state.tcpCalibrationTargets[Number(button.dataset.tcpCalTarget)];
+    if (point) setTcpCalibrationTarget(point.intended_target);
+  });
+  elements.tcpCalibrationSamples?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-tcp-cal-delete]");
+    if (button) deleteTcpCalibrationSample(button.dataset.tcpCalDelete);
+  });
 
   elements.sliderRangeControls.addEventListener("input", () => {
     state.ikUserEdited = true;
@@ -3585,27 +5584,71 @@ function bindActions() {
   elements.executeIkBtn.addEventListener("click", () => executePreview());
   elements.ikStopBtn.addEventListener("click", () => postJson("/api/stop"));
 
-  elements.addCurrentJointWaypointBtn.addEventListener("click", addCurrentJointWaypoint);
-  elements.addIkWaypointBtn.addEventListener("click", addIkWaypoint);
+  elements.appTabPanels.program.addEventListener("click", (event) => {
+    const quickAdd = event.target.closest("[data-program-quick-source]");
+    if (quickAdd) {
+      addProgramStep(quickAdd.dataset.programQuickSource);
+    }
+  });
+  elements.programStepSource.addEventListener("change", () => {
+    renderProgramSourceOptions();
+    updateDisabledState();
+  });
+  elements.programSourceItem.addEventListener("change", updateDisabledState);
+  elements.addProgramStepBtn.addEventListener("click", () => addProgramStep());
   elements.clearProgramBtn.addEventListener("click", () => {
+    if (!window.confirm(`Clear all ${state.programWaypoints.length} program steps? This cannot be undone.`)) return;
     state.programWaypoints = [];
-    renderProgramList();
+    state.programSelectedId = null;
+    state.programPreview = null;
+    state.programPreviewFailure = null;
+    state.programPreviewRevision = null;
+    state.programValidationRevision = null;
+    state.programHasPreviewed = false;
+    markProgramEdited("Program cleared");
   });
   elements.previewProgramBtn.addEventListener("click", previewProgram);
-  elements.executeProgramBtn.addEventListener("click", executePreview);
+  elements.executeProgramBtn.addEventListener("click", executeProgram);
   elements.programList.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-program-action]");
-    if (!button) return;
-    const index = Number(button.dataset.programIndex);
-    const action = button.dataset.programAction;
-    if (action === "delete") state.programWaypoints.splice(index, 1);
-    if (action === "up" && index > 0) {
-      [state.programWaypoints[index - 1], state.programWaypoints[index]] = [state.programWaypoints[index], state.programWaypoints[index - 1]];
+    const actionControl = event.target.closest("[data-program-action]");
+    if (actionControl) {
+      const index = Number(actionControl.dataset.programIndex);
+      const action = actionControl.dataset.programAction;
+      if (action === "toggle") {
+        state.programWaypoints[index].enabled = actionControl.checked;
+        state.programSelectedId = state.programWaypoints[index].id;
+        markProgramEdited(`${actionControl.checked ? "Enabled" : "Disabled"} ${state.programWaypoints[index].label || `step ${index + 1}`}`);
+      }
+      if (action === "delete") deleteProgramStep(index);
+      if (action === "duplicate") duplicateProgramStep(index);
+      if (action === "up") moveProgramStep(index, -1);
+      if (action === "down") moveProgramStep(index, 1);
+      return;
     }
-    if (action === "down" && index < state.programWaypoints.length - 1) {
-      [state.programWaypoints[index + 1], state.programWaypoints[index]] = [state.programWaypoints[index], state.programWaypoints[index + 1]];
+    const row = event.target.closest("[data-program-select]");
+    if (row) {
+      const step = state.programWaypoints[Number(row.dataset.programSelect)];
+      state.programSelectedId = step?.id || null;
+      renderProgramList();
+      renderProgramInspector();
     }
-    renderProgramList();
+  });
+  elements.programInspector.addEventListener("input", (event) => {
+    if (event.target.matches('input[type="text"], input[type="number"]')) {
+      updateProgramStepFromControl(event.target);
+    }
+  });
+  elements.programInspector.addEventListener("change", (event) => {
+    if (event.target.matches("select, input[type='checkbox']")) {
+      updateProgramStepFromControl(event.target);
+      renderProgramInspector();
+    }
+  });
+  elements.programInspector.addEventListener("click", (event) => {
+    const action = event.target.closest("[data-program-inspector-action]")?.dataset.programInspectorAction;
+    const index = selectedProgramIndex();
+    if (action === "duplicate") duplicateProgramStep(index);
+    if (action === "delete") deleteProgramStep(index);
   });
 
   elements.saveCalibrationBtn.addEventListener("click", saveAllSettings);

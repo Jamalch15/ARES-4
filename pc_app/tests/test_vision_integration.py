@@ -8,14 +8,14 @@ from fastapi.testclient import TestClient
 from pytest import approx
 
 from app import main
-from app.config import load_config
+from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import camera_settings, color_profiles
 from app.vision import VisionPipeline, workspace_aruco_settings
 from app.workspace_calibration import detect_fiducials
 
 
 def working_camera() -> dict:
-    camera = camera_settings(load_config())
+    camera = camera_settings(load_config(EXAMPLE_CONFIG_PATH))
     camera["enabled"] = True
     camera["source_index"] = 1
     camera["resolution"] = {"width": 640, "height": 480}
@@ -60,7 +60,7 @@ def test_workspace_pipeline_detects_multiple_objects_and_masks_outside_workspace
     cv2.circle(image, (380, 250), 20, (0, 0, 255), -1)
     cv2.circle(image, (20, 20), 18, (0, 0, 255), -1)
 
-    result = VisionPipeline().process(image, camera, color_profiles(load_config()))
+    result = VisionPipeline().process(image, camera, color_profiles(load_config(EXAMPLE_CONFIG_PATH)))
 
     assert result["ok"]
     assert result["workspace"]["homography_source"] == "workspace_aruco_saved"
@@ -117,7 +117,7 @@ def test_normal_pipeline_never_recalibrates_from_live_tags():
             (float(center[0]), float(center[1])),
         )
 
-    result = VisionPipeline().process(image, camera, color_profiles(load_config()))
+    result = VisionPipeline().process(image, camera, color_profiles(load_config(EXAMPLE_CONFIG_PATH)))
     workspace = result["workspace"]
 
     assert workspace["visible_ids"] == []
@@ -134,7 +134,7 @@ def test_configured_hsv_provider_uses_workspace_projection_when_available():
     image = np.full((480, 640, 3), 80, dtype=np.uint8)
     cv2.circle(image, (260, 220), 18, (0, 0, 255), -1)
 
-    result = VisionPipeline().process(image, camera, color_profiles(load_config()))
+    result = VisionPipeline().process(image, camera, color_profiles(load_config(EXAMPLE_CONFIG_PATH)))
     red = next(detection for detection in result["detections"] if detection["label"] == "red")
 
     assert red["ok"]
@@ -151,7 +151,7 @@ def test_workspace_projection_texture_uses_saved_homography_bounds():
     result = VisionPipeline().process(
         image,
         camera,
-        color_profiles(load_config()),
+        color_profiles(load_config(EXAMPLE_CONFIG_PATH)),
         include_workspace_projection=True,
     )
     projection = result["workspace_projection"]
