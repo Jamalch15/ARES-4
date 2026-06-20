@@ -7,6 +7,7 @@ venv/
 
 # Local robot/app configuration
 pc_app/config/robot.local.yaml
+pc_app/config/programs.local.json
 
 # Build and editor artifacts
 .cache/

@@ -249,7 +249,7 @@ def correct_waypoint_program(
     for index, waypoint in enumerate(waypoints):
         item = deepcopy(waypoint)
         kind = str(item.get("type") or item.get("kind") or "cartesian").lower()
-        if kind == "joint":
+        if kind != "cartesian":
             corrected.append(item)
             continue
         raw_target = item.get("target") if isinstance(item.get("target"), dict) else item

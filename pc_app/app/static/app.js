@@ -45,6 +45,23 @@ const state = {
   programExecutionError: "",
   programLastEditReason: "",
   programNextId: 1,
+  activeProgramStage: "library",
+  programLibrary: [],
+  programActiveId: null,
+  programName: "Untitled program",
+  programDescription: "",
+  programReadOnly: false,
+  programDirty: false,
+  programSaving: false,
+  programTargetPreview: null,
+  programTargetPreviewPending: false,
+  programTargetMovePending: false,
+  programTargetStatus: "",
+  programPlaybackPlaying: false,
+  programPlaybackElapsedS: 0,
+  programPlaybackStartedAtMs: 0,
+  programPlaybackFrame: null,
+  programPlaybackRate: 1,
   hardwareDraftDirty: false,
   settingsDirtyScopes: new Set(),
   taskPreviewId: null,
@@ -61,7 +78,11 @@ const state = {
   taskDestinationsDraft: null,
   unsavedColorProfiles: new Set(),
   positionLibraryDraft: null,
+  positionLibraryErrors: {},
   positionLibrarySaving: false,
+  pendingSetPoseAngles: null,
+  toolSwitchPending: false,
+  diagnosticsRenderTimer: null,
   cameraTimer: null,
   cameraInFlight: false,
   cameraLive: false,
@@ -154,6 +175,10 @@ const elements = {
   lastError: $("#lastError"),
   portStatus: $("#portStatus"),
   serialModal: $("#serialModal"),
+  setPoseModal: $("#setPoseModal"),
+  setPoseAngles: $("#setPoseAngles"),
+  cancelSetPoseBtn: $("#cancelSetPoseBtn"),
+  confirmSetPoseBtn: $("#confirmSetPoseBtn"),
   serialPortList: $("#serialPortList"),
   refreshPortsBtn: $("#refreshPortsBtn"),
   closeSerialModalBtn: $("#closeSerialModalBtn"),
@@ -201,8 +226,6 @@ const elements = {
   hardwareIo: $("#hardwareIo"),
   hardwareStatus: $("#hardwareStatus"),
   syncHardwareBtn: $("#syncHardwareBtn"),
-  addTaskDestinationBtn: $("#addTaskDestinationBtn"),
-  taskDestinationEditor: $("#taskDestinationEditor"),
   positionLibraryStatus: $("#positionLibraryStatus"),
   positionLibraryList: $("#positionLibraryList"),
   addJointPositionBtn: $("#addJointPositionBtn"),
@@ -231,7 +254,17 @@ const elements = {
   ikPathSummary: $("#ikPathSummary"),
   previewStatus: $("#previewStatus"),
   programWorkflow: $("#programWorkflow"),
+  programPanels: document.querySelectorAll("[data-program-panel]"),
   programStatusDetail: $("#programStatusDetail"),
+  programLibraryStatus: $("#programLibraryStatus"),
+  programTemplateNotice: $("#programTemplateNotice"),
+  programNameInput: $("#programNameInput"),
+  programDescriptionInput: $("#programDescriptionInput"),
+  newProgramBtn: $("#newProgramBtn"),
+  saveProgramBtn: $("#saveProgramBtn"),
+  copyProgramBtn: $("#copyProgramBtn"),
+  builtInProgramList: $("#builtInProgramList"),
+  userProgramList: $("#userProgramList"),
   programStepSource: $("#programStepSource"),
   programSourceItemField: $("#programSourceItemField"),
   programSourceItem: $("#programSourceItem"),
@@ -249,6 +282,15 @@ const elements = {
   programInspectorTitle: $("#programInspectorTitle"),
   programInspector: $("#programInspector"),
   programPreviewSummary: $("#programPreviewSummary"),
+  programPlayback: $("#programPlayback"),
+  programPlaybackStep: $("#programPlaybackStep"),
+  programPlaybackTime: $("#programPlaybackTime"),
+  programPlaybackProgress: $("#programPlaybackProgress"),
+  programPlaybackToggle: $("#programPlaybackToggle"),
+  programPlaybackRestart: $("#programPlaybackRestart"),
+  programPlaybackRate: $("#programPlaybackRate"),
+  stopProgramBtn: $("#stopProgramBtn"),
+  programRunMonitor: $("#programRunMonitor"),
   programExecuteHint: $("#programExecuteHint"),
   namedPositionsList: $("#namedPositionsList"),
   eventLog: $("#eventLog"),
@@ -606,7 +648,7 @@ function clonePlain(value) {
 }
 
 const robotSettingsScopes = new Set(["geometry", "joints", "motion", "tooling", "hardware", "task_destinations"]);
-const CORE_POSITION_IDS = new Set(["home", "safe", "pickup_test", "dropoff_a", "dropoff_b"]);
+const CORE_POSITION_IDS = new Set(["home"]);
 
 function savedSettingsDetail() {
   if (state.robotState?.simulation) return "Saved locally. Controller sync is not required in simulation.";
@@ -754,12 +796,13 @@ function renderPositionLibrary() {
   const records = ensurePositionLibraryDraft();
   const entries = sortedPositionEntries(records);
   elements.positionLibraryList.innerHTML = entries.length
-    ? entries.map(([positionId, record]) => {
+      ? entries.map(([positionId, record]) => {
         const kind = positionRecordKind(record);
         const core = CORE_POSITION_IDS.has(positionId);
         const source = record.source || (core ? "core" : "saved");
+        const validationErrors = state.positionLibraryErrors?.[positionId] || [];
         return `
-          <div class="position-library-row ${core ? "core-position" : ""}" data-position-id="${escapeHtml(positionId)}">
+          <div class="position-library-row ${core ? "core-position" : ""} ${validationErrors.length ? "invalid" : ""}" data-position-id="${escapeHtml(positionId)}">
             <div class="position-library-title">
               <strong>${escapeHtml(positionDisplayName(positionId, record))}</strong>
               <small>${escapeHtml(positionId)} | ${kind} | ${escapeHtml(source)}</small>
@@ -769,11 +812,12 @@ function renderPositionLibrary() {
             </label>
             ${positionLibraryFieldsHtml(positionId, record)}
             <code>${escapeHtml(formatPositionRecord(record))}</code>
+            ${validationErrors.length ? `<p class="position-library-error">${validationErrors.map(escapeHtml).join("<br />")}</p>` : ""}
             <div class="button-row position-library-actions">
               <button type="button" class="ghost" data-position-preview="${escapeHtml(positionId)}">Preview</button>
               <button type="button" data-position-go="${escapeHtml(positionId)}">Go To</button>
               <button type="button" class="ghost" data-position-duplicate="${escapeHtml(positionId)}">Duplicate</button>
-              <button type="button" class="danger ghost" data-position-delete="${escapeHtml(positionId)}" ${core ? "disabled title=\"Core positions are kept for compatibility\"" : ""}>Delete</button>
+              <button type="button" class="danger ghost" data-position-delete="${escapeHtml(positionId)}" ${core ? "disabled title=\"Home is required by the robot configuration\"" : ""}>Delete</button>
             </div>
           </div>
         `;
@@ -790,6 +834,7 @@ function markPositionLibraryDirty(message = "Unsaved position-library edits") {
 function updatePositionLibraryDraft(positionId, field, value) {
   const records = ensurePositionLibraryDraft();
   if (!records[positionId]) return;
+  delete state.positionLibraryErrors[positionId];
   if (field === "display_name") {
     records[positionId].display_name = String(value || "").trim() || positionId;
   } else if (field.startsWith("angles_deg.")) {
@@ -846,6 +891,7 @@ function addPositionLibraryRecord(kind) {
       angles_deg: angles,
     };
   }
+  state.positionLibraryErrors = {};
   markPositionLibraryDirty(`Added ${displayName}. Save Library to persist.`);
   renderPositionLibrary();
 }
@@ -864,12 +910,14 @@ function duplicatePositionLibraryRecord(positionId) {
   };
   delete records[copyId].created_at;
   delete records[copyId].updated_at;
+  delete state.positionLibraryErrors[copyId];
   markPositionLibraryDirty(`Duplicated ${positionDisplayName(positionId, source)}. Save Library to persist.`);
   renderPositionLibrary();
 }
 
 function resetPositionLibraryDraft() {
   state.positionLibraryDraft = savedPositionLibraryRecords();
+  state.positionLibraryErrors = {};
   renderPositionLibrary();
 }
 
@@ -920,13 +968,29 @@ async function savePositionLibrary(options = {}) {
   });
   state.positionLibrarySaving = false;
   if (payload.ok) {
+    state.positionLibraryErrors = {};
     if (payload.config) applyConfig(payload.config);
     if (payload.state) renderState(payload.state);
     setPositionLibraryStatus(options.message || "Saved", "");
   } else {
+    state.positionLibraryErrors = payload.errors || {};
     setPositionLibraryStatus(positionLibraryErrorText(payload), "error");
+    renderPositionLibrary();
   }
   updatePositionLibraryControls();
+  return payload;
+}
+
+async function requestJson(url, { method = "GET", body = null } = {}) {
+  const options = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== null) options.body = JSON.stringify(body);
+  const response = await fetch(url, options);
+  const payload = await response.json();
+  if (!response.ok && !payload.error) {
+    payload.ok = false;
+    payload.error = formatApiError(payload, response.status);
+  }
+  if (!payload.ok && payload.error) showLocalError(payload.error);
   return payload;
 }
 
@@ -1653,12 +1717,56 @@ function taskDestinations() {
   return state.taskDestinationsDraft || {};
 }
 
+function positionLibraryTaskDestinations() {
+  const records = state.config?.position_library?.positions || {};
+  return Object.fromEntries(
+    Object.entries(records).map(([positionId, record]) => [
+      positionId,
+      {
+        id: positionId,
+        label: positionDisplayName(positionId, record),
+        position_id: positionId,
+        position_type: positionRecordKind(record),
+        source: "position_library",
+      },
+    ])
+  );
+}
+
+function availableTaskDestinations() {
+  return {
+    ...taskDestinations(),
+    ...positionLibraryTaskDestinations(),
+  };
+}
+
+function taskDestinationsForSave() {
+  const explicit = taskDestinations();
+  const positions = positionLibraryTaskDestinations();
+  const referenced = new Set(
+    Object.values(taskColorProfiles())
+      .map((profile) => String(profile?.drop_zone || ""))
+      .filter(Boolean)
+  );
+  const destinations = {};
+  referenced.forEach((destinationId) => {
+    if (positions[destinationId]) {
+      destinations[destinationId] = {
+        id: destinationId,
+        label: positions[destinationId].label,
+        position_id: destinationId,
+      };
+    } else if (explicit[destinationId]) {
+      destinations[destinationId] = clonePlain(explicit[destinationId]);
+    }
+  });
+  return destinations;
+}
+
 function taskDestinationDraftChanged() {
   if (!state.config) return false;
-  const savedDestinations = savedTaskDestinations();
   return (
     JSON.stringify(state.taskColorProfilesDraft || state.config.color_profiles || {}) !== JSON.stringify(state.config.color_profiles || {})
-    || JSON.stringify(state.taskDestinationsDraft || savedDestinations) !== JSON.stringify(savedDestinations)
     || state.unsavedColorProfiles.size > 0
   );
 }
@@ -1680,10 +1788,9 @@ function ensureDetectedColorDrafts(detections = state.latestDetections, options 
   });
   if (changed) {
     if (options.markDirty) {
-      markSettingsDirty("task_destinations", "Detected new colors. Assign task destinations and save before running.");
+      markSettingsDirty("task_destinations", "Detected new colors. Assign Position Library records and save before running.");
     }
     renderColorPresetMapping();
-    renderTaskDestinationEditor();
   }
   return changed;
 }
@@ -1704,7 +1811,7 @@ function colorProfileOverridesPayload() {
 
 function taskDraftBlocksRun() {
   if (taskDestinationDraftChanged()) return true;
-  const zones = taskDestinations();
+  const zones = availableTaskDestinations();
   return Object.entries(taskColorProfiles()).some(([, profile]) => {
     if (profile.enabled === false) return false;
     return !profile.drop_zone || !zones[profile.drop_zone];
@@ -1822,7 +1929,7 @@ function renderSetupChecklist() {
   const calibration = state.config?.calibration || {};
   const robot = state.robotState || {};
   const profiles = state.config?.color_profiles || {};
-  const zones = state.config?.drop_zones || {};
+  const zones = availableTaskDestinations();
   const enabledProfiles = Object.entries(profiles).filter(([, profile]) => profile.enabled !== false);
   const relevantZones = enabledProfiles
     .map(([, profile]) => profile.drop_zone)
@@ -1857,23 +1964,12 @@ function colorStatusBadge(color, profile, zones) {
 }
 
 function zoneOptionsHtml(selected = "") {
-  const zones = taskDestinations();
-  const options = [`<option value="">Choose destination</option>`];
+  const zones = availableTaskDestinations();
+  const options = [`<option value="">Choose Position Library record</option>`];
   Object.keys(zones).sort().forEach((name) => {
     const label = zones[name]?.label || name;
-    options.push(`<option value="${escapeHtml(name)}" ${name === selected ? "selected" : ""}>${escapeHtml(label)}</option>`);
-  });
-  return options.join("");
-}
-
-function positionReferenceOptionsHtml(selected = "") {
-  const records = state.config?.position_library?.positions || {};
-  const options = [`<option value="">Inline coordinates</option>`];
-  sortedPositionEntries(records).forEach(([positionId, record]) => {
-    const label = positionDisplayName(positionId, record);
-    options.push(
-      `<option value="${escapeHtml(positionId)}" ${positionId === selected ? "selected" : ""}>${escapeHtml(label)} (${escapeHtml(positionId)})</option>`
-    );
+    const sourceSuffix = zones[name]?.source === "position_library" ? "" : " (legacy destination)";
+    options.push(`<option value="${escapeHtml(name)}" ${name === selected ? "selected" : ""}>${escapeHtml(label)}${sourceSuffix}</option>`);
   });
   return options.join("");
 }
@@ -1882,7 +1978,7 @@ function renderColorPresetMapping() {
   if (!elements.colorPresetMapping || !state.config) return;
   ensureDetectedColorDrafts(state.latestDetections);
   const profiles = taskColorProfiles();
-  const zones = taskDestinations();
+  const zones = availableTaskDestinations();
   const colors = new Set(Object.keys(profiles));
   state.latestDetections.forEach((detection) => {
     const color = detectionColor(detection);
@@ -1928,52 +2024,6 @@ function renderColorPresetMapping() {
   }).join("");
 }
 
-function renderTaskDestinationEditor() {
-  if (!state.config) return;
-  ensureTaskDrafts();
-  const zones = taskDestinations();
-  if (elements.taskDestinationEditor) {
-    const names = Object.keys(zones).sort();
-    elements.taskDestinationEditor.innerHTML = names.length
-      ? names.map((name) => {
-          const zone = zones[name] || {};
-          const grid = zone.grid || {};
-          const referenced = Boolean(zone.position_id);
-          return `
-            <div class="task-destination-row" data-task-destination="${escapeHtml(name)}">
-              <div class="task-destination-title">
-                <strong>${escapeHtml(zone.label || name)}</strong>
-                <small>${escapeHtml(name)} | ${referenced ? `position ${zone.position_id}` : "inline"} | ${grid.rows && grid.columns ? `${grid.rows}x${grid.columns} grid` : "fixed anchor"}</small>
-              </div>
-              <label>Name
-                <input type="text" data-task-destination-field="label" data-task-destination="${escapeHtml(name)}" value="${escapeHtml(zone.label || name)}" />
-              </label>
-              <label>Saved position
-                <select data-task-destination-field="position_id" data-task-destination="${escapeHtml(name)}">
-                  ${positionReferenceOptionsHtml(zone.position_id || "")}
-                </select>
-              </label>
-              <div class="task-destination-coordinates">
-                <label>X <input type="number" step="1" data-task-destination-field="x_mm" data-task-destination="${escapeHtml(name)}" value="${zone.x_mm == null ? "" : format(zone.x_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
-                <label>Y <input type="number" step="1" data-task-destination-field="y_mm" data-task-destination="${escapeHtml(name)}" value="${zone.y_mm == null ? "" : format(zone.y_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
-                <label>Z <input type="number" step="1" data-task-destination-field="z_mm" data-task-destination="${escapeHtml(name)}" value="${zone.z_mm == null ? "" : format(zone.z_mm, 1)}" ${referenced ? "disabled" : ""} /></label>
-              </div>
-              ${referenced ? `<small class="field-help task-destination-reference-help">Coordinates resolve from the selected Position Library record.</small>` : ""}
-              <div class="drop-grid-fields">
-                <label>Rows <input type="number" min="0" step="1" data-task-destination-field="grid.rows" data-task-destination="${escapeHtml(name)}" value="${grid.rows ?? ""}" /></label>
-                <label>Cols <input type="number" min="0" step="1" data-task-destination-field="grid.columns" data-task-destination="${escapeHtml(name)}" value="${grid.columns ?? ""}" /></label>
-                <label>dX <input type="number" step="1" data-task-destination-field="grid.x_spacing_mm" data-task-destination="${escapeHtml(name)}" value="${grid.x_spacing_mm ?? ""}" /></label>
-                <label>dY <input type="number" step="1" data-task-destination-field="grid.y_spacing_mm" data-task-destination="${escapeHtml(name)}" value="${grid.y_spacing_mm ?? ""}" /></label>
-              </div>
-              <button class="danger ghost" type="button" data-task-destination-delete="${escapeHtml(name)}">Delete</button>
-            </div>
-          `;
-        }).join("")
-      : `<div class="empty-state">No task destinations configured.</div>`;
-  }
-  updateTaskMappingControls();
-}
-
 function updateTaskMappingControls() {
   const dirty = taskDestinationDraftChanged();
   if (elements.saveTaskMappingsBtn) elements.saveTaskMappingsBtn.disabled = !dirty;
@@ -1986,7 +2036,7 @@ async function saveTaskMappingEdits() {
     color_profiles: taskColorProfiles(),
     task_destinations: {
       schema_version: 1,
-      destinations: taskDestinations(),
+      destinations: taskDestinationsForSave(),
     },
   });
   if (payload.ok) {
@@ -2013,15 +2063,13 @@ function discardTaskMappingEdits() {
   clearSettingsDirty("task_destinations");
   invalidateTaskDetections("Task mappings reverted - refresh detections");
   renderColorPresetMapping();
-  renderTaskDestinationEditor();
   updateTaskMappingControls();
 }
 
-function markTaskDestinationDraftDirty(detail = "Task destinations changed. Save task mappings before running.") {
+function markTaskDestinationDraftDirty(detail = "Task mappings changed. Save task mappings before running.") {
   markSettingsDirty("task_destinations", detail);
-  invalidateTaskDetections("Task destinations changed - refresh detections");
+  invalidateTaskDetections("Task mappings changed - refresh detections");
   renderColorPresetMapping();
-  renderTaskDestinationEditor();
   updateTaskMappingControls();
 }
 
@@ -2038,87 +2086,6 @@ function updateColorProfileDraft(color, patch, detail = "Color destination mappi
     state.unsavedColorProfiles.add(name);
   }
   markTaskDestinationDraftDirty(detail);
-}
-
-function updateTaskDestinationDraft(name, field, rawValue) {
-  const zones = taskDestinations();
-  if (!zones[name]) return;
-  if (field === "label") {
-    zones[name].label = String(rawValue || "").trim() || name;
-  } else if (field === "position_id") {
-    const positionId = String(rawValue || "").trim();
-    if (positionId) {
-      zones[name].position_id = positionId;
-      zones[name].type = "position_ref";
-      const record = positionLibraryRecord(positionId);
-      if (positionRecordKind(record || {}) === "cartesian") {
-        const target = record?.target || {};
-        zones[name].x_mm = Number(target.x_mm);
-        zones[name].y_mm = Number(target.y_mm);
-        zones[name].z_mm = Number(target.z_mm);
-        if (target.phi_deg != null) zones[name].phi_deg = Number(target.phi_deg);
-      } else {
-        delete zones[name].x_mm;
-        delete zones[name].y_mm;
-        delete zones[name].z_mm;
-        delete zones[name].phi_deg;
-      }
-    } else {
-      delete zones[name].position_id;
-      delete zones[name].position_display_name;
-      delete zones[name].position_type;
-      zones[name].type = "cartesian";
-    }
-  } else if (field.startsWith("grid.")) {
-    const key = field.slice("grid.".length);
-    const value = String(rawValue || "").trim() === "" ? null : Number(rawValue);
-    if (value === null || !Number.isFinite(value) || value <= 0) {
-      if (zones[name].grid) delete zones[name].grid[key];
-    } else {
-      zones[name].grid = zones[name].grid || { order: "row_major" };
-      zones[name].grid[key] = key === "rows" || key === "columns" ? Math.round(value) : value;
-    }
-    if (zones[name].grid && (!zones[name].grid.rows || !zones[name].grid.columns)) {
-      delete zones[name].grid;
-    }
-  } else {
-    const value = Number(rawValue);
-    zones[name][field] = Number.isFinite(value) ? value : 0;
-  }
-  markSettingsDirty("task_destinations", "Task destination changed. Save task mappings before running.");
-  invalidateTaskDetections("Task destinations changed - refresh detections");
-  renderColorPresetMapping();
-  if (field === "position_id") renderTaskDestinationEditor();
-  updateTaskMappingControls();
-}
-
-function addTaskDestination() {
-  const zones = taskDestinations();
-  let index = Object.keys(zones).length + 1;
-  let name = `destination_${index}`;
-  while (zones[name]) {
-    index += 1;
-    name = `destination_${index}`;
-  }
-  const fk = state.robotState?.fk || {};
-  zones[name] = {
-    id: name,
-    label: `Destination ${index}`,
-    type: "cartesian",
-    x_mm: Number(fk.x_mm ?? 0),
-    y_mm: Number(fk.y_mm ?? 180),
-    z_mm: Number(fk.z_mm ?? 45),
-  };
-  markTaskDestinationDraftDirty("Added a task destination. Set coordinates and save task mappings before running.");
-}
-
-function deleteTaskDestination(name) {
-  const zones = taskDestinations();
-  delete zones[name];
-  Object.values(taskColorProfiles()).forEach((profile) => {
-    if (profile.drop_zone === name) profile.drop_zone = "";
-  });
-  markTaskDestinationDraftDirty("Deleted a task destination. Review color mappings and save before running.");
 }
 
 function renderWorkflowStepper(phase = "setup") {
@@ -2228,7 +2195,6 @@ function renderOperatorPanels() {
     }
   });
   renderColorPresetMapping();
-  renderTaskDestinationEditor();
   applyTaskSettingsControls();
   renderSetupChecklist();
   renderToolControls();
@@ -2282,13 +2248,30 @@ async function saveActiveTool(active) {
     renderToolControls(active);
     return;
   }
+  const previousActive = state.config.tools.active || state.robotState?.active_tool || "gripper";
+  state.toolSwitchPending = true;
+  elements.toolSelect.disabled = true;
+  elements.toolStatus.textContent = `Changing to ${active}...`;
+  elements.toolStatus.classList.add("warn");
   if (state.config?.tools) state.config.tools.active = active;
   if (state.robotState) state.robotState.active_tool = active;
   renderToolControls(active);
   const tools = state.config?.tools || { active, presets: {} };
   tools.active = active;
   const payload = await postJson("/api/tools", { active, presets: tools.presets || {} });
-  if (payload.ok && payload.config) applyConfig(payload.config);
+  state.toolSwitchPending = false;
+  elements.toolSelect.disabled = false;
+  elements.toolStatus.classList.remove("warn");
+  if (payload.ok && payload.config) {
+    applyConfig(payload.config);
+    elements.toolStatus.textContent = `Active: ${active}`;
+  } else {
+    state.config.tools.active = previousActive;
+    if (state.robotState) state.robotState.active_tool = previousActive;
+    renderToolControls(previousActive);
+    elements.toolStatus.textContent = payload.error || "Tool change failed";
+    elements.toolStatus.classList.add("error");
+  }
   if (payload.state) renderState(payload.state);
 }
 
@@ -2339,17 +2322,21 @@ async function connectSelectedSerial() {
   if (payload.ok) setSerialModalVisible(false);
 }
 
-async function refreshDiagnostics() {
+async function refreshDiagnostics(options = {}) {
   if (!elements.diagnosticsDrawer || elements.diagnosticsDrawer.hidden) return;
-  const response = await fetch("/api/diagnostics");
-  const payload = await response.json();
-  const robotState = payload.state || {};
+  const robotState = state.robotState || {};
+  let events = null;
+  if (options.events !== false) {
+    const response = await fetch("/api/events?limit=80");
+    const payload = await response.json();
+    events = payload.events || [];
+  }
   const enc = robotState.encoder_angles_deg || [];
   const err = robotState.encoder_errors_deg || [];
   const pending = robotState.pending_motion || {};
   const diagnostics = robotState.motion_diagnostics || {};
   const configChange = robotState.config_change || {};
-  const truth = payload.model_truth || state.config?.model_truth || {};
+  const truth = state.config?.model_truth || {};
   const tool = truth.active_tool || {};
   const currentFk = truth.current_fk || robotState.fk || {};
   const currentTcp = currentFk.tcp_frame?.origin || currentFk.tcp || currentFk;
@@ -2381,14 +2368,24 @@ async function refreshDiagnostics() {
     <div class="log-line"><span>Encoder errors</span><code>${err.map((value) => value == null ? "-" : format(value, 2)).join(", ")}</code></div>
     <div class="log-line"><span>Sync</span><code>${robotState.config_sync_status || "unknown"}</code></div>
   `;
-  elements.eventLog.innerHTML = "";
-  (payload.events || []).reverse().forEach((event) => {
-    const line = document.createElement("div");
-    line.className = "log-line";
-    const ts = new Date((event.ts || 0) * 1000).toLocaleTimeString();
-    line.innerHTML = `<span>${ts} ${event.source}</span><code>${event.message}</code>`;
-    elements.eventLog.appendChild(line);
-  });
+  if (events) {
+    elements.eventLog.innerHTML = "";
+    events.reverse().forEach((event) => {
+      const line = document.createElement("div");
+      line.className = "log-line";
+      const ts = new Date((event.ts || 0) * 1000).toLocaleTimeString();
+      line.innerHTML = `<span>${ts} ${event.source}</span><code>${event.message}</code>`;
+      elements.eventLog.appendChild(line);
+    });
+  }
+}
+
+function scheduleDiagnosticsRender() {
+  if (!elements.diagnosticsDrawer || elements.diagnosticsDrawer.hidden || state.diagnosticsRenderTimer) return;
+  state.diagnosticsRenderTimer = window.setTimeout(() => {
+    state.diagnosticsRenderTimer = null;
+    refreshDiagnostics({ events: false });
+  }, 250);
 }
 
 async function refreshEvents() {
@@ -2431,8 +2428,23 @@ async function previewNamedPosition(name) {
 }
 
 async function moveNamedPosition(name) {
-  await previewNamedPosition(name);
-  if (state.previewId) await executePreview();
+  const waypoint = namedPositionWaypoint(name);
+  if (!waypoint) return;
+  const payload = await postJson("/api/path/go", {
+    branch: elements.ikBranchSelect.value,
+    settings: pathSettings(),
+    waypoints: [waypoint],
+  });
+  if (payload.ok) {
+    invalidatePendingIkPreview();
+    releaseJointControlIntent();
+    clearViewPreview();
+    state.ikUserEdited = false;
+    elements.previewStatus.textContent = `Moving to ${positionDisplayName(name, positionLibraryRecord(name) || {})}`;
+  } else {
+    showLocalError(payload.error || `Could not move to ${name}`);
+  }
+  if (payload.state) renderState(payload.state);
 }
 
 async function sendTool(action, value = null) {
@@ -2823,7 +2835,6 @@ async function detectVision() {
     }
     renderDetectionList(payload.detections || []);
     renderColorPresetMapping();
-    renderTaskDestinationEditor();
     if (state.view) {
       state.view.setObjectDetections(state.latestDetections.filter((detection) => detection.ok && detection.robot));
     }
@@ -4179,28 +4190,54 @@ async function stopCartesianJog() {
   await flushCartesianJogStop();
 }
 
-async function setCurrentPoseKnown() {
-  const angles =
+function setPoseCandidateAngles() {
+  return (
     normalizeJointAngles(state.draftAngles) ||
     normalizeJointAngles(state.robotState?.target_angles_deg) ||
     normalizeJointAngles(state.robotState?.reported_angles_deg) ||
     normalizeJointAngles(state.config?.joints?.map((joint) => joint.home_deg)) ||
-    [];
+    []
+  );
+}
+
+function setPoseModalVisible(visible) {
+  if (!elements.setPoseModal) return;
+  elements.setPoseModal.hidden = !visible;
+  if (!visible) state.pendingSetPoseAngles = null;
+}
+
+function setCurrentPoseKnown() {
+  const angles = setPoseCandidateAngles();
   if (angles.length !== 4 || angles.some((angle) => !Number.isFinite(angle))) {
     showLocalError("Cannot set pose: joint angles are incomplete.");
     return;
   }
-  if (!window.confirm(
-    "Set Pose does not move or physically home the robot. It asserts that the displayed joint angles match the real arm. Continue only after checking every joint while hardware is disarmed?"
-  )) return;
+  state.pendingSetPoseAngles = angles;
+  if (elements.setPoseAngles) {
+    elements.setPoseAngles.innerHTML = angles
+      .map((angle, index) => `<div class="log-line"><span>J${index + 1}</span><code>${format(angle, 2)} deg</code></div>`)
+      .join("");
+  }
+  setPoseModalVisible(true);
+}
+
+async function confirmCurrentPoseKnown() {
+  const angles = normalizeJointAngles(state.pendingSetPoseAngles);
+  if (!angles) {
+    setPoseModalVisible(false);
+    return;
+  }
+  elements.confirmSetPoseBtn.disabled = true;
   elements.statusPill.textContent = "Setting known pose...";
   const payload = await postJson("/api/hardware/setpose", { angles_deg: angles });
+  elements.confirmSetPoseBtn.disabled = false;
   if (payload.ok) {
     invalidatePendingIkPreview();
     releaseJointControlIntent();
     clearViewPreview();
     state.ikUserEdited = false;
     elements.statusPill.textContent = "Pose marked known.";
+    setPoseModalVisible(false);
   }
   if (payload.state) renderState(payload.state);
 }
@@ -4230,9 +4267,80 @@ function programPreviewIsFresh() {
   );
 }
 
+function programTargetPreviewIsFresh(step = selectedProgramStep()) {
+  const preview = state.programTargetPreview;
+  if (!step || !preview) return false;
+  return Boolean(
+    preview.stepId === step.id &&
+    preview.programRevision === state.programRevision &&
+    preview.previewId === state.previewId &&
+    preview.previewId === state.latestPreview?.id &&
+    Number(preview.startPoseRevision) === Number(state.robotState?.pose_revision) &&
+    state.robotState?.motion_state !== "moving"
+  );
+}
+
+function programTargetPreviewStatus(step = selectedProgramStep()) {
+  if (!step) return { text: "Select a step to test its target.", tone: "" };
+  if (state.programTargetPreviewPending) return { text: "Planning from the current reported pose...", tone: "warn" };
+  if (state.programTargetMovePending) return { text: state.programTargetStatus || "Starting target move...", tone: "warn" };
+  if (state.programTargetStatus) {
+    const error = /failed|invalid|enable|first|blocked|stale|error|outside|cannot|requires?/i.test(state.programTargetStatus);
+    return { text: state.programTargetStatus, tone: error ? "error" : "ready" };
+  }
+  if (programTargetPreviewIsFresh(step)) {
+    return {
+      text: "Preview ready from the current robot pose. Go to target will execute this exact path.",
+      tone: "ready",
+    };
+  }
+  if (state.programTargetPreview) {
+    return { text: "Target preview is stale or belongs to another step. Preview this target again.", tone: "warn" };
+  }
+  return { text: "Preview draws the direct path from the current robot pose. It does not execute motion.", tone: "" };
+}
+
+function updateProgramTargetControls() {
+  const step = selectedProgramStep();
+  const previewButton = elements.programInspector?.querySelector('[data-program-target-action="preview"]');
+  const goButton = elements.programInspector?.querySelector('[data-program-target-action="go"]');
+  const status = elements.programInspector?.querySelector("#programTargetTestStatus");
+  const validation = step ? programStepClientValidation(step, selectedProgramIndex()) : { ok: false };
+  const previewDisabled = Boolean(
+    !step ||
+    step.enabled === false ||
+    !validation.ok ||
+    state.programTargetPreviewPending ||
+    state.programTargetMovePending ||
+    state.programExecutionActive ||
+    state.robotState?.motion_state === "moving"
+  );
+  const goDisabled = Boolean(
+    !programTargetPreviewIsFresh(step) ||
+    programMotionGateReason() ||
+    state.programTargetPreviewPending ||
+    state.programTargetMovePending ||
+    state.programExecutionActive
+  );
+  if (previewButton) previewButton.disabled = previewDisabled;
+  if (goButton) {
+    goButton.disabled = goDisabled;
+    goButton.title = goDisabled
+      ? programTargetPreviewIsFresh(step)
+        ? programMotionGateReason()
+        : "Preview this exact target from the current robot pose first"
+      : "Execute the currently displayed target preview";
+  }
+  if (status) {
+    const targetStatus = programTargetPreviewStatus(step);
+    status.textContent = targetStatus.text;
+    status.dataset.tone = targetStatus.tone;
+  }
+}
+
 function programSelectedSourceIsReady() {
   const source = elements.programStepSource?.value;
-  if (!["named_position", "vision_detection", "drop_zone"].includes(source)) return true;
+  if (!["named_position", "vision_detection", "drop_zone", "end_effector"].includes(source)) return true;
   return Boolean(elements.programSourceItem?.value);
 }
 
@@ -4250,11 +4358,18 @@ function updateDisabledState() {
     Boolean(state.previewAngles);
   elements.stopBtn.disabled = !state.robotState?.connected && !state.robotState?.simulation;
   if (elements.hardwareArmToggle) {
+    const armingBlocked =
+      !state.robotState?.hardware_armed &&
+      (!state.robotState?.known_pose || state.robotState?.config_sync_status !== "synced");
     elements.hardwareArmToggle.disabled =
       !state.robotState?.connected ||
       state.robotState?.simulation ||
-      !state.robotState?.known_pose ||
-      state.robotState?.config_sync_status !== "synced";
+      armingBlocked;
+    elements.hardwareArmToggle.title = state.robotState?.hardware_armed
+      ? "Disarm hardware"
+      : armingBlocked
+        ? state.robotState?.config_sync_message || "Sync controller configuration and establish a known pose before arming"
+        : "Arm hardware";
   }
   if (elements.syncHardwareBtn) {
     elements.syncHardwareBtn.disabled =
@@ -4267,8 +4382,13 @@ function updateDisabledState() {
       : "";
   }
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
+  document.querySelectorAll("[data-position-go], [data-position-preview]").forEach((button) => {
+    button.disabled = !enabled || state.robotState?.motion_state === "moving";
+    button.title = state.robotState?.motion_state === "moving" ? "Wait for the current motion to finish" : "";
+  });
   const enabledProgramSteps = state.programWaypoints.filter((step) => step.enabled !== false).length;
   const programGateReason = programMotionGateReason();
+  const programLocked = programEditingLocked();
   elements.previewProgramBtn.disabled =
     state.programPreviewPending ||
     state.programExecutionActive ||
@@ -4278,14 +4398,13 @@ function updateDisabledState() {
     Boolean(programGateReason) ||
     state.programPreviewPending ||
     state.programExecutionActive;
-  elements.clearProgramBtn.disabled = state.programWaypoints.length === 0 || state.programExecutionActive;
-  elements.addProgramStepBtn.disabled = state.programExecutionActive || !programSelectedSourceIsReady();
-  elements.programStepSource.disabled = state.programExecutionActive;
-  elements.programSourceItem.disabled = state.programExecutionActive;
-  elements.programInsertPosition.disabled = state.programExecutionActive;
-  document.querySelectorAll("[data-program-quick-source]").forEach((button) => {
-    button.disabled = state.programExecutionActive;
-  });
+  elements.clearProgramBtn.disabled = state.programWaypoints.length === 0 || programLocked;
+  elements.addProgramStepBtn.disabled = programLocked || !programSelectedSourceIsReady();
+  elements.programStepSource.disabled = programLocked;
+  elements.programSourceItem.disabled = programLocked;
+  elements.programInsertPosition.disabled = programLocked;
+  updateProgramTargetControls();
+  elements.stopProgramBtn.disabled = !state.programExecutionActive && state.robotState?.motion_state !== "moving";
   if (elements.cartesianJogToggle) elements.cartesianJogToggle.disabled = !enabled;
   if (elements.cartesianJogSpeedInput) elements.cartesianJogSpeedInput.disabled = !enabled;
   if (elements.cartesianJogPhiSpeedInput) elements.cartesianJogPhiSpeedInput.disabled = !enabled;
@@ -4345,7 +4464,10 @@ function renderState(robotState) {
     robotState.motion_state === "estop" || robotState.motion_state === "fault" ? "badge-danger" : "",
   );
   setBadge(elements.armedBadge, robotState.hardware_armed ? "Armed" : "Disarmed", robotState.hardware_armed ? "badge-danger" : "");
-  if (elements.toolStatus) elements.toolStatus.textContent = robotState.tool_state || "unknown";
+  if (elements.toolStatus && !state.toolSwitchPending) {
+    elements.toolStatus.classList.remove("warn", "error");
+    elements.toolStatus.textContent = robotState.tool_state || "unknown";
+  }
   renderToolControls();
 
   if (!robotState.live_motion_enabled) elements.liveRealToggle.checked = false;
@@ -4392,6 +4514,8 @@ function renderState(robotState) {
   syncProgramExecutionState(robotState);
   renderProgramWorkflowStatus();
   renderProgramPreviewSummary();
+  renderProgramRunMonitor(robotState);
+  scheduleDiagnosticsRender();
   if (state.cartesianJogActiveAxes.size === 0) setIkTargetFromFk(fk);
   updateDisabledState();
   if (!state.settingsDirtyScopes.size) updateSettingsSaveBar();
@@ -4473,6 +4597,7 @@ function renderPreview(preview) {
 }
 
 function renderPreviewFailure(payload) {
+  stopProgramPlayback({ reset: true });
   state.previewId = null;
   state.latestPreview = null;
   if (state.activeTab === "ik") {
@@ -4601,6 +4726,234 @@ async function executePreview() {
   updateDisabledState();
 }
 
+function activeProgramRecord() {
+  return state.programLibrary.find((program) => program.id === state.programActiveId) || null;
+}
+
+function programEditingLocked() {
+  return Boolean(state.programReadOnly || state.programExecutionActive || state.programSaving);
+}
+
+function setProgramLibraryStatus(message, tone = "") {
+  if (!elements.programLibraryStatus) return;
+  elements.programLibraryStatus.textContent = message;
+  elements.programLibraryStatus.classList.toggle("warn", tone === "warn");
+  elements.programLibraryStatus.classList.toggle("error", tone === "error");
+}
+
+function resetProgramPreviewState(reason = "") {
+  clearProgramTargetPreview();
+  state.programPreview = null;
+  state.programPreviewFailure = null;
+  state.programPreviewRevision = null;
+  state.programValidationRevision = null;
+  state.programHasPreviewed = false;
+  state.programExecutionFailed = false;
+  state.programExecutionAwaitingStart = false;
+  state.programExecutionError = "";
+  state.programLastEditReason = reason;
+  clearActiveProgramPreview();
+}
+
+function setActiveProgramStage(stage) {
+  const allowed = ["library", "build", "preview", "run"];
+  state.activeProgramStage = allowed.includes(stage) ? stage : "library";
+  elements.programPanels.forEach((panel) => {
+    panel.hidden = panel.dataset.programPanel !== state.activeProgramStage;
+  });
+  elements.programWorkflow?.querySelectorAll("[data-program-stage]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.programStage === state.activeProgramStage);
+  });
+}
+
+function currentProgramPayload({ copy = false } = {}) {
+  const name = String(state.programName || elements.programNameInput?.value || "Untitled program").trim() || "Untitled program";
+  return {
+    id: copy ? null : state.programActiveId,
+    schema_version: 1,
+    name: copy ? `${name} Copy` : name,
+    description: String(state.programDescription || "").trim(),
+    steps: clonePlain(state.programWaypoints),
+  };
+}
+
+function replaceCurrentProgram(program, { stage = "build" } = {}) {
+  state.programActiveId = program?.id || null;
+  state.programName = String(program?.name || "Untitled program");
+  state.programDescription = String(program?.description || "");
+  state.programReadOnly = Boolean(program?.read_only);
+  state.programWaypoints = clonePlain(program?.steps || []);
+  state.programSelectedId = state.programWaypoints[0]?.id || null;
+  state.programNextId = Math.max(1, state.programWaypoints.length + 1);
+  state.programRevision += 1;
+  state.programDirty = false;
+  resetProgramPreviewState(program ? `Loaded ${state.programName}` : "New program");
+  setActiveProgramStage(stage);
+  renderProgramBuilder();
+  renderProgramLibrary();
+}
+
+function startNewProgram() {
+  replaceCurrentProgram(
+    {
+      id: null,
+      name: "Untitled program",
+      description: "",
+      read_only: false,
+      steps: [],
+    },
+    { stage: "build" }
+  );
+  state.programDirty = false;
+  setProgramLibraryStatus("New draft");
+}
+
+function upsertProgramLibraryRecord(program) {
+  const index = state.programLibrary.findIndex((item) => item.id === program.id);
+  if (index >= 0) state.programLibrary[index] = clonePlain(program);
+  else state.programLibrary.push(clonePlain(program));
+}
+
+async function loadProgramLibrary({ preserveActive = true } = {}) {
+  const payload = await requestJson("/api/programs");
+  if (!payload.ok) {
+    setProgramLibraryStatus(payload.error || "Could not load programs", "error");
+    return;
+  }
+  state.programLibrary = Array.isArray(payload.programs) ? payload.programs : [];
+  if (preserveActive && state.programActiveId) {
+    const active = activeProgramRecord();
+    if (active && !state.programDirty) {
+      state.programName = active.name;
+      state.programDescription = active.description || "";
+      state.programReadOnly = Boolean(active.read_only);
+    }
+  }
+  renderProgramLibrary();
+}
+
+function programLibraryRowHtml(program) {
+  const isActive = program.id === state.programActiveId;
+  const template = Boolean(program.read_only || program.template);
+  const steps = Array.isArray(program.steps) ? program.steps.length : 0;
+  const metadata = program.metadata || {};
+  const adaptiveText = metadata.adaptive ? "geometry-adaptive" : "saved targets";
+  return `
+    <div class="program-library-row ${isActive ? "active" : ""}" data-program-id="${escapeHtml(program.id)}">
+      <div class="program-library-row-header">
+        <strong>${escapeHtml(program.name)}</strong>
+        <span class="program-library-kind">${template ? "Read-only template" : "User program"}</span>
+      </div>
+      <p>${escapeHtml(program.description || "No description")}</p>
+      <div class="program-library-row-meta">
+        <span>${steps} step${steps === 1 ? "" : "s"}</span>
+        <span>${template ? adaptiveText : "persistent"}</span>
+        ${metadata.radius_mm ? `<span>${format(metadata.radius_mm, 1)} mm radius</span>` : ""}
+      </div>
+      <div class="program-library-row-actions">
+        <button type="button" class="ghost" data-program-library-action="load" data-program-id="${escapeHtml(program.id)}">Load</button>
+        <button type="button" data-program-library-action="copy" data-program-id="${escapeHtml(program.id)}">${template ? "Copy" : "Duplicate"}</button>
+        ${template ? "" : `<button type="button" class="ghost danger-text" data-program-library-action="delete" data-program-id="${escapeHtml(program.id)}">Delete</button>`}
+      </div>
+    </div>
+  `;
+}
+
+function renderProgramLibrary() {
+  if (!elements.builtInProgramList || !elements.userProgramList) return;
+  const builtIns = state.programLibrary.filter((program) => program.read_only || program.template);
+  const users = state.programLibrary.filter((program) => !program.read_only && !program.template);
+  elements.builtInProgramList.innerHTML = builtIns.length
+    ? builtIns.map(programLibraryRowHtml).join("")
+    : `<div class="program-library-empty">No built-in demos are available.</div>`;
+  elements.userProgramList.innerHTML = users.length
+    ? users.map(programLibraryRowHtml).join("")
+    : `<div class="program-library-empty">No saved programs yet.</div>`;
+
+  if (elements.programNameInput && document.activeElement !== elements.programNameInput) {
+    elements.programNameInput.value = state.programName;
+  }
+  if (elements.programDescriptionInput && document.activeElement !== elements.programDescriptionInput) {
+    elements.programDescriptionInput.value = state.programDescription;
+  }
+  const locked = programEditingLocked();
+  elements.programNameInput.disabled = state.programReadOnly || state.programExecutionActive;
+  elements.programDescriptionInput.disabled = state.programReadOnly || state.programExecutionActive;
+  elements.saveProgramBtn.disabled =
+    locked ||
+    state.programReadOnly ||
+    !String(state.programName || "").trim();
+  elements.copyProgramBtn.disabled = state.programSaving || state.programExecutionActive || !state.programWaypoints.length;
+  elements.newProgramBtn.disabled = state.programSaving || state.programExecutionActive;
+  elements.programTemplateNotice.hidden = !state.programReadOnly;
+  elements.programTemplateNotice.textContent = state.programReadOnly
+    ? "This built-in is read-only. You can preview and run it, or use Save as copy to make an editable program."
+    : "";
+
+  if (state.programSaving) setProgramLibraryStatus("Saving...");
+  else if (state.programReadOnly) setProgramLibraryStatus("Template");
+  else if (state.programDirty) setProgramLibraryStatus("Unsaved changes", "warn");
+  else if (state.programActiveId) setProgramLibraryStatus("Saved");
+  else setProgramLibraryStatus("Draft");
+}
+
+async function saveCurrentProgram({ copy = false } = {}) {
+  if (state.programSaving) return;
+  if (state.programReadOnly && !copy) {
+    showLocalError("Built-in templates are read-only. Use Save as copy.");
+    return;
+  }
+  state.programSaving = true;
+  renderProgramLibrary();
+  let payload;
+  if (copy && state.programReadOnly && state.programActiveId) {
+    payload = await postJson(`/api/programs/${encodeURIComponent(state.programActiveId)}/copy`, {
+      name: `${state.programName} Copy`,
+    });
+  } else {
+    const program = currentProgramPayload({ copy });
+    const updating = Boolean(program.id && !copy);
+    payload = await requestJson(
+      updating ? `/api/programs/${encodeURIComponent(program.id)}` : "/api/programs",
+      { method: updating ? "PUT" : "POST", body: program }
+    );
+  }
+  state.programSaving = false;
+  if (!payload.ok) {
+    setProgramLibraryStatus(payload.error || "Save failed", "error");
+    renderProgramLibrary();
+    return;
+  }
+  upsertProgramLibraryRecord(payload.program);
+  replaceCurrentProgram(payload.program, { stage: state.activeProgramStage });
+  setProgramLibraryStatus(copy ? "Copy saved" : "Saved");
+}
+
+async function deleteProgram(programId) {
+  const program = state.programLibrary.find((item) => item.id === programId);
+  if (!program || program.read_only) return;
+  const payload = await requestJson(`/api/programs/${encodeURIComponent(programId)}`, { method: "DELETE" });
+  if (!payload.ok) {
+    setProgramLibraryStatus(payload.error || "Delete failed", "error");
+    return;
+  }
+  state.programLibrary = state.programLibrary.filter((item) => item.id !== programId);
+  if (state.programActiveId === programId) startNewProgram();
+  else renderProgramLibrary();
+  setProgramLibraryStatus("Deleted");
+}
+
+async function copyLibraryProgram(programId) {
+  const payload = await postJson(`/api/programs/${encodeURIComponent(programId)}/copy`, {});
+  if (!payload.ok) {
+    setProgramLibraryStatus(payload.error || "Copy failed", "error");
+    return;
+  }
+  upsertProgramLibraryRecord(payload.program);
+  replaceCurrentProgram(payload.program, { stage: "build" });
+  setProgramLibraryStatus("Copy ready");
+}
+
 function nextProgramStepId() {
   const id = `program-step-${state.programNextId}`;
   state.programNextId += 1;
@@ -4634,6 +4987,32 @@ function programDetectionEntries() {
     .filter(({ detection }) => Boolean(detection.ok && detection.robot));
 }
 
+function activeProgramTool() {
+  const tools = state.config?.tools || {};
+  const name = tools.active || state.robotState?.active_tool || "gripper";
+  const preset = tools.presets?.[name] || {};
+  return {
+    name,
+    label: preset.label || name,
+    type: preset.type || "generic",
+  };
+}
+
+function programToolActions() {
+  const tool = activeProgramTool();
+  if (tool.type === "electromagnet") {
+    return [
+      { value: "on", label: `Turn ${tool.label} on` },
+      { value: "off", label: `Turn ${tool.label} off` },
+    ];
+  }
+  return [
+    { value: "open", label: `Open ${tool.label}` },
+    { value: "close", label: `Close ${tool.label}` },
+    { value: "set", label: `Set ${tool.label} value` },
+  ];
+}
+
 function programSourceOptions(source = elements.programStepSource.value) {
   if (source === "named_position") {
     const records = state.config?.position_library?.positions || {};
@@ -4652,6 +5031,7 @@ function programSourceOptions(source = elements.programStepSource.value) {
   if (source === "drop_zone") {
     return Object.keys(taskDestinations()).sort().map((name) => ({ value: name, label: name }));
   }
+  if (source === "end_effector") return programToolActions();
   return [];
 }
 
@@ -4660,6 +5040,7 @@ function programSourceHint(source = elements.programStepSource.value, optionCoun
   if (source === "named_position") return count ? "Adds a saved joint or Cartesian Position Library record." : "No Position Library records are configured.";
   if (source === "manual_cartesian") return "Starts from the current IK target. Edit X, Y, Z, phi, and move mode after adding.";
   if (source === "manual_joint") return "Starts from the reported joint pose. Edit each joint after adding.";
+  if (source === "end_effector") return `Adds an action for the active ${activeProgramTool().label}. Tool safety checks still apply during execution.`;
   if (source === "vision_detection") return count ? "Uses the selected detection's robot-frame coordinates." : "Refresh detections in Tasks before adding a vision target.";
   if (source === "drop_zone") return count ? "Adds a configured Cartesian task destination." : "No task destinations are configured.";
   return "";
@@ -4678,7 +5059,7 @@ function renderProgramSourceOptions() {
     elements.programSourceItem.appendChild(option);
   });
   if (options.some((option) => option.value === previous)) elements.programSourceItem.value = previous;
-  const needsItem = ["named_position", "vision_detection", "drop_zone"].includes(source);
+  const needsItem = ["named_position", "vision_detection", "drop_zone", "end_effector"].includes(source);
   elements.programSourceItemField.hidden = !needsItem;
   elements.programAddHint.textContent = programSourceHint(source, options.length);
 }
@@ -4765,10 +5146,25 @@ function createProgramStep(source, sourceItem = "") {
       },
     };
   }
+  if (source === "end_effector") {
+    const tool = activeProgramTool();
+    const action = sourceItem || programToolActions()[0]?.value || "open";
+    return {
+      ...base,
+      label: uniqueProgramLabel(`${tool.label} ${action}`),
+      type: "tool",
+      mode: "tool",
+      tool: tool.name,
+      action,
+      value: action === "set" ? Number(state.robotState?.tool_value ?? 0.5) : undefined,
+      settle_ms: 150,
+    };
+  }
   return null;
 }
 
 function clearActiveProgramPreview() {
+  stopProgramPlayback({ reset: true });
   if (state.latestPreview?.mode !== "program") return;
   state.previewId = null;
   state.latestPreview = null;
@@ -4780,9 +5176,19 @@ function clearActiveProgramPreview() {
   syncJointControls();
 }
 
+function clearProgramTargetPreview() {
+  state.programTargetPreview = null;
+  state.programTargetPreviewPending = false;
+  state.programTargetMovePending = false;
+  state.programTargetStatus = "";
+}
+
 function markProgramEdited(reason = "Program edited", options = {}) {
   state.programRevision += 1;
+  state.programDirty = true;
   state.programLastEditReason = reason;
+  stopProgramPlayback({ reset: true });
+  clearProgramTargetPreview();
   state.programExecutionFailed = false;
   state.programExecutionAwaitingStart = false;
   state.programExecutionError = "";
@@ -4791,6 +5197,10 @@ function markProgramEdited(reason = "Program edited", options = {}) {
 }
 
 function insertProgramStep(step) {
+  if (programEditingLocked()) {
+    showLocalError(state.programReadOnly ? "Copy this template before editing it." : "Program editing is currently locked.");
+    return;
+  }
   if (!step) {
     showLocalError("The selected program source is not available.");
     return;
@@ -4807,13 +5217,14 @@ function insertProgramStep(step) {
 
 function addProgramStep(source = elements.programStepSource.value) {
   const options = programSourceOptions(source);
-  const sourceItem = ["named_position", "vision_detection", "drop_zone"].includes(source)
+  const sourceItem = ["named_position", "vision_detection", "drop_zone", "end_effector"].includes(source)
     ? (source === elements.programStepSource.value ? elements.programSourceItem.value : options[0]?.value)
     : "";
   insertProgramStep(createProgramStep(source, sourceItem || ""));
 }
 
 function duplicateProgramStep(index) {
+  if (programEditingLocked()) return;
   const original = state.programWaypoints[index];
   if (!original) return;
   const duplicate = clonePlain(original);
@@ -4825,6 +5236,7 @@ function duplicateProgramStep(index) {
 }
 
 function deleteProgramStep(index) {
+  if (programEditingLocked()) return;
   const [removed] = state.programWaypoints.splice(index, 1);
   if (!removed) return;
   const next = state.programWaypoints[Math.min(index, state.programWaypoints.length - 1)];
@@ -4833,6 +5245,7 @@ function deleteProgramStep(index) {
 }
 
 function moveProgramStep(index, direction) {
+  if (programEditingLocked()) return;
   const nextIndex = index + direction;
   if (index < 0 || nextIndex < 0 || nextIndex >= state.programWaypoints.length) return;
   const [step] = state.programWaypoints.splice(index, 1);
@@ -4845,7 +5258,13 @@ function programStepClientValidation(step, index) {
   if (step.enabled === false) return { ok: true, status: "disabled", errors: [] };
   const errors = [];
   if (!String(step.label || "").trim()) errors.push("label is required");
-  if (step.type === "joint") {
+  if (step.type === "tool") {
+    if (!["open", "close", "set", "on", "off"].includes(step.action)) errors.push("end-effector action is invalid");
+    if (step.action === "set" && (!Number.isFinite(Number(step.value)) || Number(step.value) < 0 || Number(step.value) > 1)) {
+      errors.push("end-effector value must be between 0 and 1");
+    }
+    if (!Number.isFinite(Number(step.settle_ms)) || Number(step.settle_ms) < 0) errors.push("settle time must be zero or greater");
+  } else if (step.type === "joint") {
     const expected = state.config?.joints?.length || 4;
     if (!Array.isArray(step.angles_deg) || step.angles_deg.length !== expected) {
       errors.push(`expected ${expected} joint angles`);
@@ -4869,6 +5288,13 @@ function programStepClientValidation(step, index) {
     if (!target.phi_auto && !Number.isFinite(Number(target.phi_deg))) errors.push("Phi must be a number or Auto");
     if (!["joint", "linear"].includes(step.mode)) errors.push("move mode must be joint or linear");
   }
+  if (step.type !== "tool") {
+    Object.entries(step.settings || {}).forEach(([key, value]) => {
+      if (!Number.isFinite(Number(value)) || Number(value) <= 0) {
+        errors.push(`${key.replaceAll("_", " ")} must be positive`);
+      }
+    });
+  }
   return {
     ok: errors.length === 0,
     status: errors.length ? "invalid" : "unvalidated",
@@ -4886,6 +5312,10 @@ function programStepResult(index) {
 }
 
 function programStepValues(step) {
+  if (step.type === "tool") {
+    const value = step.action === "set" ? ` ${format(step.value, 2)}` : "";
+    return `${step.tool || activeProgramTool().name} · ${String(step.action || "action").toUpperCase()}${value} · settle ${format(step.settle_ms, 0)} ms`;
+  }
   if (step.type === "joint") {
     return (step.angles_deg || []).map((value, index) => `J${index + 1} ${format(value, 1)}°`).join(" · ");
   }
@@ -4920,12 +5350,8 @@ function renderProgramList() {
   if (!stepCount) {
     elements.programList.innerHTML = `
       <div class="program-empty-state">
-        <strong>Build the first move</strong>
-        <p>Add the reported robot pose or the current IK target, then select the step to edit its values and move mode.</p>
-        <div class="program-empty-actions">
-          <button type="button" data-program-quick-source="current_pose">Add current pose</button>
-          <button type="button" data-program-quick-source="ik_target">Add IK target</button>
-        </div>
+        <strong>Build the first step</strong>
+        <p>Choose a source above, add the step, then select it to edit motion limits, target values, or end-effector behavior.</p>
       </div>
     `;
     return;
@@ -4952,7 +5378,7 @@ function renderProgramList() {
     item.innerHTML = `
       <div class="program-step-main">
         <label class="program-step-enable" title="${step.enabled === false ? "Enable step" : "Disable step"}">
-          <input type="checkbox" data-program-action="toggle" data-program-index="${index}" ${step.enabled === false ? "" : "checked"} ${state.programExecutionActive ? "disabled" : ""} />
+          <input type="checkbox" data-program-action="toggle" data-program-index="${index}" ${step.enabled === false ? "" : "checked"} ${programEditingLocked() ? "disabled" : ""} />
           <span>${index + 1}</span>
         </label>
         <div class="program-step-copy">
@@ -4961,8 +5387,8 @@ function renderProgramList() {
             <span class="program-validation ${status}">${status === "valid" ? "Valid" : status === "invalid" ? "Invalid" : status === "disabled" ? "Disabled" : status === "stale" ? "Stale" : "Not previewed"}</span>
           </div>
           <div class="program-step-meta">
-            <span>${step.type === "joint" ? "Joint target" : "Cartesian target"}</span>
-            <span class="program-mode ${step.mode === "linear" ? "linear" : "joint"}">${step.mode === "linear" ? "Linear TCP" : "Joint move"}</span>
+            <span>${step.type === "tool" ? "End effector" : step.type === "joint" ? "Joint target" : "Cartesian target"}</span>
+            <span class="program-mode ${step.type === "tool" ? "tool" : step.mode === "linear" ? "linear" : "joint"}">${step.type === "tool" ? String(step.action || "Action") : step.mode === "linear" ? "Linear TCP" : "Joint move"}</span>
             <span>${duration}</span>
           </div>
           <code>${escapeHtml(programStepValues(step))}</code>
@@ -4970,14 +5396,49 @@ function renderProgramList() {
         </div>
       </div>
       <div class="program-step-actions">
-        <button type="button" class="ghost" data-program-action="up" data-program-index="${index}" ${index === 0 || state.programExecutionActive ? "disabled" : ""} aria-label="Move step up">↑</button>
-        <button type="button" class="ghost" data-program-action="down" data-program-index="${index}" ${index === stepCount - 1 || state.programExecutionActive ? "disabled" : ""} aria-label="Move step down">↓</button>
-        <button type="button" class="ghost" data-program-action="duplicate" data-program-index="${index}" ${state.programExecutionActive ? "disabled" : ""}>Duplicate</button>
-        <button type="button" class="ghost danger-text" data-program-action="delete" data-program-index="${index}" ${state.programExecutionActive ? "disabled" : ""}>Delete</button>
+        <button type="button" class="ghost" data-program-action="up" data-program-index="${index}" ${index === 0 || programEditingLocked() ? "disabled" : ""} aria-label="Move step up">↑</button>
+        <button type="button" class="ghost" data-program-action="down" data-program-index="${index}" ${index === stepCount - 1 || programEditingLocked() ? "disabled" : ""} aria-label="Move step down">↓</button>
+        <button type="button" class="ghost" data-program-action="duplicate" data-program-index="${index}" ${programEditingLocked() ? "disabled" : ""}>Duplicate</button>
+        <button type="button" class="ghost danger-text" data-program-action="delete" data-program-index="${index}" ${programEditingLocked() ? "disabled" : ""}>Delete</button>
       </div>
     `;
     elements.programList.appendChild(item);
   });
+}
+
+function programMotionLimitFields(step, disabled) {
+  if (step.type === "tool") return "";
+  const defaults = pathSettings();
+  const linear = step.type === "cartesian" && step.mode === "linear";
+  const fields = linear
+    ? [
+        ["tcp_speed_mm_s", "TCP speed limit", "mm/s"],
+        ["tcp_accel_mm_s2", "TCP acceleration limit", "mm/s²"],
+        ["phi_speed_deg_s", "Tool rotation speed", "deg/s"],
+        ["phi_accel_deg_s2", "Tool rotation acceleration", "deg/s²"],
+      ]
+    : [
+        ["global_speed_deg_s", "Joint-space speed limit", "deg/s"],
+        ["global_accel_deg_s2", "Joint-space acceleration limit", "deg/s²"],
+      ];
+  return `
+    <div class="program-motion-limits">
+      <div class="subsection-heading">
+        <h4>Step motion limits</h4>
+        <p class="hint">Leave a field blank to inherit the current value from Settings.</p>
+      </div>
+      <div class="program-value-grid">
+        ${fields.map(([key, label, unit]) => `
+          <label>${label}
+            <span class="input-with-unit">
+              <input type="number" min="0.001" step="0.1" value="${Number.isFinite(Number(step.settings?.[key])) ? step.settings[key] : ""}" placeholder="${format(defaults[key], 1)}" data-program-field="setting" data-program-setting-key="${key}" ${disabled} />
+              <span>${unit}</span>
+            </span>
+          </label>
+        `).join("")}
+      </div>
+    </div>
+  `;
 }
 
 function renderProgramInspector() {
@@ -4989,59 +5450,104 @@ function renderProgramInspector() {
     return;
   }
   elements.programInspectorTitle.textContent = `Selected step ${index + 1} of ${state.programWaypoints.length}`;
-  const disabled = state.programExecutionActive ? "disabled" : "";
-  const valueFields = step.type === "joint"
-    ? `<div class="program-value-grid">
-        ${(step.angles_deg || []).map((value, jointIndex) => `
-          <label>J${jointIndex + 1} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(value)) ? value : ""}" data-program-field="angle" data-program-value-index="${jointIndex}" ${disabled} /><span>deg</span></span></label>
-        `).join("")}
-      </div>`
-    : `<div class="program-value-grid">
-        ${[
-          ["x_mm", "X", "mm"],
-          ["y_mm", "Y", "mm"],
-          ["z_mm", "Z", "mm"],
-          ["phi_deg", "Phi", "deg"],
-        ].map(([key, label, unit]) => `
-          <label>${label} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(step.target?.[key])) ? step.target[key] : ""}" data-program-field="target" data-program-target-key="${key}" ${key === "phi_deg" && step.target?.phi_auto ? "disabled" : disabled} /><span>${unit}</span></span></label>
-        `).join("")}
+  const disabled = programEditingLocked() ? "disabled" : "";
+  const isTool = step.type === "tool";
+  let valueFields = "";
+  if (isTool) {
+    const tool = activeProgramTool();
+    const actionOptions = programToolActions();
+    if (!actionOptions.some((option) => option.value === step.action)) {
+      actionOptions.push({ value: step.action, label: String(step.action || "Unknown action") });
+    }
+    valueFields = `
+      <div class="program-value-grid">
+        <label>Action
+          <select data-program-field="tool_action" ${disabled}>
+            ${actionOptions.map((option) => `<option value="${option.value}" ${step.action === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+          </select>
+        </label>
+        <label>Settle time
+          <span class="input-with-unit"><input type="number" min="0" step="10" value="${Number.isFinite(Number(step.settle_ms)) ? step.settle_ms : 150}" data-program-field="settle_ms" ${disabled} /><span>ms</span></span>
+        </label>
+        ${step.action === "set" ? `
+          <label>Tool value
+            <span class="input-with-unit"><input type="number" min="0" max="1" step="0.01" value="${Number.isFinite(Number(step.value)) ? step.value : 0.5}" data-program-field="tool_value" ${disabled} /><span>0..1</span></span>
+          </label>
+        ` : ""}
+        <div class="program-source-readout"><span>Configured tool</span><strong>${escapeHtml(tool.label)}</strong></div>
       </div>
-      <label class="toggle-label compact-toggle program-auto-phi">
-        <input type="checkbox" data-program-field="phi_auto" ${step.target?.phi_auto ? "checked" : ""} ${disabled} />
-        <span>Choose phi automatically during IK</span>
-      </label>`;
+      <p class="field-help">This action runs at its exact position in the sequence. Hardware execution still requires the configured tool, connection, and Armed state.</p>
+    `;
+  } else if (step.type === "joint") {
+    valueFields = `<div class="program-value-grid">
+      ${(step.angles_deg || []).map((value, jointIndex) => `
+        <label>J${jointIndex + 1} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(value)) ? value : ""}" data-program-field="angle" data-program-value-index="${jointIndex}" ${disabled} /><span>deg</span></span></label>
+      `).join("")}
+    </div>`;
+  } else {
+    valueFields = `<div class="program-value-grid">
+      ${[
+        ["x_mm", "X", "mm"],
+        ["y_mm", "Y", "mm"],
+        ["z_mm", "Z", "mm"],
+        ["phi_deg", "Phi", "deg"],
+      ].map(([key, label, unit]) => `
+        <label>${label} <span class="input-with-unit"><input type="number" step="0.1" value="${Number.isFinite(Number(step.target?.[key])) ? step.target[key] : ""}" data-program-field="target" data-program-target-key="${key}" ${key === "phi_deg" && step.target?.phi_auto ? "disabled" : disabled} /><span>${unit}</span></span></label>
+      `).join("")}
+    </div>
+    <label class="toggle-label compact-toggle program-auto-phi">
+      <input type="checkbox" data-program-field="phi_auto" ${step.target?.phi_auto ? "checked" : ""} ${disabled} />
+      <span>Choose phi automatically during IK</span>
+    </label>`;
+  }
 
   elements.programInspector.innerHTML = `
     <div class="program-inspector-grid">
       <label>Label <input type="text" value="${escapeHtml(step.label || "")}" data-program-field="label" ${disabled} /></label>
-      <label>Move mode
-        <select data-program-field="mode" ${step.type === "joint" || state.programExecutionActive ? "disabled" : ""}>
-          <option value="joint" ${step.mode === "joint" ? "selected" : ""}>Joint move</option>
-          <option value="linear" ${step.mode === "linear" ? "selected" : ""}>Linear Cartesian move</option>
-        </select>
-      </label>
-    </div>
-    <div class="program-inspector-type"><span>Type</span><strong>${step.type === "joint" ? "Joint target" : "Cartesian target"}</strong></div>
-    ${valueFields}
-    <details class="program-advanced">
-      <summary>Advanced</summary>
-      <div class="program-inspector-grid">
-        <label>IK branch
-          <select data-program-field="branch" ${step.type === "joint" || state.programExecutionActive ? "disabled" : ""}>
-            <option value="auto" ${step.branch === "auto" ? "selected" : ""}>Auto nearest</option>
-            <option value="elbow_up" ${step.branch === "elbow_up" ? "selected" : ""}>Elbow up</option>
-            <option value="elbow_down" ${step.branch === "elbow_down" ? "selected" : ""}>Elbow down</option>
+      ${isTool ? `<div class="program-inspector-type"><span>Type</span><strong>End-effector action</strong></div>` : `
+        <label>Move mode
+          <select data-program-field="mode" ${step.type === "joint" || programEditingLocked() ? "disabled" : ""}>
+            <option value="joint" ${step.mode === "joint" ? "selected" : ""}>Joint move</option>
+            <option value="linear" ${step.mode === "linear" ? "selected" : ""}>Linear Cartesian move</option>
           </select>
         </label>
-        <div class="program-source-readout"><span>Source</span><strong>${escapeHtml(step.source_label || step.source || "manual")}</strong></div>
+      `}
+    </div>
+    ${isTool ? "" : `<div class="program-inspector-type"><span>Type</span><strong>${step.type === "joint" ? "Joint target" : "Cartesian target"}</strong></div>`}
+    ${valueFields}
+    ${programMotionLimitFields(step, disabled)}
+    ${isTool ? "" : `
+      <details class="program-advanced">
+        <summary>Advanced</summary>
+        <div class="program-inspector-grid">
+          <label>IK branch
+            <select data-program-field="branch" ${step.type === "joint" || programEditingLocked() ? "disabled" : ""}>
+              <option value="auto" ${step.branch === "auto" ? "selected" : ""}>Auto nearest</option>
+              <option value="elbow_up" ${step.branch === "elbow_up" ? "selected" : ""}>Elbow up</option>
+              <option value="elbow_down" ${step.branch === "elbow_down" ? "selected" : ""}>Elbow down</option>
+            </select>
+          </label>
+          <div class="program-source-readout"><span>Source</span><strong>${escapeHtml(step.source_label || step.source || "manual")}</strong></div>
+        </div>
+      </details>
+      <div class="program-target-test">
+        <div>
+          <strong>Test selected target</strong>
+          <span>Preview or move directly from the robot's current reported pose. Other program steps are not included.</span>
+        </div>
+        <div class="program-target-test-actions">
+          <button type="button" class="ghost" data-program-target-action="preview">Preview target</button>
+          <button type="button" class="primary" data-program-target-action="go">Go to target</button>
+        </div>
+        <p id="programTargetTestStatus" class="program-target-test-status" aria-live="polite"></p>
       </div>
-      <p class="field-help">Per-step speed and tool actions are not part of the current motion-only program API. The step shape keeps source and settings fields available for later extension.</p>
-    </details>
+    `}
     <div class="program-inspector-actions">
       <button type="button" class="ghost" data-program-inspector-action="duplicate" ${disabled}>Duplicate step</button>
       <button type="button" class="ghost danger-text" data-program-inspector-action="delete" ${disabled}>Delete step</button>
     </div>
   `;
+  updateProgramTargetControls();
 }
 
 function programWorkflowState() {
@@ -5053,6 +5559,7 @@ function programWorkflowState() {
   ) return "failed";
   if (programPreviewIsFresh()) return "preview_valid";
   if (state.programHasPreviewed || state.programValidationRevision !== null) return "needs_preview";
+  if (state.programReadOnly) return "template";
   return "editing";
 }
 
@@ -5060,6 +5567,7 @@ function renderProgramWorkflowStatus() {
   const workflowState = programWorkflowState();
   const labels = {
     empty: "Empty",
+    template: "Template",
     editing: "Editing",
     needs_preview: "Needs preview",
     preview_valid: "Preview valid",
@@ -5070,8 +5578,9 @@ function renderProgramWorkflowStatus() {
   elements.programStatus.dataset.state = workflowState;
   const diagnostics = state.robotState?.motion_diagnostics || {};
   const details = {
-    empty: "Add the first motion step to begin.",
-    editing: "Build the sequence, select each step to edit it, then run Preview.",
+    empty: "Choose a demo, load a saved program, or create a new one.",
+    template: `${state.programName || "This demo"} is read-only. Preview it as-is, or save a copy before editing.`,
+    editing: `${state.programName || "Untitled program"} is ready for editing. Build the sequence, then move to Preview.`,
     needs_preview: `${state.programLastEditReason || "The sequence changed"}. Preview the current version before execution.`,
     preview_valid: "This exact sequence passed preview and is ready when the robot safety gates are satisfied.",
     running: `Executing ${diagnostics.current_waypoint_total ? `waypoint ${diagnostics.current_waypoint_index || 0} of ${diagnostics.current_waypoint_total}` : "the validated program"}.`,
@@ -5079,18 +5588,40 @@ function renderProgramWorkflowStatus() {
   };
   elements.programStatusDetail.textContent = details[workflowState];
 
-  const activeStage = workflowState === "running" || state.programExecutionFailed
-    ? "execute"
-    : ["preview_valid", "failed"].includes(workflowState)
-      ? "preview"
-      : "build";
   const completed = new Set();
-  if (["preview_valid", "running"].includes(workflowState)) completed.add("build");
-  if (workflowState === "running") completed.add("preview");
+  if (state.programActiveId || state.programDirty || state.programWaypoints.length) completed.add("library");
+  if (state.programWaypoints.length) completed.add("build");
+  if (["preview_valid", "running"].includes(workflowState)) completed.add("preview");
+  if (workflowState === "running") completed.add("run");
   elements.programWorkflow.querySelectorAll("[data-program-stage]").forEach((stage) => {
-    stage.classList.toggle("active", stage.dataset.programStage === activeStage);
+    stage.classList.toggle("active", stage.dataset.programStage === state.activeProgramStage);
     stage.classList.toggle("done", completed.has(stage.dataset.programStage));
   });
+}
+
+function renderProgramRunMonitor(robotState = state.robotState) {
+  if (!elements.programRunMonitor) return;
+  const diagnostics = robotState?.motion_diagnostics || {};
+  const trajectory = latestProgramTrajectory();
+  const result = String(diagnostics.result || robotState?.motion_execution_state || "").toLowerCase();
+  const status = state.programExecutionActive
+    ? (result || "starting")
+    : state.programExecutionFailed
+      ? "failed"
+      : programPreviewIsFresh()
+        ? "ready"
+        : "waiting for preview";
+  const progress = clamp(Number(diagnostics.progress_ratio ?? 0), 0, 1);
+  const activeStep = Number(diagnostics.active_step_index || 0);
+  const totalSteps = Number(diagnostics.active_step_total || state.programWaypoints.length || 0);
+  elements.programRunMonitor.innerHTML = `
+    <div class="program-run-grid">
+      <div class="program-run-metric"><span>Program</span><strong>${escapeHtml(state.programName || "Untitled program")}</strong><small>${state.programReadOnly ? "built-in template" : state.programActiveId ? "saved user program" : "unsaved draft"}</small></div>
+      <div class="program-run-metric"><span>Status</span><strong>${escapeHtml(status)}</strong><small>${state.programExecutionError ? escapeHtml(state.programExecutionError) : `${format(progress * 100, 0)}% complete`}</small></div>
+      <div class="program-run-metric"><span>Step</span><strong>${activeStep && totalSteps ? `${activeStep}/${totalSteps}` : "—"}</strong><small>${escapeHtml(diagnostics.active_step_label || "No active step")}</small></div>
+      <div class="program-run-metric"><span>Planned duration</span><strong>${Number.isFinite(Number(trajectory.duration_s)) ? `${format(trajectory.duration_s, 2)} s` : "—"}</strong><small>${trajectory.waypoint_count || 0} path points</small></div>
+    </div>
+  `;
 }
 
 function currentProgramErrors() {
@@ -5112,6 +5643,7 @@ function renderProgramPreviewSummary() {
   const trajectory = latestProgramTrajectory();
   const stepCount = state.programWaypoints.length;
   const moveCount = state.programWaypoints.filter((step) => step.enabled !== false).length;
+  const actionCount = state.programWaypoints.filter((step) => step.enabled !== false && step.type === "tool").length;
   const fresh = programPreviewIsFresh();
   const stale = state.programValidationRevision !== null && state.programValidationRevision !== state.programRevision;
   const status = state.programExecutionActive
@@ -5135,7 +5667,7 @@ function renderProgramPreviewSummary() {
   elements.programPreviewSummary.innerHTML = `
     <div class="program-summary-grid">
       <div><span>Steps</span><strong>${stepCount}</strong></div>
-      <div><span>Moves</span><strong>${moveCount}</strong></div>
+      <div><span>Moves / actions</span><strong>${Math.max(0, moveCount - actionCount)} / ${actionCount}</strong></div>
       <div><span>Duration</span><strong>${Number.isFinite(Number(trajectory.duration_s)) ? `${format(trajectory.duration_s, 2)} s` : "—"}</strong></div>
       <div><span>Preview</span><strong class="program-summary-status ${status.toLowerCase().replace(" ", "-")}">${status}</strong></div>
     </div>
@@ -5160,12 +5692,124 @@ function renderProgramPreviewSummary() {
   }
 }
 
+function programPlaybackTrajectory() {
+  return programPreviewIsFresh() ? state.programPreview?.trajectory || null : null;
+}
+
+function programPlaybackDuration() {
+  return Math.max(0, Number(programPlaybackTrajectory()?.duration_s) || 0);
+}
+
+function programPlaybackAnglesAt(elapsedS) {
+  const trajectory = programPlaybackTrajectory();
+  const waypoints = trajectory?.waypoints || [];
+  const times = trajectory?.time_from_start_s || [];
+  if (!waypoints.length) return null;
+  if (waypoints.length === 1 || elapsedS <= Number(times[0] || 0)) return waypoints[0].map(Number);
+  const finalTime = Number(times[times.length - 1] || 0);
+  if (elapsedS >= finalTime) return waypoints[waypoints.length - 1].map(Number);
+  let nextIndex = 1;
+  while (nextIndex < times.length && Number(times[nextIndex]) < elapsedS) nextIndex += 1;
+  const previousIndex = Math.max(0, nextIndex - 1);
+  const startTime = Number(times[previousIndex] || 0);
+  const endTime = Number(times[nextIndex] || startTime);
+  const ratio = endTime > startTime ? Math.min(1, Math.max(0, (elapsedS - startTime) / (endTime - startTime))) : 1;
+  return waypoints[previousIndex].map((value, jointIndex) => {
+    const start = Number(value);
+    const end = Number(waypoints[nextIndex]?.[jointIndex] ?? start);
+    return start + (end - start) * ratio;
+  });
+}
+
+function programPlaybackStepAt(elapsedS) {
+  const results = (programPlaybackTrajectory()?.step_results || []).filter((result) => result.enabled !== false);
+  if (!results.length) return null;
+  return results.find((result) => {
+    const start = Number(result.start_time_s || 0);
+    const end = Number(result.end_time_s ?? start);
+    return elapsedS >= start && (elapsedS < end || (end === start && Math.abs(elapsedS - start) < 0.001));
+  }) || results[results.length - 1];
+}
+
+function updateProgramPlaybackUi() {
+  if (!elements.programPlayback) return;
+  const duration = programPlaybackDuration();
+  const fresh = Boolean(programPlaybackTrajectory());
+  const elapsed = Math.min(duration, Math.max(0, Number(state.programPlaybackElapsedS) || 0));
+  const ratio = duration > 0 ? elapsed / duration : 0;
+  const activeStep = fresh ? programPlaybackStepAt(elapsed) : null;
+  elements.programPlaybackProgress.disabled = !fresh || duration <= 0;
+  elements.programPlaybackProgress.value = String(Math.round(ratio * 1000));
+  elements.programPlaybackToggle.disabled = !fresh || duration <= 0;
+  elements.programPlaybackRestart.disabled = !fresh || duration <= 0;
+  elements.programPlaybackRate.disabled = !fresh || duration <= 0;
+  elements.programPlaybackRate.value = String(state.programPlaybackRate);
+  elements.programPlaybackToggle.textContent = state.programPlaybackPlaying ? "Pause" : elapsed >= duration && duration > 0 ? "Replay" : "Play";
+  elements.programPlaybackTime.textContent = `${format(elapsed, 2)} / ${format(duration, 2)} s`;
+  elements.programPlaybackStep.textContent = !fresh
+    ? "Preview the program to animate its timing."
+    : activeStep
+      ? `Step ${Number(activeStep.index) + 1}: ${activeStep.label || activeStep.type}${activeStep.type === "tool" ? ` · ${String(activeStep.mode || activeStep.action || "action")}` : ""}`
+      : "Ready to play the planned movement.";
+}
+
+function seekProgramPlayback(elapsedS) {
+  const duration = programPlaybackDuration();
+  state.programPlaybackElapsedS = Math.min(duration, Math.max(0, Number(elapsedS) || 0));
+  const angles = programPlaybackAnglesAt(state.programPlaybackElapsedS);
+  if (angles && state.view) {
+    state.viewPreviewSource = "program";
+    state.view.setPreviewAngles(angles);
+  }
+  updateProgramPlaybackUi();
+}
+
+function stopProgramPlayback(options = {}) {
+  if (state.programPlaybackFrame !== null) cancelAnimationFrame(state.programPlaybackFrame);
+  state.programPlaybackFrame = null;
+  state.programPlaybackPlaying = false;
+  if (options.reset) state.programPlaybackElapsedS = 0;
+  updateProgramPlaybackUi();
+}
+
+function programPlaybackTick(nowMs) {
+  if (!state.programPlaybackPlaying) return;
+  const duration = programPlaybackDuration();
+  state.programPlaybackElapsedS = Math.min(
+    duration,
+    Math.max(0, (nowMs - state.programPlaybackStartedAtMs) / 1000 * state.programPlaybackRate),
+  );
+  seekProgramPlayback(state.programPlaybackElapsedS);
+  if (state.programPlaybackElapsedS >= duration) {
+    state.programPlaybackPlaying = false;
+    state.programPlaybackFrame = null;
+    updateProgramPlaybackUi();
+    return;
+  }
+  state.programPlaybackFrame = requestAnimationFrame(programPlaybackTick);
+}
+
+function startProgramPlayback(options = {}) {
+  const duration = programPlaybackDuration();
+  if (!duration) return;
+  if (options.restart || state.programPlaybackElapsedS >= duration) state.programPlaybackElapsedS = 0;
+  if (state.programPlaybackFrame !== null) cancelAnimationFrame(state.programPlaybackFrame);
+  state.programPlaybackPlaying = true;
+  state.programPlaybackStartedAtMs = performance.now() - (state.programPlaybackElapsedS / state.programPlaybackRate) * 1000;
+  seekProgramPlayback(state.programPlaybackElapsedS);
+  state.programPlaybackFrame = requestAnimationFrame(programPlaybackTick);
+}
+
 function renderProgramBuilder(options = {}) {
+  renderProgramLibrary();
   renderProgramSourceOptions();
   renderProgramList();
   if (options.inspector !== false) renderProgramInspector();
   renderProgramWorkflowStatus();
   renderProgramPreviewSummary();
+  renderProgramRunMonitor();
+  setActiveProgramStage(state.activeProgramStage);
+  updateProgramPlaybackUi();
   updateDisabledState();
 }
 
@@ -5176,6 +5820,19 @@ function updateProgramStepFromControl(control) {
   if (field === "label") step.label = control.value;
   if (field === "mode") step.mode = control.value === "linear" && step.type === "cartesian" ? "linear" : "joint";
   if (field === "branch") step.branch = control.value;
+  if (field === "tool_action") {
+    step.action = control.value;
+    if (step.action === "set" && !Number.isFinite(Number(step.value))) step.value = 0.5;
+  }
+  if (field === "tool_value") step.value = control.value === "" ? Number.NaN : Number(control.value);
+  if (field === "settle_ms") step.settle_ms = control.value === "" ? Number.NaN : Number(control.value);
+  if (field === "setting") {
+    step.settings = step.settings || {};
+    const key = control.dataset.programSettingKey;
+    if (control.value === "") delete step.settings[key];
+    else step.settings[key] = Number(control.value);
+    if (!Object.keys(step.settings).length) delete step.settings;
+  }
   if (field === "phi_auto") {
     step.target = step.target || {};
     step.target.phi_auto = control.checked;
@@ -5189,6 +5846,97 @@ function updateProgramStepFromControl(control) {
     step.angles_deg[valueIndex] = control.value === "" ? Number.NaN : Number(control.value);
   }
   markProgramEdited(`Edited ${step.label || "selected step"}`, { inspector: false });
+}
+
+async function previewSelectedProgramTarget() {
+  const step = selectedProgramStep();
+  const index = selectedProgramIndex();
+  if (!step || index < 0 || state.programTargetPreviewPending) return;
+  const validation = programStepClientValidation(step, index);
+  if (step.enabled === false || !validation.ok) {
+    state.programTargetStatus = step.enabled === false
+      ? "Enable this step before previewing its target."
+      : validation.errors[0] || "The selected target is invalid.";
+    updateProgramTargetControls();
+    return;
+  }
+
+  const revision = state.programRevision;
+  state.programTargetPreviewPending = true;
+  state.programTargetStatus = "";
+  updateProgramTargetControls();
+  const payload = await postJson("/api/path/preview", {
+    mode: "program",
+    branch: step.branch || elements.ikBranchSelect.value,
+    settings: pathSettings(),
+    waypoints: [clonePlain(step)],
+    program_revision: revision,
+  });
+  state.programTargetPreviewPending = false;
+  if (revision !== state.programRevision || selectedProgramStep()?.id !== step.id) {
+    clearProgramTargetPreview();
+    updateProgramTargetControls();
+    return;
+  }
+  if (payload.ok) {
+    stopProgramPlayback({ reset: true });
+    renderPreview(payload.preview);
+    state.programTargetPreview = {
+      previewId: payload.preview.id,
+      stepId: step.id,
+      programRevision: revision,
+      startPoseRevision: payload.preview.start_pose_revision,
+    };
+    state.programTargetStatus = "";
+    state.programPreviewRevision = null;
+    state.programLastEditReason = "A Build target preview replaced the full-program preview";
+  } else {
+    clearProgramTargetPreview();
+    state.programTargetStatus = payload.error || "Target preview failed.";
+    renderPreviewFailure(payload);
+  }
+  renderProgramBuilder({ inspector: false });
+  updateProgramTargetControls();
+}
+
+async function executeSelectedProgramTarget() {
+  const step = selectedProgramStep();
+  if (!programTargetPreviewIsFresh(step)) {
+    state.programTargetStatus = "Preview this exact target from the current robot pose first.";
+    updateProgramTargetControls();
+    return;
+  }
+  const gateReason = programMotionGateReason();
+  if (gateReason) {
+    state.programTargetStatus = gateReason;
+    updateProgramTargetControls();
+    return;
+  }
+
+  const previewId = state.programTargetPreview.previewId;
+  state.programTargetMovePending = true;
+  state.programTargetStatus = `Starting move to ${step.label || "selected target"}...`;
+  updateProgramTargetControls();
+  const payload = await postJson("/api/path/execute", {
+    preview_id: previewId,
+    program_revision: state.programRevision,
+  });
+  if (payload.ok) {
+    releaseJointControlIntent();
+    state.previewId = null;
+    state.previewAngles = null;
+    state.taskPreviewId = null;
+    state.ikUserEdited = false;
+    clearProgramTargetPreview();
+    state.programTargetStatus = `Move accepted for ${step.label || "selected target"}. Watch the HUD and 3D arm for progress.`;
+  } else {
+    clearProgramTargetPreview();
+    state.programTargetStatus = payload.error || "Target move failed.";
+    if (/preview|configuration|model|start pose/i.test(payload.error || "")) clearViewPreview();
+  }
+  if (payload.state) renderState(payload.state);
+  renderProgramBuilder({ inspector: false });
+  updateProgramTargetControls();
 }
 
 async function previewProgram() {
@@ -5247,11 +5995,14 @@ async function previewProgram() {
   }
   state.programValidationRevision = revision;
   if (payload.ok) {
+    clearProgramTargetPreview();
     renderPreview(payload.preview);
     state.programPreview = payload.preview;
     state.programPreviewRevision = revision;
     state.programPreviewFailure = null;
     state.programExecutionFailed = false;
+    state.programPlaybackElapsedS = 0;
+    startProgramPlayback({ restart: true });
   } else {
     state.programPreviewRevision = null;
     state.programPreviewFailure = payload;
@@ -5272,10 +6023,12 @@ async function executeProgram() {
     return;
   }
   const previewId = state.previewId;
+  stopProgramPlayback();
   state.programExecutionActive = true;
   state.programExecutionAwaitingStart = true;
   state.programExecutionFailed = false;
   state.programExecutionError = "";
+  setActiveProgramStage("run");
   renderProgramBuilder({ inspector: false });
   const payload = await postJson("/api/path/execute", {
     preview_id: previewId,
@@ -5321,6 +6074,9 @@ function syncProgramExecutionState(robotState) {
     state.programExecutionFailed = true;
     state.programExecutionError = diagnostics.error || robotState?.last_error || `Program ${result}.`;
   } else if (result === "reached") {
+    const activeStepIndex = Number(diagnostics.active_step_index || 0);
+    const activeStepTotal = Number(diagnostics.active_step_total || 0);
+    if (activeStepTotal > 0 && activeStepIndex < activeStepTotal) return;
     state.programExecutionActive = false;
     state.programExecutionAwaitingStart = false;
     state.programExecutionFailed = false;
@@ -5380,9 +6136,9 @@ function readCalibrationPayload() {
     color_profiles: taskColorProfiles(),
     task_destinations: {
       schema_version: 1,
-      destinations: taskDestinations(),
+      destinations: taskDestinationsForSave(),
     },
-    drop_zones: taskDestinations(),
+    drop_zones: taskDestinationsForSave(),
     tasks: {
       ...(state.config.tasks || {}),
       color_sorting: {
@@ -5499,6 +6255,7 @@ function applyConfig(config) {
   state.taskColorProfilesDraft = clonePlain(config.color_profiles || {});
   state.taskDestinationsDraft = savedTaskDestinations();
   state.positionLibraryDraft = savedPositionLibraryRecords();
+  state.positionLibraryErrors = {};
   state.unsavedColorProfiles.clear();
   state.selectedSerialPort = state.selectedSerialPort || state.config.serial.port;
   elements.baudRate.value = state.config.serial.baud_rate;
@@ -5931,7 +6688,7 @@ function bindActions() {
   elements.connectSelectedSerialBtn.addEventListener("click", connectSelectedSerial);
   elements.disconnectBtn.addEventListener("click", () => postJson("/api/disconnect"));
   elements.homeBtn.addEventListener("click", async () => {
-    const payload = await postJson("/api/home");
+    const payload = await postJson("/api/home", { settings: pathSettings() });
     if (payload.ok) {
       invalidatePendingIkPreview();
       releaseJointControlIntent();
@@ -5941,6 +6698,11 @@ function bindActions() {
     if (payload.state) renderState(payload.state);
   });
   elements.setPoseBtn.addEventListener("click", setCurrentPoseKnown);
+  elements.cancelSetPoseBtn?.addEventListener("click", () => setPoseModalVisible(false));
+  elements.confirmSetPoseBtn?.addEventListener("click", confirmCurrentPoseKnown);
+  elements.setPoseModal?.addEventListener("click", (event) => {
+    if (event.target === elements.setPoseModal) setPoseModalVisible(false);
+  });
   elements.stopBtn.addEventListener("click", async () => {
     elements.cartesianJogToggle.checked = false;
     zeroCartesianJogVelocity();
@@ -5960,6 +6722,8 @@ function bindActions() {
   });
   elements.closeDiagnosticsBtn.addEventListener("click", () => {
     elements.diagnosticsDrawer.hidden = true;
+    if (state.diagnosticsRenderTimer) window.clearTimeout(state.diagnosticsRenderTimer);
+    state.diagnosticsRenderTimer = null;
   });
   elements.hardwareArmToggle.addEventListener("change", () => postJson("/api/hardware-arm", { armed: elements.hardwareArmToggle.checked }));
   elements.hardwareIo.addEventListener("input", markHardwareDraftDirty);
@@ -6137,6 +6901,7 @@ function bindActions() {
       if (CORE_POSITION_IDS.has(positionId)) return;
       const records = ensurePositionLibraryDraft();
       delete records[positionId];
+      delete state.positionLibraryErrors[positionId];
       markPositionLibraryDirty("Position removed. Save Library to persist.");
       renderPositionLibrary();
     }
@@ -6189,22 +6954,6 @@ function bindActions() {
       updateColorProfileDraft(zoneSelect.dataset.colorDropZone, { drop_zone: zoneSelect.value });
     }
   });
-  elements.taskDestinationEditor?.addEventListener("input", (event) => {
-    const input = event.target.closest("[data-task-destination-field]");
-    if (!input || input.tagName === "SELECT") return;
-    updateTaskDestinationDraft(input.dataset.taskDestination, input.dataset.taskDestinationField, input.value);
-  });
-  elements.taskDestinationEditor?.addEventListener("change", (event) => {
-    const input = event.target.closest("[data-task-destination-field]");
-    if (!input || input.tagName !== "SELECT") return;
-    updateTaskDestinationDraft(input.dataset.taskDestination, input.dataset.taskDestinationField, input.value);
-  });
-  elements.taskDestinationEditor?.addEventListener("click", (event) => {
-    const button = event.target.closest("[data-task-destination-delete]");
-    if (!button) return;
-    deleteTaskDestination(button.dataset.taskDestinationDelete);
-  });
-  elements.addTaskDestinationBtn?.addEventListener("click", addTaskDestination);
   elements.saveTaskMappingsBtn?.addEventListener("click", saveTaskMappingEdits);
   elements.discardTaskMappingsBtn?.addEventListener("click", discardTaskMappingEdits);
   [
@@ -6332,10 +7081,37 @@ function bindActions() {
   elements.ikStopBtn.addEventListener("click", () => postJson("/api/stop"));
 
   elements.appTabPanels.program.addEventListener("click", (event) => {
-    const quickAdd = event.target.closest("[data-program-quick-source]");
-    if (quickAdd) {
-      addProgramStep(quickAdd.dataset.programQuickSource);
+    const stageButton = event.target.closest("[data-program-stage]");
+    if (stageButton) {
+      setActiveProgramStage(stageButton.dataset.programStage);
+      renderProgramWorkflowStatus();
+      return;
     }
+    const libraryAction = event.target.closest("[data-program-library-action]");
+    if (libraryAction) {
+      const programId = libraryAction.dataset.programId;
+      const action = libraryAction.dataset.programLibraryAction;
+      const program = state.programLibrary.find((item) => item.id === programId);
+      if (action === "load" && program) replaceCurrentProgram(program, { stage: "build" });
+      if (action === "copy") copyLibraryProgram(programId);
+      if (action === "delete") deleteProgram(programId);
+      return;
+    }
+  });
+  elements.newProgramBtn.addEventListener("click", startNewProgram);
+  elements.saveProgramBtn.addEventListener("click", () => saveCurrentProgram());
+  elements.copyProgramBtn.addEventListener("click", () => saveCurrentProgram({ copy: true }));
+  elements.programNameInput.addEventListener("input", () => {
+    if (state.programReadOnly) return;
+    state.programName = elements.programNameInput.value;
+    state.programDirty = true;
+    setProgramLibraryStatus("Unsaved changes", "warn");
+  });
+  elements.programDescriptionInput.addEventListener("input", () => {
+    if (state.programReadOnly) return;
+    state.programDescription = elements.programDescriptionInput.value;
+    state.programDirty = true;
+    setProgramLibraryStatus("Unsaved changes", "warn");
   });
   elements.programStepSource.addEventListener("change", () => {
     renderProgramSourceOptions();
@@ -6344,7 +7120,7 @@ function bindActions() {
   elements.programSourceItem.addEventListener("change", updateDisabledState);
   elements.addProgramStepBtn.addEventListener("click", () => addProgramStep());
   elements.clearProgramBtn.addEventListener("click", () => {
-    if (!window.confirm(`Clear all ${state.programWaypoints.length} program steps? This cannot be undone.`)) return;
+    if (programEditingLocked()) return;
     state.programWaypoints = [];
     state.programSelectedId = null;
     state.programPreview = null;
@@ -6355,7 +7131,28 @@ function bindActions() {
     markProgramEdited("Program cleared");
   });
   elements.previewProgramBtn.addEventListener("click", previewProgram);
+  elements.programPlaybackToggle.addEventListener("click", () => {
+    if (state.programPlaybackPlaying) stopProgramPlayback();
+    else startProgramPlayback();
+  });
+  elements.programPlaybackRestart.addEventListener("click", () => startProgramPlayback({ restart: true }));
+  elements.programPlaybackRate.addEventListener("change", () => {
+    const wasPlaying = state.programPlaybackPlaying;
+    const elapsed = state.programPlaybackElapsedS;
+    state.programPlaybackRate = Number(elements.programPlaybackRate.value) || 1;
+    state.programPlaybackElapsedS = elapsed;
+    if (wasPlaying) startProgramPlayback();
+    else updateProgramPlaybackUi();
+  });
+  elements.programPlaybackProgress.addEventListener("input", () => {
+    stopProgramPlayback();
+    seekProgramPlayback(programPlaybackDuration() * (Number(elements.programPlaybackProgress.value) / 1000));
+  });
   elements.executeProgramBtn.addEventListener("click", executeProgram);
+  elements.stopProgramBtn.addEventListener("click", async () => {
+    const payload = await postJson("/api/stop");
+    if (payload.state) renderState(payload.state);
+  });
   elements.programList.addEventListener("click", (event) => {
     const actionControl = event.target.closest("[data-program-action]");
     if (actionControl) {
@@ -6392,6 +7189,15 @@ function bindActions() {
     }
   });
   elements.programInspector.addEventListener("click", (event) => {
+    const targetAction = event.target.closest("[data-program-target-action]")?.dataset.programTargetAction;
+    if (targetAction === "preview") {
+      previewSelectedProgramTarget();
+      return;
+    }
+    if (targetAction === "go") {
+      executeSelectedProgramTarget();
+      return;
+    }
     const action = event.target.closest("[data-program-inspector-action]")?.dataset.programInspectorAction;
     const index = selectedProgramIndex();
     if (action === "duplicate") duplicateProgramStep(index);
@@ -6415,6 +7221,7 @@ function bindActions() {
 async function init() {
   state.view = new RobotView($("#robotViewport"));
   await loadConfig();
+  await loadProgramLibrary();
   bindActions();
   await postJson("/api/live-motion", { enabled: false });
   await checkAppVersion();

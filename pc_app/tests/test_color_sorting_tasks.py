@@ -439,8 +439,11 @@ def test_invalid_drop_zone_coordinates_are_reported_instead_of_becoming_zero():
             "destinations": {
                 **config.raw["task_destinations"]["destinations"],
                 "dropoff_a": {
-                    **config.raw["task_destinations"]["destinations"]["dropoff_a"],
+                    "label": "Dropoff A",
                     "x_mm": "not-a-number",
+                    "y_mm": 180.0,
+                    "z_mm": 45.0,
+                    "phi_deg": 0.0,
                 },
             },
         },

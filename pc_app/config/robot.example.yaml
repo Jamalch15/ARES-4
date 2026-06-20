@@ -385,34 +385,16 @@ color_profiles:
     drop_zone: dropoff_b
 
 task_destinations:
-  # Task-owned destinations are separate from the general Position Library.
-  # A destination may instead use position_id to reference a saved position.
+  # Compatibility bridge for task planning. The UI maps colors directly to
+  # Position Library IDs and writes these lightweight references.
   schema_version: 1
   destinations:
     dropoff_a:
       label: Dropoff A
-      x_mm: -160.0
-      y_mm: 180.0
-      z_mm: 45.0
-      phi_deg: 0.0
-      grid:
-        rows: 2
-        columns: 3
-        x_spacing_mm: 24.0
-        y_spacing_mm: 24.0
-        order: row_major
+      position_id: dropoff_a
     dropoff_b:
       label: Dropoff B
-      x_mm: 120.0
-      y_mm: 180.0
-      z_mm: 45.0
-      phi_deg: 0.0
-      grid:
-        rows: 2
-        columns: 3
-        x_spacing_mm: 24.0
-        y_spacing_mm: 24.0
-        order: row_major
+      position_id: dropoff_b
 
 task_defaults:
   safe_position: safe

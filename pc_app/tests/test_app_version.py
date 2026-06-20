@@ -155,8 +155,53 @@ def test_frontend_contains_position_library_hooks():
     assert "addCartesianPositionBtn" in app_js
     assert "data-position-duplicate" in app_js
     assert "/api/position-library" in app_js
-    assert "Task destinations" in index_html
-    assert "taskDestinationEditor" in app_js
-    assert "positionReferenceOptionsHtml" in app_js
+    assert "Tasks select these positions directly" in index_html
+    assert "availableTaskDestinations" in app_js
+    assert "taskDestinationsForSave" in app_js
     assert "/api/task-mappings" in app_js
     assert "Color-to-destination defaults" not in index_html
+    assert 'const CORE_POSITION_IDS = new Set(["home"])' in app_js
+    assert "position-library-error" in app_js
+
+
+def test_frontend_contains_sweep_feedback_hooks():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "setPoseModal" in index_html
+    assert "Set Pose does not move or physically home the robot. It asserts" not in app_js
+    assert "confirmCurrentPoseKnown" in app_js
+    assert "Changing to ${active}..." in app_js
+    assert "scheduleDiagnosticsRender" in app_js
+    assert 'fetch("/api/events?limit=80")' in app_js
+    assert 'postJson("/api/home", { settings: pathSettings() })' in app_js
+    assert 'postJson("/api/path/go"' in app_js
+    assert index_html.count("collapsible-panel") >= 2
+
+
+def test_frontend_contains_program_library_workflow_and_demo_hooks():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    for stage in ("library", "build", "preview", "run"):
+        assert f'data-program-stage="{stage}"' in index_html
+        assert f'data-program-panel="{stage}"' in index_html
+    assert "Built-in demos" in index_html
+    assert "My programs" in index_html
+    assert "Save as copy" in index_html
+    assert "previewProgramStepBtn" not in index_html
+    assert "Preview selected step" not in index_html
+    assert "programPlaybackProgress" in index_html
+    assert "programPlaybackToggle" in index_html
+    assert 'option value="end_effector"' in index_html
+    assert "loadProgramLibrary" in app_js
+    assert 'requestJson("/api/programs")' in app_js
+    assert "startProgramPlayback" in app_js
+    assert "programMotionLimitFields" in app_js
+    assert "copyLibraryProgram" in app_js
+    assert "renderProgramRunMonitor" in app_js
+    assert "Preview target" in app_js
+    assert "Go to target" in app_js
+    assert "previewSelectedProgramTarget" in app_js
+    assert "executeSelectedProgramTarget" in app_js
+    assert 'postJson("/api/path/preview"' in app_js

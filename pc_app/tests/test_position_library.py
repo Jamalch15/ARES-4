@@ -1,3 +1,4 @@
+import asyncio
 from copy import deepcopy
 from dataclasses import replace
 from shutil import copyfile
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 import app.main as main
 from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import drop_zones, named_positions
+from app.motion import RateLimitedMotion
 from app.position_library import (
     POSITION_LIBRARY_SCHEMA_VERSION,
     normalize_position_record,
@@ -342,6 +344,80 @@ def test_position_library_rejects_record_id_that_differs_from_stable_key(tmp_pat
 
     assert not payload["ok"]
     assert "must match its stable library key" in payload["errors"]["stable_key"][0]
+    assert payload["error"].startswith("stable_key:")
+
+
+def test_position_library_reports_the_specific_invalid_record(tmp_path, monkeypatch):
+    target = tmp_path / "robot.local.yaml"
+    copyfile(EXAMPLE_CONFIG_PATH, target)
+    main.cancel_motion_tasks()
+    main.config = load_config(target)
+    main.state.motion_state = MotionState.IDLE
+    main.state.live_motion_enabled = False
+    main.state.hardware_armed = False
+    monkeypatch.setattr(main, "ensure_local_config", lambda: target)
+    client = TestClient(main.app)
+
+    payload = client.post(
+        "/api/position-library",
+        json={
+            "positions": {
+                "unsafe_joint": {
+                    "type": "joint",
+                    "display_name": "Unsafe Joint",
+                    "angles_deg": [0.0, 999.0, 0.0, 0.0],
+                }
+            }
+        },
+    ).json()
+
+    assert not payload["ok"]
+    assert payload["error"].startswith("unsafe_joint:")
+    assert payload["errors"]["unsafe_joint"]
+
+
+def test_atomic_go_path_does_not_stale_between_preview_and_execute(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "position-go-test")
+    main.cancel_motion_tasks()
+    main.state.connected = True
+    main.state.simulation = True
+    main.state.known_pose = True
+    main.state.pose_source = "simulation"
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    monkeypatch.setattr(
+        main,
+        "limiter",
+        RateLimitedMotion(config, config.home_pose.copy(), config.home_pose.copy()),
+    )
+
+    async def scenario():
+        response = await main.go_path(
+            main.PathGoRequest(
+                waypoints=[
+                    {
+                        "type": "joint",
+                        "mode": "joint",
+                        "angles_deg": config.home_pose.copy(),
+                    }
+                ],
+                settings=main.PathSettingsRequest(
+                    global_speed_deg_s=10.0,
+                    global_accel_deg_s2=20.0,
+                ),
+            )
+        )
+        assert response["ok"], response
+        await asyncio.wait_for(main.path_task, timeout=2.0)
+        return response
+
+    payload = asyncio.run(scenario())
+
+    assert payload["preview"]["source"] == "position_library_go"
+    assert payload["preview"]["settings"]["global_speed_deg_s"] == 10.0
 
 
 def test_position_library_rejects_deleting_position_used_by_task_destination(tmp_path, monkeypatch):

@@ -13,7 +13,7 @@ Current scope:
 - Standard DH forward kinematics and Jacobian IK sandbox
 - Cartesian target preview with ghost arm, target marker, and path line
 - Task panel with a movable live camera popup, multi-object workspace color detection, and pick/place or color-sorting preview
-- In-memory program sandbox for multi-waypoint experiments
+- Persistent staged program builder with per-step preview and adaptive demo templates
 - Simulation mode by default
 - Serial transport abstraction for later ESP32-S3 control
 - Persistent Hardware IO settings for pins, TB6600 microstep value, gear ratios, servo pulse mapping, tools, and encoders
@@ -86,11 +86,11 @@ http://127.0.0.1:8000
 
 Simulation mode is enabled by default in `config/robot.example.yaml`, so the dashboard should work without an ESP32-S3 connected. Machine-specific values are saved to `config/robot.local.yaml` when present.
 
-General robot poses are stored in the Position Library. Color-sorting
-destinations are stored separately under `task_destinations` and may either
-contain inline Cartesian coordinates or reference a Position Library ID.
-Legacy `named_positions` and `drop_zones` values are still loaded and mirrored
-when saving so existing local configurations remain usable during migration.
+General robot poses are stored in the Position Library. Color-sorting mappings
+select Position Library records directly in Tasks. The backend still writes
+lightweight `task_destinations` references and legacy `named_positions` /
+`drop_zones` mirrors so existing local configurations remain usable during
+migration.
 
 ## Startup Troubleshooting
 
@@ -233,12 +233,26 @@ Use this for Cartesian target experiments.
 
 ### Program Tab
 
-Use this for temporary waypoint experiments. Programs are in-memory only and are not saved.
+Use the staged `Library -> Build -> Preview -> Run` workflow for reusable
+motion sequences.
 
-- Add the current joint pose or current IK target as a waypoint.
-- Reorder or delete waypoints.
-- `Preview Program` builds the full path.
-- `Execute Program` runs the accepted program preview.
+- `Library` creates, saves, loads, duplicates, and deletes local user programs.
+- Built-in read-only demos include an adaptive air square, a 24-segment air
+  circle, and a conservative joint-space kinematic showcase.
+- Copy a built-in before editing it. Built-ins adapt their coordinates or
+  joint amplitudes to the active robot geometry and limits.
+- `Build` supports manually entered joint angles and Cartesian targets,
+  Position Library records, the current reported pose, the current IK target,
+  and available vision/task targets.
+- Every Cartesian step explicitly selects joint-space or linear TCP motion.
+- The selected Build step can be previewed directly from the current reported
+  robot pose. `Go to target` only unlocks for that exact unchanged preview and
+  executes the displayed path through the normal safety gates.
+- `Preview selected step` plans through all preceding enabled steps so the
+  selected step is checked in sequence context.
+- `Preview full program` is required before `Run` unlocks execution.
+- User programs persist in ignored `config/programs.local.json`; the file uses
+  a versioned JSON schema and is not committed with machine-specific data.
 
 ### Settings Tab
 

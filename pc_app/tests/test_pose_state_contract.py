@@ -185,9 +185,15 @@ def test_go_home_simulation_moves_on_first_request(monkeypatch):
     main.state.target_angles_deg = away.copy()
     main.limiter.reset(away)
     revision_before = main.state.pose_revision
+    requested_settings = main.PathSettingsRequest(
+        global_speed_deg_s=11.0,
+        global_accel_deg_s2=22.0,
+        per_joint_speed_deg_s=[11.0] * 4,
+        per_joint_accel_deg_s2=[22.0] * 4,
+    )
 
     async def scenario():
-        response = await main.home()
+        response = await main.home(main.HomeRequest(settings=requested_settings))
         assert response["ok"]
         await asyncio.wait_for(main.path_task, timeout=4.0)
         return response
@@ -196,8 +202,8 @@ def test_go_home_simulation_moves_on_first_request(monkeypatch):
 
     assert response["command"] == "home"
     assert response["preview"]["settings"]["motion_purpose"] == "configured_home_pose_move"
-    assert response["preview"]["settings"]["global_speed_deg_s"] <= main.HOME_SPEED_CAP_DEG_S
-    assert response["preview"]["settings"]["global_accel_deg_s2"] <= main.HOME_ACCEL_CAP_DEG_S2
+    assert response["preview"]["settings"]["global_speed_deg_s"] == 11.0
+    assert response["preview"]["settings"]["global_accel_deg_s2"] == 22.0
     assert response["preview"]["motion_contract"]["controller_command"]["command"] == "SIM_TRAJ"
     assert main.state.reported_angles_deg == pytest.approx(config.home_pose, abs=0.08)
     assert main.state.pose_revision > revision_before

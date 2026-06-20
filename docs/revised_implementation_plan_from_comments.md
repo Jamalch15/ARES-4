@@ -1128,8 +1128,8 @@ Code complete in the current working tree:
   compatibility mirroring to legacy `named_positions`.
 - Control includes create, save-current, edit, rename, duplicate, delete,
   Preview, and Go To actions for Position Library records.
-- `task_destinations` is separate from general positions and supports inline
-  Cartesian anchors or Position Library references with optional grids.
+- `task_destinations` remains a compatibility schema for old inline anchors,
+  while the primary Tasks UI maps colors directly to Position Library IDs.
 - color-to-destination assignment is edited and saved from Tasks, not from
   general robot Settings.
 - legacy `named_positions`, `drop_zones`, and their APIs remain supported
@@ -1139,12 +1139,28 @@ Code complete in the current working tree:
 - automated migration, stable-ID, reference-integrity, persistence, safety,
   and task-planning tests are present.
 
+Follow-up operator sweep on June 20, 2026:
+
+- only `home` is protected as a core Position Library record;
+- Position Library and Physical Model Truth panels are collapsible;
+- task color mappings select Position Library records directly, while
+  `task_destinations` remains a compatibility bridge in persisted config;
+- grid/row/column destination editing is no longer exposed in the primary UI;
+- Position Library validation errors are shown on the exact invalid record;
+- Position Library Go To uses one atomic backend plan-and-start request to
+  avoid a stale gap between separate preview and execute requests;
+- Go Home uses the same selected speed, acceleration, and per-joint limits as
+  other normal moves;
+- Set Pose uses an in-app confirmation panel;
+- tool changes expose a visible pending state;
+- Diagnostics uses lightweight live state rendering so opening it does not
+  stall the robot viewport.
+
 Remaining verification:
 
-- rendered browser interaction QA for rename/Preview/Go To/delete and
-  responsive layout still needs a working browser-control session. The
-  in-app Browser invocation was blocked by missing sandbox metadata on
-  June 20, 2026; this is a verification gap, not an unfinished code path.
+- the private five-pose physical calibration measurement sweep is deferred;
+- fresh rendered browser automation still needs a working browser-control
+  session. Manual desktop feedback was supplied by the operator.
 
 ### WP-06 — Kinematics Pane as Cartesian Control and Diagnostic Surface
 

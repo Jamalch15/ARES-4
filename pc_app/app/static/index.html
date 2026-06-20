@@ -66,22 +66,26 @@
                   <div id="jointControls" class="joint-controls"></div>
                 </section>
 
-                <section class="panel-section position-library-panel">
-                  <div class="section-header">
-                    <div>
-                      <h2>Position Library</h2>
-                      <p class="hint">General saved robot poses. Tasks can reference these positions, but they are not task-owned.</p>
+                <section class="panel-section position-library-panel collapsible-panel">
+                  <details open>
+                    <summary class="section-header collapsible-panel-summary">
+                      <div>
+                        <h2>Position Library</h2>
+                        <p class="hint">General saved robot poses. Tasks select these positions directly.</p>
+                      </div>
+                      <span id="positionLibraryStatus" class="status-chip">Saved</span>
+                    </summary>
+                    <div class="collapsible-panel-body">
+                      <div class="button-row action-row">
+                        <button id="addJointPositionBtn" class="ghost" type="button">New Joint</button>
+                        <button id="addCartesianPositionBtn" class="ghost" type="button">New Cartesian</button>
+                        <button id="saveCurrentPositionBtn" type="button">Save Current Pose</button>
+                        <button id="savePositionLibraryBtn" class="primary" type="button" disabled>Save Library</button>
+                        <button id="resetPositionLibraryBtn" class="ghost" type="button" disabled>Discard Edits</button>
+                      </div>
+                      <div id="positionLibraryList" class="position-library-list"></div>
                     </div>
-                    <span id="positionLibraryStatus" class="status-chip">Saved</span>
-                  </div>
-                  <div class="button-row action-row">
-                    <button id="addJointPositionBtn" class="ghost" type="button">New Joint</button>
-                    <button id="addCartesianPositionBtn" class="ghost" type="button">New Cartesian</button>
-                    <button id="saveCurrentPositionBtn" type="button">Save Current Pose</button>
-                    <button id="savePositionLibraryBtn" class="primary" type="button" disabled>Save Library</button>
-                    <button id="resetPositionLibraryBtn" class="ghost" type="button" disabled>Discard Edits</button>
-                  </div>
-                  <div id="positionLibraryList" class="position-library-list"></div>
+                  </details>
                 </section>
 
                 <section class="panel-section">
@@ -195,7 +199,7 @@
                     <label class="wide-field task-colors-field">Colors
                       <select id="includeColorsSelect" multiple hidden></select>
                       <div id="colorPresetMapping" class="color-preset-mapping"></div>
-                      <span class="field-help">Draft means this color assignment has not been saved. Saved mappings are reused by later task runs.</span>
+                      <span class="field-help">Choose a saved Position Library record. Draft means this color assignment has not been saved.</span>
                       <div class="button-row task-mapping-actions">
                         <button id="saveTaskMappingsBtn" class="ghost" type="button" disabled>Save task mappings</button>
                         <button id="discardTaskMappingsBtn" class="ghost" type="button" disabled>Discard task edits</button>
@@ -357,41 +361,76 @@
               </section>
 
               <section id="programTab" class="app-tab">
-                <section class="panel-section program-workflow-panel">
+                <section class="panel-section task-rail program-workflow-panel">
                   <div class="section-header">
                     <div>
-                      <h2>Program builder</h2>
-                      <p class="hint">Build a motion sequence, preview its path and timing, then execute the exact validated version.</p>
+                      <h2>Program workflow</h2>
+                      <p class="hint">Library &rarr; Build &rarr; Preview &rarr; Run. Editing never starts motion.</p>
                     </div>
                     <span id="programStatus" class="status-chip program-status" data-state="empty">Empty</span>
                   </div>
-                  <div id="programWorkflow" class="program-workflow" aria-label="Program workflow">
-                    <div class="program-workflow-step active" data-program-stage="build"><span>1</span><strong>Build</strong></div>
-                    <div class="program-workflow-line"></div>
-                    <div class="program-workflow-step" data-program-stage="preview"><span>2</span><strong>Preview</strong></div>
-                    <div class="program-workflow-line"></div>
-                    <div class="program-workflow-step" data-program-stage="execute"><span>3</span><strong>Execute</strong></div>
+                  <div id="programWorkflow" class="task-stepper program-stage-tabs" aria-label="Program workflow">
+                    <button class="active" type="button" data-program-stage="library">Library</button>
+                    <button type="button" data-program-stage="build">Build</button>
+                    <button type="button" data-program-stage="preview">Preview</button>
+                    <button type="button" data-program-stage="run">Run</button>
                   </div>
-                  <p id="programStatusDetail" class="program-status-detail">Add the first motion step to begin.</p>
+                  <p id="programStatusDetail" class="program-status-detail">Choose a demo, load a saved program, or create a new one.</p>
                 </section>
 
-                <section class="panel-section program-add-panel">
+                <section class="panel-section task-rail task-step-panel program-library-panel" data-program-panel="library">
                   <div class="section-header">
                     <div>
-                      <h2>Add step</h2>
-                      <p class="hint">Choose a source. Move mode belongs to each step and can be edited below.</p>
+                      <h2>Program Library</h2>
+                      <p class="hint">Built-ins adapt to the active robot model. Copy a template before editing it.</p>
                     </div>
+                    <span id="programLibraryStatus" class="status-chip">Ready</span>
                   </div>
-                  <div class="program-quick-add">
-                    <button type="button" data-program-quick-source="current_pose"><strong>Current pose</strong><span>Reported joints</span></button>
-                    <button type="button" data-program-quick-source="ik_target"><strong>IK target</strong><span>Current target</span></button>
+                  <div id="programTemplateNotice" class="program-template-notice" hidden></div>
+                  <div class="program-metadata-grid">
+                    <label>Name
+                      <input id="programNameInput" type="text" maxlength="80" placeholder="Untitled program" />
+                    </label>
+                    <label>Description
+                      <textarea id="programDescriptionInput" rows="2" maxlength="300" placeholder="What this program demonstrates"></textarea>
+                    </label>
+                  </div>
+                  <div class="button-row program-library-actions">
+                    <button id="newProgramBtn" type="button" class="ghost">New program</button>
+                    <button id="saveProgramBtn" type="button" class="primary">Save</button>
+                    <button id="copyProgramBtn" type="button">Save as copy</button>
+                  </div>
+                  <div class="program-library-group">
+                    <div class="subsection-heading">
+                      <h3>Built-in demos</h3>
+                      <p class="hint">Read-only templates. Preview is required before every run.</p>
+                    </div>
+                    <div id="builtInProgramList" class="program-library-list"></div>
+                  </div>
+                  <div class="program-library-group">
+                    <div class="subsection-heading">
+                      <h3>My programs</h3>
+                      <p class="hint">Saved locally in an ignored versioned JSON store.</p>
+                    </div>
+                    <div id="userProgramList" class="program-library-list"></div>
+                  </div>
+                </section>
+
+                <section class="panel-section task-rail task-step-panel program-build-panel" data-program-panel="build" hidden>
+                  <div class="section-header">
+                    <div>
+                      <h2>Build <span id="programStepCount" class="muted-count">(0 steps)</span></h2>
+                      <p class="hint">Build motion and end-effector steps, then test individual motion targets in place.</p>
+                    </div>
+                    <span id="programEstimatedDuration" class="status-chip">No estimate</span>
                   </div>
                   <div class="program-add-grid">
                     <label>Source
                       <select id="programStepSource">
-                        <option value="named_position">Named position</option>
+                        <option value="named_position">Position Library</option>
                         <option value="manual_cartesian">Manual Cartesian</option>
                         <option value="manual_joint">Manual joints</option>
+                        <option value="end_effector">End-effector action</option>
                         <option value="vision_detection">Vision object</option>
                         <option value="drop_zone">Task destination</option>
                       </select>
@@ -408,43 +447,66 @@
                     </label>
                     <button id="addProgramStepBtn" type="button" class="primary">Add step</button>
                   </div>
-                  <p id="programAddHint" class="field-help">Named positions use the saved robot configuration.</p>
-                </section>
-
-                <section class="panel-section program-sequence-panel">
-                  <div class="section-header">
-                    <div>
-                      <h2>Sequence <span id="programStepCount" class="muted-count">(0 steps)</span></h2>
-                      <p class="hint">Select a row to edit it. Disabled steps remain in the program but are not planned.</p>
-                    </div>
-                    <span id="programEstimatedDuration" class="status-chip">No estimate</span>
+                  <p id="programAddHint" class="field-help">Position Library records use the saved robot configuration.</p>
+                  <div class="program-build-toolbar">
+                    <strong>Sequence</strong>
+                    <button id="clearProgramBtn" type="button" class="ghost danger-text">Clear all</button>
                   </div>
                   <div id="programList" class="program-list program-sequence-list"></div>
-                </section>
-
-                <section id="programInspectorSection" class="panel-section program-inspector-panel" hidden>
-                  <div class="section-header">
-                    <div>
-                      <h2 id="programInspectorTitle">Selected step</h2>
+                  <div id="programInspectorSection" class="program-inspector-panel" hidden>
+                    <div class="subsection-heading">
+                      <h3 id="programInspectorTitle">Selected step</h3>
                       <p class="hint">Edits immediately make the current preview stale.</p>
                     </div>
+                    <div id="programInspector"></div>
                   </div>
-                  <div id="programInspector"></div>
                 </section>
 
-                <section class="panel-section program-preview-panel">
+                <section class="panel-section task-rail task-step-panel program-preview-panel" data-program-panel="preview" hidden>
                   <div class="section-header">
                     <div>
-                      <h2>Preview summary</h2>
-                      <p class="hint">Execution stays locked until this exact sequence has a successful preview.</p>
+                      <h2>Preview</h2>
+                      <p class="hint">Plan the complete program, then play its timed motion without commanding the robot.</p>
                     </div>
                   </div>
-                  <div id="programPreviewSummary" class="program-preview-summary"></div>
-                  <div class="program-final-actions">
-                    <button id="clearProgramBtn" type="button" class="ghost">Clear program</button>
-                    <button id="previewProgramBtn" type="button" class="primary">Preview program</button>
-                    <button id="executeProgramBtn" type="button" disabled>Execute program</button>
+                  <div class="program-preview-controls">
+                    <button id="previewProgramBtn" type="button" class="primary">Plan and preview full program</button>
                   </div>
+                  <div id="programPreviewSummary" class="program-preview-summary"></div>
+                  <div id="programPlayback" class="program-playback" aria-live="polite">
+                    <div class="program-playback-heading">
+                      <div>
+                        <strong>Movement playback</strong>
+                        <span id="programPlaybackStep">Preview the program to animate its timing.</span>
+                      </div>
+                      <span id="programPlaybackTime">0.00 / 0.00 s</span>
+                    </div>
+                    <input id="programPlaybackProgress" type="range" min="0" max="1000" step="1" value="0" aria-label="Program preview progress" disabled />
+                    <div class="program-playback-actions">
+                      <button id="programPlaybackToggle" type="button" class="ghost" disabled>Play</button>
+                      <button id="programPlaybackRestart" type="button" class="ghost" disabled>Restart</button>
+                      <label>Speed
+                        <select id="programPlaybackRate" disabled>
+                          <option value="0.5">0.5×</option>
+                          <option value="1" selected>1×</option>
+                          <option value="2">2×</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <p class="program-execute-hint">Playback is visual only. Execute remains locked until this exact full-program preview is valid.</p>
+                </section>
+
+                <section class="panel-section task-rail task-step-panel program-run-panel" data-program-panel="run" hidden>
+                  <div class="section-header">
+                    <div>
+                      <h2>Run</h2>
+                      <p class="hint">Only the exact full-program preview can be executed.</p>
+                    </div>
+                    <button id="stopProgramBtn" class="warn" type="button">Stop</button>
+                  </div>
+                  <div id="programRunMonitor" class="program-run-monitor"></div>
+                  <button id="executeProgramBtn" type="button" class="primary program-execute-button" disabled>Execute validated program</button>
                   <p id="programExecuteHint" class="program-execute-hint">Add and preview at least one enabled step before execution.</p>
                 </section>
               </section>
@@ -470,7 +532,6 @@
                     <button type="button" data-settings-target="settingsJoints">Joints</button>
                     <button type="button" data-settings-target="settingsMotion">Motion</button>
                     <button type="button" data-settings-target="settingsTooling">Tooling</button>
-                    <button type="button" data-settings-target="settingsTaskDestinations">Task destinations</button>
                     <button type="button" data-settings-target="settingsCamera">Camera</button>
                     <button type="button" data-settings-target="settingsTcpCalibration">TCP calibration</button>
                     <button type="button" data-settings-target="settingsHardware">Hardware</button>
@@ -498,14 +559,18 @@
                   </details>
                 </section>
 
-                <section class="panel-section settings-section" id="settingsModelTruth">
-                  <div class="section-header">
-                    <div>
-                      <h2>Physical model truth</h2>
-                      <p class="hint">Read-only frame, TCP, and calibration-chain diagnostics. Cartesian command correction is a later compensation layer, not FK truth.</p>
+                <section class="panel-section settings-section collapsible-panel" id="settingsModelTruth">
+                  <details>
+                    <summary class="section-header collapsible-panel-summary">
+                      <div>
+                        <h2>Physical model truth</h2>
+                        <p class="hint">Read-only frame, TCP, and calibration-chain diagnostics.</p>
+                      </div>
+                    </summary>
+                    <div class="collapsible-panel-body">
+                      <div id="modelTruthSummary" class="path-summary model-truth-summary"></div>
                     </div>
-                  </div>
-                  <div id="modelTruthSummary" class="path-summary model-truth-summary"></div>
+                  </details>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsJoints">
@@ -587,21 +652,6 @@
                     </div>
                   </div>
                   <div id="toolCalibration" class="path-summary"></div>
-                </section>
-
-                <section class="panel-section settings-section" id="settingsTaskDestinations">
-                  <div class="section-header">
-                    <div>
-                      <h2>Task destinations</h2>
-                      <p class="hint">Task-specific drop anchors used by color sorting. Color assignments are edited in Tasks.</p>
-                    </div>
-                    <button id="addTaskDestinationBtn" type="button">Add destination</button>
-                  </div>
-                  <div class="subsection-heading">
-                    <h3>Drop destinations</h3>
-                    <p class="hint">Coordinates are active-TCP robot-frame millimeters. Optional grids are finite row-major placement slots.</p>
-                  </div>
-                  <div id="taskDestinationEditor" class="task-destination-editor"></div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsCamera">
@@ -941,6 +991,23 @@
           <div id="serialPortList" class="program-list"></div>
           <div class="button-row action-row">
             <button id="connectSelectedSerialBtn" type="button" class="primary">Connect Selected</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="setPoseModal" class="modal-backdrop" hidden>
+        <div class="modal-panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="setPoseModalTitle">
+          <div class="section-header">
+            <div>
+              <h2 id="setPoseModalTitle">Confirm Set Pose</h2>
+              <p class="hint">This does not move or physically home the robot.</p>
+            </div>
+          </div>
+          <p>Confirm that the displayed angles match the real arm while hardware is disarmed.</p>
+          <div id="setPoseAngles" class="path-summary"></div>
+          <div class="button-row action-row modal-actions">
+            <button id="cancelSetPoseBtn" type="button" class="ghost">Cancel</button>
+            <button id="confirmSetPoseBtn" type="button" class="primary">Set Pose</button>
           </div>
         </div>
       </section>

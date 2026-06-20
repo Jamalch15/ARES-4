@@ -814,13 +814,22 @@ def build_program_trajectory(
     segment_summaries: list[dict[str, Any]] = []
     cartesian_waypoints: list[dict[str, float]] = []
     step_results: list[dict[str, Any]] = []
-    move_count = sum(1 for waypoint in waypoints if waypoint.get("enabled", True) is not False)
-    if move_count == 0:
+    enabled_count = sum(1 for waypoint in waypoints if waypoint.get("enabled", True) is not False)
+    move_count = sum(
+        1
+        for waypoint in waypoints
+        if waypoint.get("enabled", True) is not False
+        and str(waypoint.get("type") or waypoint.get("kind") or "cartesian").lower() in {"joint", "cartesian"}
+    )
+    action_count = enabled_count - move_count
+    execution_steps: list[dict[str, Any]] = []
+    if enabled_count == 0:
         return {
             "ok": False,
             "mode": "program",
             "step_count": len(waypoints),
             "move_count": 0,
+            "action_count": 0,
             "waypoints": [],
             "step_results": [
                 {
@@ -836,10 +845,11 @@ def build_program_trajectory(
                 }
                 for index, waypoint in enumerate(waypoints)
             ],
-            "errors": ["program has no enabled waypoints"],
+            "errors": ["program has no enabled steps"],
         }
 
     for index, waypoint in enumerate(waypoints):
+        step_started_s = sum(combined_durations)
         waypoint_label = _waypoint_label(waypoint, index)
         waypoint_settings = _settings_for_waypoint(settings, waypoint)
         kind = str(waypoint.get("type") or waypoint.get("kind") or "cartesian").lower()
@@ -854,11 +864,177 @@ def build_program_trajectory(
                     "enabled": False,
                     "status": "disabled",
                     "duration_s": 0.0,
+                    "start_time_s": step_started_s,
+                    "end_time_s": step_started_s,
                     "waypoint_count": 0,
                     "errors": [],
                 }
             )
             continue
+        if kind == "tool":
+            action = str(waypoint.get("action") or "").strip().lower()
+            if action not in {"open", "close", "set", "on", "off"}:
+                error = f"unsupported end-effector action {action or '(empty)'}"
+                step_results.append(
+                    {
+                        "index": index,
+                        "label": waypoint_label,
+                        "type": kind,
+                        "mode": "tool",
+                        "enabled": True,
+                        "status": "invalid",
+                        "duration_s": 0.0,
+                        "start_time_s": step_started_s,
+                        "end_time_s": step_started_s,
+                        "waypoint_count": 0,
+                        "errors": [error],
+                    }
+                )
+                return {
+                    "ok": False,
+                    "mode": "program",
+                    "step_count": len(waypoints),
+                    "move_count": move_count,
+                    "action_count": action_count,
+                    "waypoints": combined_waypoints,
+                    "errors": [f"program step {index + 1} ({waypoint_label}): {error}"],
+                    "segments": segment_summaries,
+                    "step_results": step_results,
+                    "execution_steps": execution_steps,
+                }
+            value = waypoint.get("value")
+            if action == "set":
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    value = None
+                if value is None or not 0.0 <= value <= 1.0:
+                    error = "set action value must be between 0 and 1"
+                    step_results.append(
+                        {
+                            "index": index,
+                            "label": waypoint_label,
+                            "type": kind,
+                            "mode": "tool",
+                            "enabled": True,
+                            "status": "invalid",
+                            "duration_s": 0.0,
+                            "start_time_s": step_started_s,
+                            "end_time_s": step_started_s,
+                            "waypoint_count": 0,
+                            "errors": [error],
+                        }
+                    )
+                    return {
+                        "ok": False,
+                        "mode": "program",
+                        "step_count": len(waypoints),
+                        "move_count": move_count,
+                        "action_count": action_count,
+                        "waypoints": combined_waypoints,
+                        "errors": [f"program step {index + 1} ({waypoint_label}): {error}"],
+                        "segments": segment_summaries,
+                        "step_results": step_results,
+                        "execution_steps": execution_steps,
+                    }
+            try:
+                settle_ms = float(waypoint.get("settle_ms", 150.0))
+            except (TypeError, ValueError):
+                settle_ms = -1.0
+            if settle_ms < 0.0:
+                error = "settle_ms must be zero or greater"
+                step_results.append(
+                    {
+                        "index": index,
+                        "label": waypoint_label,
+                        "type": kind,
+                        "mode": "tool",
+                        "enabled": True,
+                        "status": "invalid",
+                        "duration_s": 0.0,
+                        "start_time_s": step_started_s,
+                        "end_time_s": step_started_s,
+                        "waypoint_count": 0,
+                        "errors": [error],
+                    }
+                )
+                return {
+                    "ok": False,
+                    "mode": "program",
+                    "step_count": len(waypoints),
+                    "move_count": move_count,
+                    "action_count": action_count,
+                    "waypoints": combined_waypoints,
+                    "errors": [f"program step {index + 1} ({waypoint_label}): {error}"],
+                    "segments": segment_summaries,
+                    "step_results": step_results,
+                    "execution_steps": execution_steps,
+                }
+            duration_s = settle_ms / 1000.0
+            if not combined_waypoints:
+                combined_waypoints.append(current.copy())
+                combined_durations.append(0.0)
+            combined_waypoints.append(current.copy())
+            combined_durations.append(duration_s)
+            summary = {
+                "index": index,
+                "label": waypoint_label,
+                "type": kind,
+                "mode": action,
+                "duration_s": duration_s,
+                "start_time_s": step_started_s,
+                "end_time_s": step_started_s + duration_s,
+                "waypoint_count": 0,
+                "profile": "tool_action",
+                "limit_summary": None,
+                "motion_contract": None,
+                "action": action,
+                "tool": waypoint.get("tool"),
+                "value": value,
+            }
+            segment_summaries.append(summary)
+            step_results.append({**summary, "enabled": True, "status": "valid", "errors": []})
+            execution_steps.append(
+                {
+                    "kind": "tool",
+                    "index": index,
+                    "label": waypoint_label,
+                    "action": action,
+                    "tool": waypoint.get("tool"),
+                    "value": value,
+                    "duration_s": duration_s,
+                }
+            )
+            continue
+        if kind not in {"joint", "cartesian"}:
+            error = f"unsupported program step type {kind}"
+            step_results.append(
+                {
+                    "index": index,
+                    "label": waypoint_label,
+                    "type": kind,
+                    "mode": mode,
+                    "enabled": True,
+                    "status": "invalid",
+                    "duration_s": 0.0,
+                    "start_time_s": step_started_s,
+                    "end_time_s": step_started_s,
+                    "waypoint_count": 0,
+                    "errors": [error],
+                }
+            )
+            return {
+                "ok": False,
+                "mode": "program",
+                "step_count": len(waypoints),
+                "move_count": move_count,
+                "action_count": action_count,
+                "waypoints": combined_waypoints,
+                "errors": [f"program step {index + 1} ({waypoint_label}): {error}"],
+                "segments": segment_summaries,
+                "step_results": step_results,
+                "execution_steps": execution_steps,
+            }
         explicit_waypoint_branch = waypoint.get("branch")
         if explicit_waypoint_branch is not None:
             waypoint_branch = str(explicit_waypoint_branch)
@@ -885,6 +1061,8 @@ def build_program_trajectory(
                         "enabled": True,
                         "status": "invalid",
                         "duration_s": 0.0,
+                        "start_time_s": step_started_s,
+                        "end_time_s": step_started_s,
                         "waypoint_count": 0,
                         "errors": ["missing joint angles"],
                     }
@@ -894,10 +1072,12 @@ def build_program_trajectory(
                     "mode": "program",
                     "step_count": len(waypoints),
                     "move_count": move_count,
+                    "action_count": action_count,
                     "waypoints": combined_waypoints,
                     "errors": [error],
                     "segments": segment_summaries,
                     "step_results": step_results,
+                    "execution_steps": execution_steps,
                 }
             segment = build_joint_trajectory(current, [float(value) for value in target_angles], joints, waypoint_settings)
         else:
@@ -936,6 +1116,8 @@ def build_program_trajectory(
                             "enabled": True,
                             "status": "invalid",
                             "duration_s": 0.0,
+                            "start_time_s": step_started_s,
+                            "end_time_s": step_started_s,
                             "waypoint_count": 0,
                             "errors": [error],
                         }
@@ -945,6 +1127,7 @@ def build_program_trajectory(
                         "mode": "program",
                         "step_count": len(waypoints),
                         "move_count": move_count,
+                        "action_count": action_count,
                         "waypoints": combined_waypoints,
                         "errors": [
                             f"program waypoint {index + 1} ({waypoint_label}) has {error}"
@@ -952,6 +1135,7 @@ def build_program_trajectory(
                         "ik": ik,
                         "segments": segment_summaries,
                         "step_results": step_results,
+                        "execution_steps": execution_steps,
                     }
                 selected_branch = ik["selected_branch"] or waypoint_branch
                 segment = build_joint_trajectory(
@@ -973,6 +1157,8 @@ def build_program_trajectory(
                     "enabled": True,
                     "status": "invalid",
                     "duration_s": 0.0,
+                    "start_time_s": step_started_s,
+                    "end_time_s": step_started_s,
                     "waypoint_count": 0,
                     "errors": segment_errors,
                 }
@@ -982,10 +1168,12 @@ def build_program_trajectory(
                 "mode": "program",
                 "step_count": len(waypoints),
                 "move_count": move_count,
+                "action_count": action_count,
                 "waypoints": combined_waypoints,
                 "errors": [f"program waypoint {index + 1} ({waypoint_label}): {'; '.join(segment_errors)}"],
                 "segments": segment_summaries,
                 "step_results": step_results,
+                "execution_steps": execution_steps,
             }
 
         _append_segment(combined_waypoints, combined_durations, segment)
@@ -996,10 +1184,13 @@ def build_program_trajectory(
             "type": kind,
             "mode": segment.get("mode", mode),
             "duration_s": segment.get("duration_s", 0.0),
+            "start_time_s": step_started_s,
+            "end_time_s": step_started_s + float(segment.get("duration_s", 0.0)),
             "waypoint_count": segment.get("waypoint_count", 0),
             "profile": segment.get("profile", _profile_name(waypoint_settings)),
             "limit_summary": segment.get("limit_summary"),
             "motion_contract": segment.get("motion_contract"),
+            "settings": waypoint_settings,
         }
         segment_summaries.append(summary)
         step_results.append(
@@ -1008,6 +1199,15 @@ def build_program_trajectory(
                 "enabled": True,
                 "status": "valid",
                 "errors": [],
+            }
+        )
+        execution_steps.append(
+            {
+                "kind": "motion",
+                "index": index,
+                "label": waypoint_label,
+                "settings": waypoint_settings,
+                "trajectory": segment,
             }
         )
 
@@ -1026,6 +1226,7 @@ def build_program_trajectory(
         "mode": "program",
         "step_count": len(waypoints),
         "move_count": move_count,
+        "action_count": action_count,
         "profile": _profile_name(settings),
         "duration_s": duration_s,
         "waypoint_count": len(combined_waypoints),
@@ -1034,6 +1235,7 @@ def build_program_trajectory(
         "time_from_start_s": _cumulative_times(combined_durations),
         "segments": segment_summaries,
         "step_results": step_results,
+        "execution_steps": execution_steps,
         "cartesian_waypoints": cartesian_waypoints,
         "limit_summary": limit_summary,
         "motion_contract": contract,

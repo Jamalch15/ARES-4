@@ -398,3 +398,72 @@ def test_program_trajectory_exposes_the_failing_step_error():
     assert trajectory["step_results"][1]["index"] == 1
     assert trajectory["step_results"][1]["status"] == "invalid"
     assert "outside" in trajectory["step_results"][1]["errors"][0]
+
+
+def test_program_trajectory_applies_per_step_motion_limits():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    target = config.home_pose.copy()
+    target[0] = min(config.joints[0].max_deg, target[0] + 20.0)
+    base_settings = {
+        "global_speed_deg_s": 30.0,
+        "global_accel_deg_s2": 120.0,
+        "waypoint_rate_hz": 20.0,
+    }
+
+    default_trajectory = build_program_trajectory(
+        config.home_pose,
+        [{"label": "default", "type": "joint", "angles_deg": target}],
+        config.links,
+        config.joints,
+        base_settings,
+    )
+    limited_trajectory = build_program_trajectory(
+        config.home_pose,
+        [
+            {
+                "label": "limited",
+                "type": "joint",
+                "angles_deg": target,
+                "settings": {
+                    "global_speed_deg_s": 5.0,
+                    "global_accel_deg_s2": 20.0,
+                },
+            }
+        ],
+        config.links,
+        config.joints,
+        base_settings,
+    )
+
+    assert default_trajectory["ok"]
+    assert limited_trajectory["ok"]
+    assert limited_trajectory["duration_s"] > default_trajectory["duration_s"]
+    assert limited_trajectory["segments"][0]["settings"]["global_speed_deg_s"] == 5.0
+
+
+def test_program_trajectory_includes_end_effector_actions_in_timeline():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+
+    trajectory = build_program_trajectory(
+        config.home_pose,
+        [
+            {
+                "label": "Close gripper",
+                "type": "tool",
+                "tool": "gripper",
+                "action": "close",
+                "settle_ms": 250,
+            }
+        ],
+        config.links,
+        config.joints,
+    )
+
+    assert trajectory["ok"], trajectory.get("errors")
+    assert trajectory["move_count"] == 0
+    assert trajectory["action_count"] == 1
+    assert trajectory["duration_s"] == approx(0.25)
+    assert trajectory["step_results"][0]["type"] == "tool"
+    assert trajectory["step_results"][0]["start_time_s"] == 0.0
+    assert trajectory["step_results"][0]["end_time_s"] == approx(0.25)
+    assert trajectory["execution_steps"][0]["action"] == "close"

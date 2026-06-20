@@ -75,6 +75,15 @@ from .position_library import (
     validate_position_record,
     normalize_position_record,
 )
+from .program_library import (
+    PROGRAM_SCHEMA_VERSION,
+    ProgramLibraryError,
+    all_programs,
+    copy_program_to_user,
+    delete_user_program,
+    find_program,
+    save_user_program,
+)
 from .task_destinations import (
     TASK_DESTINATIONS_SCHEMA_VERSION,
     TaskDestinationError,
@@ -263,8 +272,6 @@ MAX_TRAJECTORY_UPLOAD_POINTS = 220
 TASK_PREVIEW_TTL_S = 600.0
 PREVIEW_START_TOLERANCE_DEG = 0.1
 CARTESIAN_JOG_STALE_S = 0.35
-HOME_SPEED_CAP_DEG_S = 15.0
-HOME_ACCEL_CAP_DEG_S2 = 60.0
 cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
     "active": False,
@@ -414,6 +421,37 @@ class PathPreviewRequest(BaseModel):
 
 class PathExecuteRequest(BaseModel):
     preview_id: str
+    program_revision: int | None = None
+
+
+class PathGoRequest(BaseModel):
+    waypoints: list[dict[str, Any]]
+    branch: str = "auto"
+    settings: PathSettingsRequest | None = None
+
+
+class HomeRequest(BaseModel):
+    settings: PathSettingsRequest | None = None
+
+
+class ProgramSaveRequest(BaseModel):
+    id: str | None = None
+    name: str
+    description: str = ""
+    steps: list[dict[str, Any]]
+    required_tool: str | None = None
+    schema_version: int = PROGRAM_SCHEMA_VERSION
+
+
+class ProgramCopyRequest(BaseModel):
+    name: str | None = None
+
+
+class ProgramStepPreviewRequest(BaseModel):
+    waypoints: list[dict[str, Any]]
+    step_index: int
+    branch: str = "auto"
+    settings: PathSettingsRequest | None = None
     program_revision: int | None = None
 
 
@@ -1079,27 +1117,8 @@ def default_path_settings() -> dict[str, Any]:
     return defaults
 
 
-def home_path_settings() -> dict[str, Any]:
-    settings = request_settings(None)
-    speed_cap = min(HOME_SPEED_CAP_DEG_S, *(joint.max_speed_deg_s for joint in config.joints))
-    accel_cap = min(HOME_ACCEL_CAP_DEG_S2, *(joint.max_accel_deg_s2 for joint in config.joints))
-    settings["global_speed_deg_s"] = min(float(settings.get("global_speed_deg_s") or speed_cap), speed_cap)
-    settings["global_accel_deg_s2"] = min(float(settings.get("global_accel_deg_s2") or accel_cap), accel_cap)
-    per_joint_speed = settings.get("per_joint_speed_deg_s")
-    if not isinstance(per_joint_speed, list) or len(per_joint_speed) != len(config.joints):
-        per_joint_speed = [joint.max_speed_deg_s for joint in config.joints]
-    per_joint_accel = settings.get("per_joint_accel_deg_s2")
-    if not isinstance(per_joint_accel, list) or len(per_joint_accel) != len(config.joints):
-        per_joint_accel = [joint.max_accel_deg_s2 for joint in config.joints]
-    settings["per_joint_speed_deg_s"] = [
-        min(float(value), speed_cap, joint.max_speed_deg_s)
-        for value, joint in zip(per_joint_speed, config.joints, strict=True)
-    ]
-    settings["per_joint_accel_deg_s2"] = [
-        min(float(value), accel_cap, joint.max_accel_deg_s2)
-        for value, joint in zip(per_joint_accel, config.joints, strict=True)
-    ]
-    settings["planner_type"] = "s_curve"
+def home_path_settings(settings_payload: PathSettingsRequest | dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = request_settings(settings_payload)
     settings["motion_purpose"] = "configured_home_pose_move"
     return settings
 
@@ -2001,6 +2020,36 @@ def build_preview(
     command_target: dict[str, Any] = {}
 
     if waypoint_program:
+        configured_tools = tools_settings(config)
+        active_tool = str(configured_tools.get("active", "gripper"))
+        active_preset = configured_tools.get("presets", {}).get(active_tool, {})
+        active_tool_type = str(active_preset.get("type", "generic")) if isinstance(active_preset, dict) else "generic"
+        for step_index, waypoint in enumerate(waypoint_program):
+            if waypoint.get("enabled", True) is False:
+                continue
+            kind = str(waypoint.get("type") or waypoint.get("kind") or "cartesian").lower()
+            if kind != "tool":
+                continue
+            requested_tool = str(waypoint.get("tool") or active_tool)
+            action = str(waypoint.get("action") or "").lower()
+            if requested_tool != active_tool:
+                return {
+                    "ok": False,
+                    "error": f"program step {step_index + 1} requires {requested_tool}; select that end effector before previewing",
+                    "diagnostic_category": "tool_configuration",
+                }
+            if active_tool_type == "servo_gripper" and action not in {"open", "close", "set"}:
+                return {
+                    "ok": False,
+                    "error": f"program step {step_index + 1}: {active_tool} does not support {action or 'an empty action'}",
+                    "diagnostic_category": "tool_configuration",
+                }
+            if active_tool_type == "electromagnet" and action not in {"on", "off"}:
+                return {
+                    "ok": False,
+                    "error": f"program step {step_index + 1}: {active_tool} does not support {action or 'an empty action'}",
+                    "diagnostic_category": "tool_configuration",
+                }
         prepared_program, corrections = correct_waypoint_program(
             waypoint_program,
             config,
@@ -2765,6 +2814,88 @@ async def apply_tool_action(action: str, value: float | None = None, tool: str |
     return {"ok": True, "command": command, "state": state.to_dict()}
 
 
+async def execute_program_sequence(preview: dict[str, Any]) -> None:
+    execution_steps = list(preview.get("trajectory", {}).get("execution_steps") or [])
+    if not execution_steps:
+        state.set_error("program preview has no executable steps")
+        await broadcast_state()
+        return
+
+    total = len(execution_steps)
+    try:
+        for step_number, execution_step in enumerate(execution_steps, start=1):
+            if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                return
+            label = str(execution_step.get("label") or f"Step {step_number}")
+            if execution_step.get("kind") == "tool":
+                duration_s = max(0.0, float(execution_step.get("duration_s", 0.0)))
+                run_id = start_motion_diagnostics(
+                    source="program",
+                    mode="tool_action",
+                    target_deg=state.reported_angles_deg.copy(),
+                    expected_duration_s=duration_s,
+                    waypoint_count=0,
+                    step_label=label,
+                    step_index=step_number,
+                    step_total=total,
+                )
+                update_motion_diagnostics(
+                    run_id,
+                    execution_state="executing",
+                    result="executing",
+                    active_step_label=label,
+                    active_step_index=step_number,
+                    active_step_total=total,
+                )
+                await broadcast_state()
+                result = await apply_tool_action(
+                    str(execution_step.get("action") or ""),
+                    execution_step.get("value"),
+                    execution_step.get("tool"),
+                )
+                if not result.get("ok"):
+                    finish_motion_diagnostics(
+                        "failed",
+                        str(result.get("error") or "end-effector action failed"),
+                        run_id,
+                    )
+                    await broadcast_state()
+                    return
+                if duration_s > 0:
+                    await asyncio.sleep(duration_s)
+                finish_motion_diagnostics("reached", run_id=run_id)
+                await broadcast_state()
+                continue
+
+            trajectory = execution_step.get("trajectory")
+            if not isinstance(trajectory, dict):
+                state.set_error(f"program step {step_number} is missing its planned trajectory")
+                await broadcast_state()
+                return
+            step_preview = {
+                **preview,
+                "source": "program",
+                "settings": execution_step.get("settings") or preview.get("settings", {}),
+                "trajectory": trajectory,
+                "task_step_label": label,
+                "task_step_index": step_number,
+                "task_step_total": total,
+            }
+            if str(trajectory.get("mode", "")).lower() == "joint":
+                await execute_joint_endpoint_move(step_preview)
+            else:
+                await execute_waypoint_path(step_preview)
+            if state.motion_execution_state in {"failed", "stopped"}:
+                return
+            if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                return
+    except asyncio.CancelledError:
+        if state.motion_execution_state not in {"failed", "stopped"}:
+            finish_motion_diagnostics("stopped", "cancelled")
+            await broadcast_state()
+        raise
+
+
 async def execute_task_sequence(
     sequence: dict[str, Any],
     settings: dict[str, Any],
@@ -3336,6 +3467,83 @@ async def get_state() -> dict[str, Any]:
     return state.to_dict()
 
 
+@app.get("/api/programs")
+async def get_programs() -> dict[str, Any]:
+    try:
+        programs = all_programs(config)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc), "programs": []}
+    return {
+        "ok": True,
+        "schema_version": PROGRAM_SCHEMA_VERSION,
+        "programs": programs,
+    }
+
+
+@app.get("/api/programs/{program_id}")
+async def get_program(program_id: str) -> dict[str, Any]:
+    try:
+        program = find_program(config, program_id)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc)}
+    if program is None:
+        return {"ok": False, "error": f"program {program_id} was not found"}
+    return {"ok": True, "program": program}
+
+
+@app.post("/api/programs")
+async def create_or_update_program(request: ProgramSaveRequest) -> dict[str, Any]:
+    try:
+        program = save_user_program(config, request.__dict__)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc)}
+    log_event("program", "program saved", program_id=program["id"], name=program["name"])
+    return {"ok": True, "program": program}
+
+
+@app.put("/api/programs/{program_id}")
+async def update_program(program_id: str, request: ProgramSaveRequest) -> dict[str, Any]:
+    try:
+        existing = find_program(config, program_id)
+        if existing is None:
+            return {"ok": False, "error": f"program {program_id} was not found"}
+        if existing.get("read_only"):
+            return {"ok": False, "error": "built-in templates are read-only; copy the template first"}
+        program = save_user_program(config, {**request.__dict__, "id": program_id})
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc)}
+    log_event("program", "program updated", program_id=program["id"], name=program["name"])
+    return {"ok": True, "program": program}
+
+
+@app.delete("/api/programs/{program_id}")
+async def remove_program(program_id: str) -> dict[str, Any]:
+    try:
+        removed = delete_user_program(config, program_id)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not removed:
+        return {"ok": False, "error": f"program {program_id} was not found"}
+    log_event("program", "program deleted", program_id=program_id)
+    return {"ok": True, "program_id": program_id}
+
+
+@app.post("/api/programs/{program_id}/copy")
+async def copy_program(program_id: str, request: ProgramCopyRequest) -> dict[str, Any]:
+    try:
+        program = copy_program_to_user(config, program_id, name=request.name)
+    except ProgramLibraryError as exc:
+        return {"ok": False, "error": str(exc)}
+    log_event(
+        "program",
+        "program copied",
+        program_id=program["id"],
+        copied_from=program_id,
+        name=program["name"],
+    )
+    return {"ok": True, "program": program}
+
+
 @app.get("/api/serial/ports")
 async def get_serial_ports() -> dict[str, Any]:
     return {"ok": True, "ports": list_serial_ports(), "last_port": config.serial.port}
@@ -3433,9 +3641,11 @@ async def save_position_library(request: PositionLibraryRequest) -> dict[str, An
         normalized[record["id"]] = record
 
     if errors:
-        state.set_error("one or more position-library records are invalid")
+        first_position_id, first_errors = next(iter(errors.items()))
+        error = f"{first_position_id}: {'; '.join(first_errors)}"
+        state.set_error(error)
         await broadcast_state()
-        return {"ok": False, "errors": errors, "state": state.to_dict()}
+        return {"ok": False, "error": error, "errors": errors, "state": state.to_dict()}
 
     library_payload = {
         "schema_version": POSITION_LIBRARY_SCHEMA_VERSION,
@@ -4736,6 +4946,27 @@ async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
     )
 
 
+@app.post("/api/programs/preview-step")
+async def preview_program_step(request: ProgramStepPreviewRequest) -> dict[str, Any]:
+    if request.step_index < 0 or request.step_index >= len(request.waypoints):
+        return {"ok": False, "error": "program step index is outside the sequence"}
+    selected = request.waypoints[request.step_index]
+    if selected.get("enabled", True) is False:
+        return {"ok": False, "error": "disabled program steps cannot be previewed"}
+    result = build_preview(
+        mode="program",
+        target=None,
+        waypoint_program=request.waypoints[: request.step_index + 1],
+        links=config.links,
+        settings=request_settings(request.settings),
+        branch=request.branch,
+        source="program_step_preview",
+        program_revision=request.program_revision,
+    )
+    result["step_index"] = request.step_index
+    return result
+
+
 @app.post("/api/path/execute")
 async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
     global path_task, path_task_source
@@ -4790,13 +5021,38 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
     state.clear_error()
     state.last_command = f"PATH_EXECUTE {request.preview_id}"
     path_task_source = "path_execute"
-    trajectory_mode = str(preview.get("trajectory", {}).get("mode", preview.get("mode", ""))).lower()
-    if trajectory_mode == "joint":
+    trajectory = preview.get("trajectory", {})
+    trajectory_mode = str(trajectory.get("mode", preview.get("mode", ""))).lower()
+    if preview.get("mode") == "program" and trajectory.get("execution_steps"):
+        path_task_source = "program_execute"
+        path_task = asyncio.create_task(execute_program_sequence(preview))
+    elif trajectory_mode == "joint":
         path_task = asyncio.create_task(execute_joint_endpoint_move(preview))
     else:
         path_task = asyncio.create_task(execute_waypoint_path(preview))
     await broadcast_state()
     return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/path/go")
+async def go_path(request: PathGoRequest) -> dict[str, Any]:
+    if not request.waypoints:
+        state.set_error("Go To requires at least one waypoint")
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    preview_result = build_preview(
+        mode="program",
+        target=None,
+        waypoint_program=request.waypoints,
+        links=config.links,
+        settings=request_settings(request.settings),
+        branch=request.branch,
+        source="position_library_go",
+    )
+    if not preview_result.get("ok"):
+        return preview_result
+    execution = await execute_path(PathExecuteRequest(preview_id=preview_result["preview_id"]))
+    execution["preview"] = preview_result["preview"]
+    return execution
 
 
 @app.post("/api/task/preview")
@@ -5727,8 +5983,12 @@ async def set_all_joint_targets(request: AllTargetsRequest) -> dict[str, Any]:
 
 
 @app.post("/api/home")
-async def home() -> dict[str, Any]:
-    response = await start_joint_target_trajectory(config.home_pose, "home", home_path_settings())
+async def home(request: HomeRequest | None = None) -> dict[str, Any]:
+    response = await start_joint_target_trajectory(
+        config.home_pose,
+        "home",
+        home_path_settings(request.settings if request else None),
+    )
     if response["ok"]:
         log_event("motion", "go home accepted", preview_id=response.get("preview_id"))
     return response
