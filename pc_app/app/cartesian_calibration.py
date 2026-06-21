@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from math import hypot, isfinite, sqrt
@@ -14,7 +14,18 @@ from .config import RobotConfig
 
 
 SCHEMA_VERSION = 2
-SUPPORTED_MODELS = {"constant_xyz", "affine_xy_z_offset"}
+DEFAULT_CALIBRATION_MODEL = "radial_reach_z_offset"
+SUPPORTED_MODELS = {"constant_xyz", "radial_reach_z_offset", "affine_xy_z_offset"}
+RADIAL_REACH_ORIGIN_EPS_MM = 1e-6
+
+
+@dataclass(frozen=True)
+class CorrectionCoefficients:
+    model_type: str
+    xy_matrix: np.ndarray
+    xy_offset_mm: np.ndarray
+    z_offset_mm: float
+    reach_offset_mm: float = 0.0
 
 DEFAULT_THRESHOLDS: dict[str, float] = {
     "good_xy_rmse_mm": 5.0,
@@ -31,9 +42,11 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
     "outlier_mad_scale": 3.5,
     "minimum_validation_samples": 2.0,
     "minimum_xy_span_mm": 80.0,
+    "minimum_radial_reach_mm": 40.0,
     "minimum_z_span_mm": 15.0,
     "minimum_phi_span_deg": 20.0,
     "maximum_enable_xy_correction_mm": 35.0,
+    "maximum_enable_reach_correction_mm": 35.0,
     "maximum_enable_z_correction_mm": 20.0,
 }
 
@@ -43,7 +56,7 @@ def calibration_settings(config: RobotConfig) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "enabled": False,
         "active_profile": active_tool_name(config),
-        "default_model": "affine_xy_z_offset",
+        "default_model": DEFAULT_CALIBRATION_MODEL,
         "thresholds": deepcopy(DEFAULT_THRESHOLDS),
         "profiles": {},
     }
@@ -248,23 +261,99 @@ def _target_xyz(target: dict[str, Any]) -> np.ndarray:
     return values
 
 
-def _model_coefficients(profile: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, float]:
+def _result_model_type(profile: dict[str, Any], coefficients: dict[str, Any]) -> str:
+    result = profile.get("result") if isinstance(profile.get("result"), dict) else {}
+    if result.get("model_type"):
+        return str(result["model_type"])
+    if profile.get("model_type"):
+        return str(profile["model_type"])
+    if "reach_offset_mm" in coefficients:
+        return "radial_reach_z_offset"
+    if "xy_matrix" in coefficients or "xy_offset_mm" in coefficients:
+        return "affine_xy_z_offset"
+    return DEFAULT_CALIBRATION_MODEL
+
+
+def _model_coefficients(profile: dict[str, Any]) -> CorrectionCoefficients:
     result = profile.get("result")
     if not isinstance(result, dict):
         raise ValueError("calibration profile has no fitted result")
     coefficients = result.get("coefficients")
     if not isinstance(coefficients, dict):
         raise ValueError("calibration result has no coefficients")
+    model_type = _result_model_type(profile, coefficients)
+    z_offset = float(coefficients.get("z_offset_mm"))
+    if model_type == "radial_reach_z_offset":
+        reach_offset = float(coefficients.get("reach_offset_mm", coefficients.get("radial_offset_mm", 0.0)))
+        if not isfinite(reach_offset) or not isfinite(z_offset):
+            raise ValueError("calibration coefficients contain non-finite values")
+        return CorrectionCoefficients(
+            model_type=model_type,
+            xy_matrix=np.identity(2),
+            xy_offset_mm=np.zeros(2),
+            z_offset_mm=z_offset,
+            reach_offset_mm=reach_offset,
+        )
+    if model_type not in {"constant_xyz", "affine_xy_z_offset"}:
+        raise ValueError(f"unsupported calibration model {model_type}")
     matrix = np.asarray(coefficients.get("xy_matrix"), dtype=float)
     offset = np.asarray(coefficients.get("xy_offset_mm"), dtype=float)
-    z_offset = float(coefficients.get("z_offset_mm"))
     if matrix.shape != (2, 2) or offset.shape != (2,):
         raise ValueError("calibration XY coefficients have invalid dimensions")
     if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(offset)) or not isfinite(z_offset):
         raise ValueError("calibration coefficients contain non-finite values")
     if abs(float(np.linalg.det(matrix))) < 1e-8:
         raise ValueError("calibration XY transform is singular")
-    return matrix, offset, z_offset
+    return CorrectionCoefficients(
+        model_type=model_type,
+        xy_matrix=matrix,
+        xy_offset_mm=offset,
+        z_offset_mm=z_offset,
+    )
+
+
+def _shift_xy_by_reach_offset(xy: np.ndarray, reach_offset_mm: float) -> np.ndarray:
+    values = np.asarray(xy, dtype=float)
+    if values.ndim == 1:
+        radius = float(np.linalg.norm(values))
+        if radius <= RADIAL_REACH_ORIGIN_EPS_MM:
+            if abs(reach_offset_mm) <= RADIAL_REACH_ORIGIN_EPS_MM:
+                return values.copy()
+            raise ValueError("radial reach correction cannot be applied at the XY origin")
+        shifted_radius = radius + float(reach_offset_mm)
+        if shifted_radius < -RADIAL_REACH_ORIGIN_EPS_MM:
+            raise ValueError("radial reach correction would invert the XY radius")
+        return values * (max(0.0, shifted_radius) / radius)
+
+    if values.ndim != 2 or values.shape[1] != 2:
+        raise ValueError("XY coordinates must have shape (2,) or (n, 2)")
+    radii = np.linalg.norm(values, axis=1)
+    if np.any(radii <= RADIAL_REACH_ORIGIN_EPS_MM) and abs(reach_offset_mm) > RADIAL_REACH_ORIGIN_EPS_MM:
+        raise ValueError("radial reach correction requires samples away from the XY origin")
+    shifted = radii + float(reach_offset_mm)
+    if np.any(shifted < -RADIAL_REACH_ORIGIN_EPS_MM):
+        raise ValueError("radial reach correction would invert the XY radius")
+    scales = np.ones_like(radii)
+    valid = radii > RADIAL_REACH_ORIGIN_EPS_MM
+    scales[valid] = np.maximum(0.0, shifted[valid]) / radii[valid]
+    return values * scales[:, None]
+
+
+def _command_xy_for_desired(desired_xy: np.ndarray, coefficients: CorrectionCoefficients) -> np.ndarray:
+    if coefficients.model_type != "radial_reach_z_offset":
+        return np.linalg.solve(coefficients.xy_matrix, desired_xy - coefficients.xy_offset_mm)
+    desired_radius = float(np.linalg.norm(desired_xy))
+    reach_offset = float(coefficients.reach_offset_mm)
+    if desired_radius <= RADIAL_REACH_ORIGIN_EPS_MM:
+        if abs(reach_offset) <= RADIAL_REACH_ORIGIN_EPS_MM:
+            return desired_xy.copy()
+        raise ValueError("radial reach correction cannot command the XY origin")
+    command_radius = desired_radius - reach_offset
+    if command_radius < -RADIAL_REACH_ORIGIN_EPS_MM:
+        raise ValueError("radial reach correction exceeds the requested XY radius")
+    if command_radius <= RADIAL_REACH_ORIGIN_EPS_MM and abs(reach_offset) > RADIAL_REACH_ORIGIN_EPS_MM:
+        raise ValueError("radial reach correction would require an XY command at the base axis")
+    return desired_xy * (command_radius / desired_radius)
 
 
 def predict_physical_pose(
@@ -283,12 +372,19 @@ def predict_physical_pose(
         or (require_enabled and not bool(profile.get("enabled", True)))
     ):
         return pose
-    matrix, offset, z_offset = _model_coefficients(profile)
+    coefficients = _model_coefficients(profile)
     xyz = _target_xyz(pose)
-    predicted_xy = matrix @ xyz[:2] + offset
+    if coefficients.model_type == "radial_reach_z_offset":
+        try:
+            predicted_xy = _shift_xy_by_reach_offset(xyz[:2], coefficients.reach_offset_mm)
+        except ValueError as exc:
+            pose["calibration_prediction_warning"] = str(exc)
+            predicted_xy = xyz[:2]
+    else:
+        predicted_xy = coefficients.xy_matrix @ xyz[:2] + coefficients.xy_offset_mm
     pose["x_mm"] = float(predicted_xy[0])
     pose["y_mm"] = float(predicted_xy[1])
-    pose["z_mm"] = float(xyz[2] + z_offset)
+    pose["z_mm"] = float(xyz[2] + coefficients.z_offset_mm)
     pose["calibration_profile"] = key
     return pose
 
@@ -338,12 +434,12 @@ def correct_cartesian_target(
         metadata["warnings"].append("profile has not passed the validation and correction-magnitude activation gate")
         return command, metadata
     try:
-        matrix, offset, z_offset = _model_coefficients(profile)
+        coefficients = _model_coefficients(profile)
         desired = _target_xyz(requested)
-        command_xy = np.linalg.solve(matrix, desired[:2] - offset)
+        command_xy = _command_xy_for_desired(desired[:2], coefficients)
         command["x_mm"] = float(command_xy[0])
         command["y_mm"] = float(command_xy[1])
-        command["z_mm"] = float(desired[2] - z_offset)
+        command["z_mm"] = float(desired[2] - coefficients.z_offset_mm)
     except (TypeError, ValueError, np.linalg.LinAlgError) as exc:
         metadata["reason"] = "invalid_result"
         metadata["warnings"].append(str(exc))
@@ -521,9 +617,12 @@ def sample_coverage(samples: list[dict[str, Any]], thresholds: dict[str, Any] | 
         return {
             "count": 0,
             "xy_span_mm": 0.0,
+            "radial_reach_min_mm": 0.0,
+            "radial_reach_span_mm": 0.0,
             "z_span_mm": 0.0,
             "phi_span_deg": 0.0,
             "non_collinear_xy": False,
+            "adequate_for_radial_reach": False,
             "adequate_for_affine": False,
             "adequate_for_physical_model": False,
             "warnings": ["no samples collected"],
@@ -541,7 +640,10 @@ def sample_coverage(samples: list[dict[str, Any]], thresholds: dict[str, Any] | 
         dtype=float,
     )
     phis = np.array([float(sample["fk_predicted"].get("phi_deg", 0.0)) for sample in active], dtype=float)
+    radii = np.linalg.norm(targets[:, :2], axis=1)
     xy_span = float(np.linalg.norm(np.ptp(targets[:, :2], axis=0)))
+    radial_reach_min = float(np.min(radii))
+    radial_reach_span = float(np.ptp(radii))
     z_span = float(np.ptp(targets[:, 2]))
     phi_span = float(np.ptp(phis))
     design = np.column_stack((targets[:, 0], targets[:, 1], np.ones(len(active))))
@@ -549,6 +651,8 @@ def sample_coverage(samples: list[dict[str, Any]], thresholds: dict[str, Any] | 
     warnings: list[str] = []
     if xy_span < float(limits.get("minimum_xy_span_mm", 80.0)):
         warnings.append("samples cover too little X/Y range")
+    if radial_reach_min < float(limits.get("minimum_radial_reach_mm", 40.0)):
+        warnings.append("radial reach samples are too close to the base axis")
     if z_span < float(limits.get("minimum_z_span_mm", 15.0)):
         warnings.append("samples cover too little Z range to separate constant and pose-dependent vertical error")
     if phi_span < float(limits.get("minimum_phi_span_deg", 20.0)):
@@ -558,9 +662,15 @@ def sample_coverage(samples: list[dict[str, Any]], thresholds: dict[str, Any] | 
     return {
         "count": len(active),
         "xy_span_mm": xy_span,
+        "radial_reach_min_mm": radial_reach_min,
+        "radial_reach_span_mm": radial_reach_span,
         "z_span_mm": z_span,
         "phi_span_deg": phi_span,
         "non_collinear_xy": non_collinear,
+        "adequate_for_radial_reach": (
+            len(active) >= 2
+            and radial_reach_min >= float(limits.get("minimum_radial_reach_mm", 40.0))
+        ),
         "adequate_for_affine": len(active) >= 4 and non_collinear and xy_span >= float(limits.get("minimum_xy_span_mm", 80.0)),
         "adequate_for_physical_model": (
             len(active) >= 8
@@ -603,14 +713,33 @@ def _sample_arrays(samples: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarra
 def _solve_model(
     samples: list[dict[str, Any]],
     model_type: str,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> CorrectionCoefficients:
     expected, measured, quality = _sample_arrays(samples)
     weights = np.sqrt(quality)[:, None]
     if model_type == "constant_xyz":
         residual = measured - expected
         weighted = residual * quality[:, None]
         offset_xyz = weighted.sum(axis=0) / max(float(quality.sum()), 1e-9)
-        return np.identity(2), offset_xyz[:2], float(offset_xyz[2])
+        return CorrectionCoefficients(
+            model_type=model_type,
+            xy_matrix=np.identity(2),
+            xy_offset_mm=offset_xyz[:2],
+            z_offset_mm=float(offset_xyz[2]),
+        )
+    if model_type == "radial_reach_z_offset":
+        expected_radius = np.linalg.norm(expected[:, :2], axis=1)
+        measured_radius = np.linalg.norm(measured[:, :2], axis=1)
+        if np.any(expected_radius <= RADIAL_REACH_ORIGIN_EPS_MM):
+            raise ValueError("radial reach fitting requires samples away from the XY origin")
+        reach_offset = float(np.average(measured_radius - expected_radius, weights=quality))
+        z_offset = float(np.average(measured[:, 2] - expected[:, 2], weights=quality))
+        return CorrectionCoefficients(
+            model_type=model_type,
+            xy_matrix=np.identity(2),
+            xy_offset_mm=np.zeros(2),
+            z_offset_mm=z_offset,
+            reach_offset_mm=reach_offset,
+        )
     if model_type != "affine_xy_z_offset":
         raise ValueError(f"unsupported calibration model {model_type}")
     design = np.column_stack((expected[:, 0], expected[:, 1], np.ones(len(samples))))
@@ -631,13 +760,21 @@ def _solve_model(
     condition = float(np.linalg.cond(matrix))
     if not isfinite(condition) or condition > 100.0 or abs(float(np.linalg.det(matrix))) < 1e-5:
         raise ValueError("fitted affine XY correction is ill-conditioned; collect wider, non-collinear samples")
-    return matrix, offset, z_offset
+    return CorrectionCoefficients(
+        model_type=model_type,
+        xy_matrix=matrix,
+        xy_offset_mm=offset,
+        z_offset_mm=z_offset,
+    )
 
 
-def _predict_array(expected: np.ndarray, matrix: np.ndarray, offset: np.ndarray, z_offset: float) -> np.ndarray:
+def _predict_array(expected: np.ndarray, coefficients: CorrectionCoefficients) -> np.ndarray:
     predicted = np.empty_like(expected)
-    predicted[:, :2] = expected[:, :2] @ matrix.T + offset
-    predicted[:, 2] = expected[:, 2] + z_offset
+    if coefficients.model_type == "radial_reach_z_offset":
+        predicted[:, :2] = _shift_xy_by_reach_offset(expected[:, :2], coefficients.reach_offset_mm)
+    else:
+        predicted[:, :2] = expected[:, :2] @ coefficients.xy_matrix.T + coefficients.xy_offset_mm
+    predicted[:, 2] = expected[:, 2] + coefficients.z_offset_mm
     return predicted
 
 
@@ -688,12 +825,10 @@ def _quality_status(metrics: dict[str, Any], thresholds: dict[str, Any]) -> str:
 def _outlier_mask(
     expected: np.ndarray,
     measured: np.ndarray,
-    matrix: np.ndarray,
-    offset: np.ndarray,
-    z_offset: float,
+    coefficients: CorrectionCoefficients,
     thresholds: dict[str, Any],
 ) -> np.ndarray:
-    residual = measured - _predict_array(expected, matrix, offset, z_offset)
+    residual = measured - _predict_array(expected, coefficients)
     scalar = np.linalg.norm(residual, axis=1)
     median = float(np.median(scalar))
     mad = float(np.median(np.abs(scalar - median)))
@@ -707,9 +842,7 @@ def _outlier_mask(
 
 def _sample_diagnostics(
     fit_samples: list[dict[str, Any]],
-    matrix: np.ndarray,
-    offset: np.ndarray,
-    z_offset: float,
+    coefficients: CorrectionCoefficients,
 ) -> list[str]:
     notes: list[str] = []
     model_residuals = np.array(
@@ -735,12 +868,16 @@ def _sample_diagnostics(
     spread = np.std(model_residuals, axis=0)
     if float(np.linalg.norm(mean_offset)) > max(3.0, float(np.linalg.norm(spread)) * 1.5):
         notes.append("residuals are dominated by a consistent offset, which is compatible with TCP or zero-offset error")
-    affine_delta = float(np.linalg.norm(matrix - np.identity(2)))
-    if affine_delta > 0.04:
+    affine_delta = float(np.linalg.norm(coefficients.xy_matrix - np.identity(2)))
+    if coefficients.model_type == "affine_xy_z_offset" and affine_delta > 0.04:
         notes.append(
             "the XY fit includes noticeable scale/skew; verify workspace calibration and geometry before treating it as robot-only error"
         )
-    if abs(z_offset) > 10.0:
+    if coefficients.model_type == "radial_reach_z_offset" and abs(coefficients.reach_offset_mm) > 5.0:
+        notes.append(
+            "radial reach offset was fitted; angular or tangential XY errors are intentionally left visible in residuals"
+        )
+    if abs(coefficients.z_offset_mm) > 10.0:
         phi_values = [
             float(sample.get("fk_predicted", {}).get("phi_deg", 0.0))
             for sample in fit_samples
@@ -788,28 +925,36 @@ def _activation_assessment(
     thresholds: dict[str, Any],
 ) -> dict[str, Any]:
     reasons: list[str] = []
+    manual_offsets = result.get("source") == "manual_offsets"
     validation = result.get("validation") if isinstance(result.get("validation"), dict) else {}
     validation_count = int(validation.get("after_model", {}).get("count") or 0)
     minimum_validation = int(thresholds.get("minimum_validation_samples", 2))
-    if validation_count < minimum_validation:
+    if not manual_offsets and validation_count < minimum_validation:
         reasons.append(f"collect at least {minimum_validation} held-out validation samples")
-    if validation.get("status") != "pass":
+    if not manual_offsets and validation.get("status") != "pass":
         reasons.append("held-out model residual validation must pass before correction can be enabled")
-    if validation.get("landing_status") != "pass":
+    if not manual_offsets and validation.get("landing_status") != "pass":
         reasons.append("held-out corrected landing validation must pass before correction can be enabled")
     coefficients = result.get("coefficients") if isinstance(result.get("coefficients"), dict) else {}
+    model_type = str(result.get("model_type") or DEFAULT_CALIBRATION_MODEL)
     xy_offset = np.asarray(coefficients.get("xy_offset_mm", [0.0, 0.0]), dtype=float)
     xy_matrix = np.asarray(coefficients.get("xy_matrix", np.identity(2)), dtype=float)
     z_offset = float(coefficients.get("z_offset_mm", 0.0))
+    reach_offset = float(coefficients.get("reach_offset_mm", 0.0))
     xy_bound = float(thresholds.get("maximum_enable_xy_correction_mm", 35.0))
+    reach_bound = float(thresholds.get("maximum_enable_reach_correction_mm", xy_bound))
     z_bound = float(thresholds.get("maximum_enable_z_correction_mm", 20.0))
-    if float(np.linalg.norm(xy_offset)) > xy_bound:
+    if model_type == "radial_reach_z_offset" and abs(reach_offset) > reach_bound:
+        reasons.append(f"radial reach offset exceeds the {reach_bound:.1f} mm automatic-enable limit")
+    if model_type != "radial_reach_z_offset" and float(np.linalg.norm(xy_offset)) > xy_bound:
         reasons.append(f"XY offset exceeds the {xy_bound:.1f} mm automatic-enable limit")
     if abs(z_offset) > z_bound:
         reasons.append(f"Z offset exceeds the {z_bound:.1f} mm automatic-enable limit")
-    if float(np.linalg.norm(xy_matrix - np.identity(2))) > 0.20:
+    if model_type == "radial_reach_z_offset" and not manual_offsets and not coverage.get("adequate_for_radial_reach"):
+        reasons.append("fit sample radius is too close to the base axis for radial reach correction")
+    if model_type != "radial_reach_z_offset" and float(np.linalg.norm(xy_matrix - np.identity(2))) > 0.20:
         reasons.append("XY scale/skew is too large for safe automatic enablement")
-    if result.get("model_type") == "affine_xy_z_offset" and not coverage.get("adequate_for_affine"):
+    if model_type == "affine_xy_z_offset" and not coverage.get("adequate_for_affine"):
         reasons.append("fit sample X/Y coverage is inadequate for affine correction")
     return {
         "eligible": not reasons,
@@ -818,29 +963,32 @@ def _activation_assessment(
         "minimum_validation_samples": minimum_validation,
         "correction_magnitude": {
             "xy_offset_norm_mm": float(np.linalg.norm(xy_offset)),
+            "reach_offset_abs_mm": abs(reach_offset),
             "z_offset_abs_mm": abs(z_offset),
             "xy_matrix_delta_norm": float(np.linalg.norm(xy_matrix - np.identity(2))),
         },
     }
 
 
+def _empty_evaluation() -> dict[str, Any]:
+    empty = _metrics(np.empty((0, 3)))
+    return {
+        "before": empty,
+        "after_model": empty,
+        "landing": empty,
+        "status": "not_run",
+        "landing_status": "not_run",
+        "worst_samples": [],
+    }
+
+
 def _evaluate_samples(
     samples: list[dict[str, Any]],
-    matrix: np.ndarray,
-    offset: np.ndarray,
-    z_offset: float,
+    coefficients: CorrectionCoefficients,
     thresholds: dict[str, Any],
 ) -> dict[str, Any]:
     if not samples:
-        empty = _metrics(np.empty((0, 3)))
-        return {
-            "before": empty,
-            "after_model": empty,
-            "landing": empty,
-            "status": "not_run",
-            "landing_status": "not_run",
-            "worst_samples": [],
-        }
+        return _empty_evaluation()
     expected, measured, _ = _sample_arrays(samples)
     intended = np.array(
         [
@@ -854,7 +1002,7 @@ def _evaluate_samples(
         dtype=float,
     )
     before_vectors = measured - expected
-    after_vectors = measured - _predict_array(expected, matrix, offset, z_offset)
+    after_vectors = measured - _predict_array(expected, coefficients)
     landing_vectors = measured - intended
     after_norm = np.linalg.norm(after_vectors, axis=1)
     worst_indices = np.argsort(after_norm)[::-1][:5]
@@ -880,6 +1028,77 @@ def _evaluate_samples(
     }
 
 
+def save_manual_radial_offsets(
+    settings: dict[str, Any],
+    config: RobotConfig,
+    *,
+    reach_offset_mm: float,
+    z_offset_mm: float,
+    profile_key: str | None = None,
+    enabled: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    reach_offset = float(reach_offset_mm)
+    z_offset = float(z_offset_mm)
+    if not isfinite(reach_offset) or not isfinite(z_offset):
+        raise ValueError("manual reach and Z offsets must be finite millimetre values")
+
+    updated = deepcopy(settings)
+    key = _profile_key(updated, config, profile_key)
+    profiles = updated.setdefault("profiles", {})
+    profile = deepcopy(profiles.get(key) or {})
+    samples = profile.get("samples")
+    if not isinstance(samples, list):
+        samples = []
+    thresholds = updated.get("thresholds") if isinstance(updated.get("thresholds"), dict) else deepcopy(DEFAULT_THRESHOLDS)
+    result = {
+        "id": str(uuid4()),
+        "source": "manual_offsets",
+        "fitted_at": datetime.now(timezone.utc).isoformat(),
+        "model_type": "radial_reach_z_offset",
+        "coordinate_frame": "robot base frame; millimetres; +Z upward",
+        "fit_sample_count": 0,
+        "validation_sample_count": 0,
+        "rejected_sample_ids": [],
+        "coefficients": {
+            "xy_matrix": np.identity(2).tolist(),
+            "xy_offset_mm": [0.0, 0.0],
+            "reach_offset_mm": reach_offset,
+            "z_offset_mm": z_offset,
+        },
+        "fit": _empty_evaluation(),
+        "validation": _empty_evaluation(),
+        "diagnostics": [
+            "manual reach/Z offsets entered by operator; no sample fit or held-out validation was run"
+        ],
+        "coverage": sample_coverage([], thresholds),
+    }
+    activation = _activation_assessment(result, result["coverage"], thresholds)
+    result["activation"] = activation
+    requested_enable = bool(enabled)
+    if requested_enable and not activation.get("eligible"):
+        raise ValueError(
+            "manual correction is not eligible: " + "; ".join(activation.get("reasons", []))
+        )
+    profile.update(
+        {
+            "tool": key,
+            "enabled": requested_enable,
+            "model_type": "radial_reach_z_offset",
+            "workspace": workspace_context(config),
+            "context": calibration_context(config, key),
+            "samples": samples,
+            "result": result,
+            "activation": activation,
+        }
+    )
+    profiles[key] = profile
+    updated["schema_version"] = SCHEMA_VERSION
+    updated["active_profile"] = key
+    updated["default_model"] = "radial_reach_z_offset"
+    updated["enabled"] = requested_enable
+    return updated, result
+
+
 def fit_profile(
     settings: dict[str, Any],
     config: RobotConfig,
@@ -894,7 +1113,7 @@ def fit_profile(
     samples = profile.get("samples")
     if not isinstance(samples, list):
         samples = []
-    chosen_model = str(model_type or profile.get("model_type") or updated.get("default_model") or "affine_xy_z_offset")
+    chosen_model = str(model_type or profile.get("model_type") or updated.get("default_model") or DEFAULT_CALIBRATION_MODEL)
     if chosen_model not in SUPPORTED_MODELS:
         raise ValueError(f"model_type must be one of {sorted(SUPPORTED_MODELS)}")
     fit_samples = [sample for sample in samples if isinstance(sample, dict) and sample.get("role", "fit") == "fit"]
@@ -918,7 +1137,7 @@ def fit_profile(
             "samples were collected with a different or unsigned tool/model/reference context; "
             "delete and recapture them: " + ", ".join(stale_sample_ids[:5])
         )
-    minimum = 2 if chosen_model == "constant_xyz" else 4
+    minimum = 2 if chosen_model in {"constant_xyz", "radial_reach_z_offset"} else 4
     if len(fit_samples) < minimum:
         raise ValueError(f"{chosen_model} requires at least {minimum} fit samples")
     thresholds = updated.get("thresholds") if isinstance(updated.get("thresholds"), dict) else deepcopy(DEFAULT_THRESHOLDS)
@@ -927,9 +1146,9 @@ def fit_profile(
     rejected: list[int] = []
     for _ in range(3):
         active_samples = [fit_samples[index] for index in inliers]
-        matrix, offset, z_offset = _solve_model(active_samples, chosen_model)
+        coefficients = _solve_model(active_samples, chosen_model)
         expected, measured, _ = _sample_arrays(active_samples)
-        local_mask = _outlier_mask(expected, measured, matrix, offset, z_offset, thresholds)
+        local_mask = _outlier_mask(expected, measured, coefficients, thresholds)
         next_inliers = [index for index, keep in zip(inliers, local_mask, strict=True) if bool(keep)]
         next_rejected = [index for index, keep in zip(inliers, local_mask, strict=True) if not bool(keep)]
         if len(next_inliers) < minimum or not next_rejected:
@@ -938,13 +1157,13 @@ def fit_profile(
         inliers = next_inliers
 
     active_samples = [fit_samples[index] for index in inliers]
-    matrix, offset, z_offset = _solve_model(active_samples, chosen_model)
-    fit_evaluation = _evaluate_samples(active_samples, matrix, offset, z_offset, thresholds)
+    coefficients = _solve_model(active_samples, chosen_model)
+    fit_evaluation = _evaluate_samples(active_samples, coefficients, thresholds)
     validation_samples = [
         sample for sample in samples if isinstance(sample, dict) and sample.get("role") == "validation"
     ]
-    validation = _evaluate_samples(validation_samples, matrix, offset, z_offset, thresholds)
-    diagnostics = _sample_diagnostics(active_samples, matrix, offset, z_offset)
+    validation = _evaluate_samples(validation_samples, coefficients, thresholds)
+    diagnostics = _sample_diagnostics(active_samples, coefficients)
     coverage = sample_coverage(active_samples, thresholds)
     rejected_ids = [fit_samples[index].get("id") for index in sorted(set(rejected))]
     result = {
@@ -956,9 +1175,10 @@ def fit_profile(
         "validation_sample_count": len(validation_samples),
         "rejected_sample_ids": rejected_ids,
         "coefficients": {
-            "xy_matrix": matrix.tolist(),
-            "xy_offset_mm": offset.tolist(),
-            "z_offset_mm": float(z_offset),
+            "xy_matrix": coefficients.xy_matrix.tolist(),
+            "xy_offset_mm": coefficients.xy_offset_mm.tolist(),
+            "reach_offset_mm": float(coefficients.reach_offset_mm),
+            "z_offset_mm": float(coefficients.z_offset_mm),
         },
         "fit": fit_evaluation,
         "validation": validation,

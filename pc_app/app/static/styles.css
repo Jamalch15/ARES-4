@@ -364,7 +364,7 @@ code {
 
 .task-detection-table table {
   width: 100%;
-  min-width: 640px;
+  min-width: 720px;
   table-layout: fixed;
   border-collapse: collapse;
   font-size: 12px;
@@ -432,7 +432,19 @@ code {
 }
 
 .color-map-row {
-  grid-template-columns: minmax(105px, 1fr) minmax(130px, 1fr) minmax(110px, auto);
+  grid-template-columns: minmax(110px, 1fr) auto;
+}
+
+.color-map-row > select,
+.color-map-row > .color-map-title {
+  grid-column: 1 / -1;
+}
+
+.color-map-row > .draft-badge,
+.color-map-row > .saved-badge,
+.color-map-row > .missing-badge {
+  grid-column: 2;
+  grid-row: 1;
 }
 
 .task-destination-row {
@@ -614,6 +626,45 @@ code {
   margin-top: 12px;
 }
 
+.task-vision-config {
+  margin-top: 10px;
+}
+
+.task-preview-feedback {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  background: rgba(13, 19, 29, 0.72);
+}
+
+.task-preview-feedback.working {
+  color: var(--text);
+  border-color: rgba(106, 167, 255, 0.45);
+  background: rgba(106, 167, 255, 0.08);
+  animation: task-preview-pulse 1.2s ease-in-out infinite;
+}
+
+.task-preview-feedback.success,
+.task-ready-state {
+  color: var(--text);
+  border-color: rgba(94, 230, 197, 0.35);
+  background: rgba(94, 230, 197, 0.08);
+}
+
+.task-preview-feedback.error {
+  color: var(--danger);
+  border-color: rgba(255, 103, 122, 0.4);
+  background: rgba(255, 103, 122, 0.08);
+}
+
+@keyframes task-preview-pulse {
+  50% {
+    border-color: rgba(106, 167, 255, 0.8);
+  }
+}
+
 .task-plan-preview,
 .task-run-monitor {
   display: grid;
@@ -623,7 +674,7 @@ code {
 
 .task-preview-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(180px, 0.75fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 12px;
 }
 
@@ -646,7 +697,7 @@ code {
 
 .task-object-row {
   display: grid;
-  grid-template-columns: 28px 72px 1fr 1fr;
+  grid-template-columns: 28px 72px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   padding: 9px 10px;
@@ -666,11 +717,13 @@ code {
 }
 
 .task-object-row code {
+  grid-column: 3;
   color: var(--muted);
   white-space: normal;
 }
 
 .task-object-row small {
+  grid-column: 2 / -1;
   color: var(--muted);
 }
 
@@ -688,7 +741,7 @@ code {
 
 .task-generated-step {
   display: grid;
-  grid-template-columns: 28px minmax(110px, 0.7fr) minmax(180px, 1fr) minmax(90px, 0.5fr);
+  grid-template-columns: 28px minmax(110px, 0.8fr) minmax(0, 1.2fr);
   gap: 8px;
   align-items: center;
   padding: 8px 10px;
@@ -702,6 +755,10 @@ code {
 .task-generated-step small,
 .task-recovery-options div {
   color: var(--muted);
+}
+
+.task-generated-step small {
+  grid-column: 2 / -1;
 }
 
 .task-recovery-options {
@@ -756,6 +813,50 @@ code {
   background: rgba(242, 180, 91, 0.08);
 }
 
+.task-ready-state,
+.task-confirmation {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid rgba(94, 230, 197, 0.35);
+  border-radius: 12px;
+}
+
+.task-ready-state strong,
+.task-ready-state span,
+.task-confirmation strong,
+.task-confirmation span {
+  display: block;
+}
+
+.task-ready-state span,
+.task-confirmation span {
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.tool-validation-panel {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(13, 19, 29, 0.72);
+}
+
+.tool-validation-panel strong.ready {
+  color: var(--ok);
+}
+
+.tool-validation-panel strong.warning {
+  color: var(--warn);
+}
+
 .wide-field {
   grid-column: 1 / -1;
 }
@@ -780,6 +881,21 @@ code {
 
   .task-object-row {
     grid-template-columns: 28px 1fr;
+  }
+
+  .color-map-row,
+  .tool-validation-panel,
+  .task-ready-state,
+  .task-confirmation {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-preview-feedback.working {
+    animation: none;
   }
 }
 

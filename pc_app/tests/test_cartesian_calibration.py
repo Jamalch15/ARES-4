@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from math import hypot
 from pathlib import Path
 from shutil import copyfile
 
@@ -15,6 +16,7 @@ from app.cartesian_calibration import (
     correct_cartesian_target,
     create_sample,
     fit_profile,
+    save_manual_radial_offsets,
 )
 from app.config import EXAMPLE_CONFIG_PATH, load_config, save_calibration_updates
 from app.kinematics import forward_kinematics
@@ -44,6 +46,50 @@ def fitted_constant_settings(
                         "xy_matrix": [[1.0, 0.0], [0.0, 1.0]],
                         "xy_offset_mm": [offset[0], offset[1]],
                         "z_offset_mm": offset[2],
+                    },
+                    "fit": {
+                        "status": "pass",
+                        "after_model": {
+                            "count": 4,
+                            "xy_rmse_mm": 0.5,
+                            "xy_max_mm": 1.0,
+                            "z_rmse_mm": 0.2,
+                            "z_max_abs_mm": 0.4,
+                        },
+                    },
+                    "validation": {"status": "pass", "landing_status": "pass"},
+                },
+            }
+        },
+    }
+
+
+def fitted_radial_settings(
+    *,
+    enabled: bool = True,
+    reach_offset_mm: float = 6.0,
+    z_offset_mm: float = 2.0,
+) -> dict:
+    return {
+        "schema_version": 2,
+        "enabled": enabled,
+        "active_profile": "gripper",
+        "default_model": "radial_reach_z_offset",
+        "profiles": {
+            "gripper": {
+                "tool": "gripper",
+                "enabled": enabled,
+                "model_type": "radial_reach_z_offset",
+                "activation": {"eligible": True, "reasons": []},
+                "samples": [],
+                "result": {
+                    "id": "radial-test-result",
+                    "model_type": "radial_reach_z_offset",
+                    "coefficients": {
+                        "xy_matrix": [[1.0, 0.0], [0.0, 1.0]],
+                        "xy_offset_mm": [0.0, 0.0],
+                        "reach_offset_mm": reach_offset_mm,
+                        "z_offset_mm": z_offset_mm,
                     },
                     "fit": {
                         "status": "pass",
@@ -141,6 +187,91 @@ def test_enabled_calibration_inverse_shifts_cartesian_command(tmp_path):
     assert command["y_mm"] == approx(205.0)
     assert command["z_mm"] == approx(38.0)
     assert command["phi_deg"] == intended["phi_deg"]
+
+
+def test_radial_reach_calibration_inverse_preserves_xy_angle(tmp_path):
+    config, _ = config_with_calibration(
+        tmp_path,
+        fitted_radial_settings(reach_offset_mm=6.0, z_offset_mm=2.5),
+    )
+    intended = {"x_mm": 120.0, "y_mm": 160.0, "z_mm": 45.0, "phi_deg": -100.0}
+
+    command, metadata = correct_cartesian_target(intended, config)
+
+    requested_radius = hypot(intended["x_mm"], intended["y_mm"])
+    command_radius = requested_radius - 6.0
+    scale = command_radius / requested_radius
+    assert metadata["applied"] is True
+    assert metadata["model_type"] == "radial_reach_z_offset"
+    assert hypot(command["x_mm"], command["y_mm"]) == approx(command_radius)
+    assert command["x_mm"] == approx(intended["x_mm"] * scale)
+    assert command["y_mm"] == approx(intended["y_mm"] * scale)
+    assert command["z_mm"] == approx(42.5)
+    assert command["phi_deg"] == intended["phi_deg"]
+
+
+def test_manual_radial_offsets_can_enable_without_samples(tmp_path):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    settings, result = save_manual_radial_offsets(
+        calibration_settings(config),
+        config,
+        reach_offset_mm=-4.0,
+        z_offset_mm=3.0,
+        enabled=True,
+    )
+    config, _ = config_with_calibration(tmp_path, settings)
+    intended = {"x_mm": 120.0, "y_mm": 160.0, "z_mm": 45.0, "phi_deg": -100.0}
+
+    command, metadata = correct_cartesian_target(intended, config)
+
+    assert result["source"] == "manual_offsets"
+    assert result["activation"]["eligible"] is True
+    assert settings["enabled"] is True
+    assert settings["profiles"]["gripper"]["samples"] == []
+    assert metadata["applied"] is True
+    assert hypot(command["x_mm"], command["y_mm"]) == approx(hypot(intended["x_mm"], intended["y_mm"]) + 4.0)
+    assert command["z_mm"] == approx(42.0)
+
+
+def test_manual_radial_offsets_reject_enable_when_magnitude_is_too_large():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    settings = calibration_settings(config)
+
+    with pytest.raises(ValueError, match="not eligible"):
+        save_manual_radial_offsets(
+            settings,
+            config,
+            reach_offset_mm=250.0,
+            z_offset_mm=0.0,
+            enabled=True,
+        )
+
+
+def test_manual_radial_offsets_endpoint_saves_operator_entered_offsets(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    saved: dict[str, dict] = {}
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(
+        main,
+        "_persist_kinematics_calibration",
+        lambda settings: saved.update(settings=deepcopy(settings)),
+    )
+    main.state.motion_state = main.MotionState.IDLE
+    client = TestClient(main.app)
+
+    payload = client.post(
+        "/api/kinematics-calibration/manual-offsets",
+        json={"reach_offset_mm": -4.0, "z_offset_mm": 3.0, "enabled": True},
+    ).json()
+
+    profile = saved["settings"]["profiles"]["gripper"]
+    assert payload["ok"] is True
+    assert payload["result"]["source"] == "manual_offsets"
+    assert payload["result"]["coefficients"]["reach_offset_mm"] == approx(-4.0)
+    assert payload["result"]["coefficients"]["z_offset_mm"] == approx(3.0)
+    assert saved["settings"]["enabled"] is True
+    assert profile["enabled"] is True
+    assert profile["samples"] == []
 
 
 def test_stale_model_signature_blocks_correction(tmp_path):
@@ -286,6 +417,59 @@ def test_affine_fit_rejects_outlier_and_reports_validation_metrics():
     assert coefficients["xy_matrix"][1] == approx([-0.02, 0.98], abs=1e-6)
     assert coefficients["xy_offset_mm"] == approx([8.0, -4.0], abs=1e-6)
     assert coefficients["z_offset_mm"] == approx(3.0)
+
+
+def test_radial_reach_z_fit_recovers_constant_radius_and_height_bias():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    settings = calibration_settings(config)
+    context = calibration_context(config)
+    reach_offset = 7.5
+    z_offset = -4.0
+
+    def transform(x, y, z):
+        radius = hypot(x, y)
+        scale = (radius + reach_offset) / radius
+        return (x * scale, y * scale, z + z_offset)
+
+    fit_points = [
+        (120.0, 160.0, 35.0),
+        (-140.0, 180.0, 35.0),
+        (90.0, 260.0, 55.0),
+        (-110.0, 280.0, 55.0),
+    ]
+    validation_point = (150.0, 210.0, 45.0)
+    samples = [
+        calibration_sample(f"fit-radial-{index}", point, transform(*point), context=context)
+        for index, point in enumerate(fit_points)
+    ]
+    samples.append(
+        calibration_sample(
+            "validation-radial",
+            validation_point,
+            transform(*validation_point),
+            role="validation",
+            context=context,
+        )
+    )
+    settings["profiles"] = {
+        "gripper": {
+            "tool": "gripper",
+            "enabled": False,
+            "model_type": "radial_reach_z_offset",
+            "samples": samples,
+        }
+    }
+    settings["active_profile"] = "gripper"
+
+    updated, result = fit_profile(settings, config, model_type="radial_reach_z_offset")
+
+    coefficients = updated["profiles"]["gripper"]["result"]["coefficients"]
+    assert result["model_type"] == "radial_reach_z_offset"
+    assert result["fit"]["status"] == "pass"
+    assert coefficients["reach_offset_mm"] == approx(reach_offset, abs=1e-6)
+    assert coefficients["z_offset_mm"] == approx(z_offset, abs=1e-6)
+    assert coefficients["xy_matrix"] == [[1.0, 0.0], [0.0, 1.0]]
+    assert coefficients["xy_offset_mm"] == approx([0.0, 0.0])
 
 
 def test_preview_applies_calibration_but_keeps_requested_target_visible(monkeypatch, tmp_path):

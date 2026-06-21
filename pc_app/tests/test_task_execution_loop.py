@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 from copy import deepcopy
 from dataclasses import replace
 
@@ -57,6 +58,7 @@ def restore_runtime_state():
     main.task_previews.update(snapshot["task_previews"])
     main.task_selection_events.clear()
     main.task_selection_choices.clear()
+    main.task_confirmation_events.clear()
 
 
 def configure_task_runtime(monkeypatch, task_settings: dict | None = None) -> dict:
@@ -124,6 +126,62 @@ def install_closed_loop_stubs(monkeypatch, captures: list[list[dict]], executed_
     return counters
 
 
+def test_tool_dimension_validation_is_per_active_tool():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["tools"]["presets"]["gripper"]["dimensions_validated"] = True
+    raw["tools"]["presets"]["magnet"]["dimensions_validated"] = False
+
+    assert main.active_tool_dimensions_validated(replace(config, raw=raw)) is True
+
+    raw["tools"]["active"] = "magnet"
+    assert main.active_tool_dimensions_validated(replace(config, raw=raw)) is False
+
+
+def test_changing_tcp_clears_only_that_tool_validation():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    previous = main.tools_settings(config)
+    previous["presets"]["gripper"]["dimensions_validated"] = True
+    previous["presets"]["magnet"]["dimensions_validated"] = True
+    updated = deepcopy(previous)
+    updated["presets"]["gripper"]["tcp_offset_mm"]["z"] += 1.0
+
+    main._invalidate_changed_tool_validations(previous, updated)
+
+    assert updated["presets"]["gripper"]["dimensions_validated"] is False
+    assert updated["presets"]["magnet"]["dimensions_validated"] is True
+
+
+def test_tool_validation_endpoint_persists_active_tool_acknowledgement(monkeypatch, tmp_path):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    config_path = tmp_path / "robot.local.yaml"
+    shutil.copyfile(EXAMPLE_CONFIG_PATH, config_path)
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "ensure_local_config", lambda: config_path)
+
+    async def fake_broadcast():
+        return None
+
+    def fake_reload(loaded_config, change):
+        main.config = loaded_config
+        main.state.config_change = change
+        return change
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "reload_runtime_config", fake_reload)
+
+    result = asyncio.run(
+        main.set_active_tool_dimensions_validation(
+            main.ToolDimensionsValidationRequest(validated=True)
+        )
+    )
+    saved = load_config(config_path)
+
+    assert result["ok"] is True
+    assert saved.raw["tools"]["presets"]["gripper"]["dimensions_validated"] is True
+    assert main.active_tool_dimensions_validated(saved) is True
+
+
 def test_closed_loop_recaptures_until_max_objects(monkeypatch):
     executed: list[dict] = []
     preview = configure_task_runtime(
@@ -150,6 +208,45 @@ def test_closed_loop_recaptures_until_max_objects(monkeypatch):
     assert main.state.task_execution["completed_count"] == 2
 
 
+def test_closed_loop_can_pause_for_confirmation_between_objects(monkeypatch):
+    executed: list[dict] = []
+    preview = configure_task_runtime(
+        monkeypatch,
+        {
+            "execution_strategy": "closed_loop",
+            "cycle_confirmation": "confirm_each_object",
+            "max_objects": 2,
+        },
+    )
+    counters = install_closed_loop_stubs(
+        monkeypatch,
+        [
+            [detection("red", -120.0, 150.0, "r1")],
+            [detection("blue", 120.0, 180.0, "b1")],
+        ],
+        executed,
+    )
+
+    async def run_and_continue():
+        task = asyncio.create_task(main.execute_closed_loop_sorting(preview))
+        for _ in range(100):
+            if main.state.task_execution.get("status") == "waiting_for_confirmation":
+                break
+            await asyncio.sleep(0.01)
+        assert main.state.task_execution["status"] == "waiting_for_confirmation"
+        assert counters["captures"] == 1
+        assert len(executed) == 1
+        response = await main.continue_task(main.TaskContinueRequest(run_id="test-run"))
+        assert response["ok"] is True
+        await task
+
+    asyncio.run(run_and_continue())
+
+    assert counters["captures"] == 2
+    assert [plan["objects"][0]["detection_id"] for plan in executed] == ["r1", "b1"]
+    assert main.state.task_execution["status"] == "completed"
+
+
 def test_closed_loop_empty_scene_completes_without_execution(monkeypatch):
     executed: list[dict] = []
     preview = configure_task_runtime(monkeypatch, {"execution_strategy": "closed_loop", "max_objects": 3})
@@ -161,6 +258,72 @@ def test_closed_loop_empty_scene_completes_without_execution(monkeypatch):
     assert executed == []
     assert main.state.task_execution["status"] == "completed"
     assert main.state.task_execution["terminal_reason"] == "empty scene"
+
+
+def test_batch_once_can_pause_between_objects(monkeypatch):
+    preview = configure_task_runtime(
+        monkeypatch,
+        {
+            "execution_strategy": "batch_once",
+            "cycle_confirmation": "confirm_each_object",
+            "max_objects": 2,
+        },
+    )
+    sequence = {
+        "steps": [
+            {
+                "kind": "move",
+                "label": "object 1 safe",
+                "object_index": 1,
+                "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0.0, 35.0, 15.0, 0.0]},
+            },
+            {
+                "kind": "move",
+                "label": "object 2 safe",
+                "object_index": 2,
+                "waypoint": {"type": "joint", "mode": "joint", "angles_deg": [0.0, 35.0, 15.0, 0.0]},
+            },
+        ]
+    }
+
+    async def fake_broadcast():
+        return None
+
+    def fake_build_preview(**kwargs):
+        return {"ok": True, "preview": {"trajectory": {"mode": "program"}}}
+
+    async def fake_execute(_preview):
+        return None
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "build_preview", fake_build_preview)
+    monkeypatch.setattr(main, "execute_waypoint_path", fake_execute)
+
+    async def run_and_continue():
+        task = asyncio.create_task(
+            main.execute_task_sequence(
+                sequence,
+                {
+                    **preview["settings"],
+                    "cycle_confirmation": "confirm_each_object",
+                },
+                preview["branch"],
+            )
+        )
+        for _ in range(100):
+            if main.state.task_execution.get("status") == "waiting_for_confirmation":
+                break
+            await asyncio.sleep(0.01)
+        assert main.state.task_execution["status"] == "waiting_for_confirmation"
+        assert main.state.task_execution["completed_count"] == 1
+        response = await main.continue_task(main.TaskContinueRequest(run_id="test-run"))
+        assert response["ok"] is True
+        await task
+
+    asyncio.run(run_and_continue())
+
+    assert main.state.task_execution["status"] == "completed"
+    assert main.state.task_execution["completed_count"] == 2
 
 
 def test_closed_loop_manual_selection_waits_and_resumes(monkeypatch):
@@ -529,6 +692,120 @@ def test_successful_batch_sequence_updates_completed_and_remaining_counts(monkey
     assert main.state.task_execution["remaining_count"] == 0
 
 
+def test_task_sequence_dispatches_program_substeps_instead_of_whole_program_upload(monkeypatch):
+    preview = configure_task_runtime(monkeypatch, {"execution_strategy": "batch_once", "max_objects": 1})
+    requested_settings = {
+        **preview["settings"],
+        "global_speed_deg_s": 37.5,
+        "global_accel_deg_s2": 88.0,
+    }
+    sequence = {
+        "steps": [
+            {
+                "kind": "move",
+                "label": "above pickup",
+                "object_index": 1,
+                "waypoint": {"type": "cartesian", "mode": "joint", "target": {"x_mm": -120.0, "y_mm": 150.0, "z_mm": 80.0, "phi_deg": -100.0}},
+            }
+        ]
+    }
+    calls: list[dict] = []
+
+    async def fake_broadcast():
+        return None
+
+    def fake_build_preview(**kwargs):
+        return {
+            "ok": True,
+            "preview_id": "preview-program-step",
+            "preview": {
+                **main.pose_snapshot_fields(),
+                "mode": "program",
+                "source": "task",
+                "settings": kwargs["settings"],
+                "trajectory": {
+                    "mode": "program",
+                    "waypoints": [[0.0, 35.0, 15.0, 0.0]],
+                    "duration_s": 0.1,
+                    "execution_steps": [
+                        {
+                            "kind": "motion",
+                            "settings": kwargs["settings"],
+                            "trajectory": {"mode": "joint", "waypoints": [[0.0, 35.0, 15.0, 0.0]], "duration_s": 0.1},
+                        }
+                    ],
+                },
+                "motion_contract": {},
+            },
+        }
+
+    async def fake_execute_program(preview_arg):
+        calls.append(preview_arg)
+        main.state.motion_state = MotionState.IDLE
+        main.state.motion_execution_state = "reached"
+
+    async def fail_if_whole_program_upload(_preview):
+        raise AssertionError("task step should execute through program substeps")
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "build_preview", fake_build_preview)
+    monkeypatch.setattr(main, "execute_program_sequence", fake_execute_program)
+    monkeypatch.setattr(main, "execute_waypoint_path", fail_if_whole_program_upload)
+
+    result = asyncio.run(main.execute_task_sequence(sequence, requested_settings, preview["branch"]))
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+    execution_step = calls[0]["trajectory"]["execution_steps"][0]
+    assert execution_step["settings"]["global_speed_deg_s"] == 37.5
+    assert execution_step["settings"]["global_accel_deg_s2"] == 88.0
+
+
+def test_joint_endpoint_execution_uses_preview_speed_and_acceleration(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = False
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.motion_execution_state = "idle"
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    captured: dict[str, float | list[float] | str] = {}
+
+    async def fake_broadcast():
+        return None
+
+    def fake_set_targets(targets, command_label="set_targets", speed_deg_s=None, accel_deg_s2=None):
+        captured["targets"] = list(targets)
+        captured["command_label"] = command_label
+        captured["speed"] = speed_deg_s
+        captured["accel"] = accel_deg_s2
+        main.state.motion_state = MotionState.IDLE
+        main.state.motion_execution_state = "reached"
+        return {"ok": True, "state": main.state.to_dict()}
+
+    async def fake_wait_for_hardware_target(*_args, **_kwargs):
+        return True, "reached"
+
+    monkeypatch.setattr(main, "broadcast_state", fake_broadcast)
+    monkeypatch.setattr(main, "set_targets", fake_set_targets)
+    monkeypatch.setattr(main, "wait_for_hardware_target", fake_wait_for_hardware_target)
+
+    target = [0.0, 35.0, 15.0, 0.0]
+    preview = {
+        "source": "task",
+        "settings": {"global_speed_deg_s": 42.0, "global_accel_deg_s2": 91.0},
+        "trajectory": {"mode": "joint", "waypoints": [config.home_pose.copy(), target], "duration_s": 0.25},
+    }
+
+    asyncio.run(main.execute_joint_endpoint_move(preview))
+
+    assert captured["targets"] == target
+    assert captured["command_label"] == "task_endpoint"
+    assert captured["speed"] == 42.0
+    assert captured["accel"] == 91.0
+
+
 def test_single_waypoint_simulation_trajectory_is_a_successful_noop(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     monkeypatch.setattr(main, "config", config)
@@ -719,6 +996,85 @@ def test_task_preview_carries_program_motion_contract(monkeypatch):
     assert contract["limits"]["limiting_constraint"]["type"] in {"speed", "acceleration", "waypoint_rate"}
 
 
+def test_task_preview_skips_unreachable_first_closed_loop_candidate(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    failed_detection_ids: set[str] = set()
+    successful_detection_ids: list[str] = []
+
+    def fake_build_preview(**kwargs):
+        waypoint_program = kwargs.get("waypoint_program") or []
+        detection_ids = [
+            str(waypoint.get("detection_id"))
+            for waypoint in waypoint_program
+            if isinstance(waypoint, dict) and waypoint.get("detection_id") is not None
+        ]
+        if detection_ids and not failed_detection_ids:
+            failed_detection_ids.add(detection_ids[0])
+            return {
+                "ok": False,
+                "error": "program waypoint 1 has no valid IK solution",
+                "trajectory": {
+                    "errors": ["no valid IK solution"],
+                    "step_results": [
+                        {
+                            "index": 0,
+                            "label": "above pickup",
+                            "status": "invalid",
+                            "errors": ["no valid IK solution"],
+                        }
+                    ],
+                },
+            }
+        successful_detection_ids[:] = sorted(set(detection_ids))
+        return {
+            "ok": True,
+            "preview_id": "preview-after-skip",
+            "preview": {
+                **main.pose_snapshot_fields(),
+                "mode": "program",
+                "source": "task",
+                "settings": kwargs.get("settings") or {},
+                "trajectory": {
+                    "mode": "program",
+                    "duration_s": 0.2,
+                    "waypoints": [config.home_pose.copy()],
+                    "execution_steps": [],
+                },
+                "motion_contract": {},
+                "limit_summary": {},
+            },
+        }
+
+    monkeypatch.setattr(main, "build_preview", fake_build_preview)
+    client = TestClient(main.app)
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": [
+                detection("red", -120.0, 150.0, "r1"),
+                detection("blue", 120.0, 180.0, "b1"),
+            ],
+            "task_settings": {"execution_strategy": "closed_loop", "max_objects": 2},
+        },
+    ).json()
+
+    assert payload["ok"], payload
+    assert len(failed_detection_ids) == 1
+    skipped_id = next(iter(failed_detection_ids))
+    selected_ids = [item["detection_id"] for item in payload["sequence"]["objects"]]
+    assert selected_ids == successful_detection_ids
+    assert skipped_id not in selected_ids
+    assert any(item.get("reason_code") == "ik_unreachable" and item.get("detection_id") == skipped_id for item in payload["task_preview"]["ignored_detections"])
+    assert any(skipped_id in warning for warning in payload["task_preview"]["warnings"])
+
+
 def test_task_preview_binds_detection_pose_model_settings_and_destinations(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     monkeypatch.setattr(main, "config", config)
@@ -754,6 +1110,108 @@ def test_task_preview_binds_detection_pose_model_settings_and_destinations(monke
     assert bindings["model_fingerprint"] == main.robot_model_fingerprint()
     assert bindings["task_settings_revision"]
     assert bindings["destination_revision"] == main.task_mapping_fingerprint()
+
+
+def test_task_preview_accepts_browser_roundtrip_detection_metadata(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    client.post(
+        "/api/simulation/vision/queue",
+        json={"frames": [{"detections": [detection("red", detection_id="r1")]}]},
+    )
+    frame = client.get("/api/vision/frame").json()
+    browser_detections = deepcopy(frame["detections"])
+    browser_detections[0]["timestamp"] = "browser-local-render-time"
+    browser_detections[0]["ui_debug"] = {"row_visible": True}
+
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": browser_detections,
+            "detection_snapshot_id": frame["detection_snapshot_id"],
+            "detection_captured_at": frame["captured_at"],
+            "task_settings": {"execution_strategy": "closed_loop", "max_objects": 1},
+        },
+    ).json()
+
+    assert payload["ok"], payload
+    bindings = payload["task_preview"]["bindings"]
+    assert bindings["detection_snapshot_id"] == frame["detection_snapshot_id"]
+    assert bindings["detection_task_fingerprint"] == frame["detection_task_fingerprint"]
+    assert bindings["detection_fingerprint"] != frame["detection_fingerprint"]
+
+
+def test_task_preview_rejects_same_snapshot_id_with_changed_task_content(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+    client.post(
+        "/api/simulation/vision/queue",
+        json={"frames": [{"detections": [detection("red", detection_id="r1")]}]},
+    )
+    frame = client.get("/api/vision/frame").json()
+    changed_detections = deepcopy(frame["detections"])
+    changed_detections[0]["robot"]["x_mm"] += 50.0
+
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": changed_detections,
+            "detection_snapshot_id": frame["detection_snapshot_id"],
+            "detection_captured_at": frame["captured_at"],
+            "task_settings": {"execution_strategy": "closed_loop", "max_objects": 1},
+        },
+    ).json()
+
+    assert payload["ok"] is False
+    assert "detection snapshot contents do not match" in payload["error"]
+
+
+def test_task_preview_uses_live_destination_mapping_without_explicit_save(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    monkeypatch.setattr(main, "config", config)
+    main.state.simulation = True
+    main.state.connected = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.reported_angles_deg = config.home_pose.copy()
+    main.state.target_angles_deg = config.home_pose.copy()
+    client = TestClient(main.app)
+
+    payload = client.post(
+        "/api/task/preview",
+        json={
+            "task": "color_sorting",
+            "detections": [detection("red", detection_id="r1")],
+            "task_settings": {
+                "execution_strategy": "batch_once",
+                "color_profile_overrides": {
+                    "red": {"enabled": True, "drop_zone": "dropoff_b"},
+                },
+                "task_destination_overrides": {
+                    "schema_version": 1,
+                    "destinations": {
+                        "dropoff_b": {"position_id": "dropoff_b"},
+                    },
+                },
+            },
+        },
+    ).json()
+
+    assert payload["ok"], payload
+    assert payload["sequence"]["objects"][0]["drop_zone"] == "dropoff_b"
 
 
 def test_task_execute_rejects_preview_after_detection_snapshot_changes(monkeypatch):

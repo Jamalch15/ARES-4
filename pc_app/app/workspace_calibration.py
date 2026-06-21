@@ -304,6 +304,28 @@ def make_aruco_detector(
     )
 
 
+def _detector_setting_profiles(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles = [dict(settings)]
+    raw_profiles = settings.get("detector_profiles")
+    if isinstance(raw_profiles, list):
+        for raw_profile in raw_profiles:
+            if isinstance(raw_profile, dict):
+                profiles.append({**settings, **raw_profile})
+    elif bool(settings.get("allow_detector_profile_fallback", True)):
+        profiles.append(
+            {
+                **settings,
+                "adaptive_thresh_window_max_px": 151,
+                "adaptive_thresh_window_step_px": 8,
+                "min_marker_perimeter_rate": 0.02,
+                "min_corner_distance_rate": 0.005,
+                "min_marker_distance_rate": 0.01,
+                "error_correction_rate": 1.0,
+            }
+        )
+    return profiles
+
+
 def _order_quad_points(points: np.ndarray) -> np.ndarray:
     normalized = np.asarray(points, dtype=np.float32).reshape(4, 2)
     sums = normalized.sum(axis=1)
@@ -651,9 +673,29 @@ def _mode_images(gray: np.ndarray, settings: dict[str, Any]) -> list[tuple[str, 
     return [first, second] if allow_fallback else [first]
 
 
+def _candidate_mode_images(
+    gray: np.ndarray,
+    settings: dict[str, Any],
+) -> list[tuple[str, np.ndarray, bool]]:
+    modes = _mode_images(gray, settings)
+    candidates = [(mode, source, False) for mode, source in modes]
+    if bool(settings.get("allow_mirror_fallback", True)):
+        candidates.extend(
+            (f"{mode}+mirror_x", cv2.flip(source, 1), True)
+            for mode, source in modes
+        )
+    return candidates
+
+
+def _restore_mirrored_corners(corners: np.ndarray, image_width: int) -> np.ndarray:
+    restored = np.asarray(corners, dtype=np.float32).reshape(4, 2).copy()
+    restored[:, 0] = float(image_width - 1) - restored[:, 0]
+    return _order_quad_points(restored)
+
+
 def _score_detection(
     ids: np.ndarray | None,
-    rejected: list[np.ndarray],
+    rejected_count: int,
     required_ids: set[int],
     dictionary_index: int,
     mode_index: int,
@@ -665,7 +707,7 @@ def _score_detection(
         len(required_ids.intersection(visible)) if required_ids else len(visible),
         -dictionary_index,
         -mode_index,
-        -len(rejected),
+        -int(rejected_count),
     )
 
 
@@ -683,7 +725,7 @@ def detect_fiducials(image_bgr: np.ndarray, settings: dict[str, Any]) -> Fiducia
         else image_bgr.copy()
     )
     dictionaries = dictionary_candidates(settings)
-    modes = _mode_images(gray, settings)
+    modes = _candidate_mode_images(gray, settings)
     required_ids = _as_int_set(settings.get("required_ids"))
     best: FiducialDetection | None = None
     best_score = (-1, -1, -10_000, -10_000, -10_000)
@@ -691,28 +733,45 @@ def detect_fiducials(image_bgr: np.ndarray, settings: dict[str, Any]) -> Fiducia
     valid_dictionary_seen = False
 
     for dictionary_index, dictionary_name in enumerate(dictionaries):
-        try:
-            detector = make_aruco_detector(dictionary_name, settings)
-        except ValueError as exc:
-            last_error = exc
+        detectors: list[cv2.aruco.ArucoDetector] = []
+        for profile in _detector_setting_profiles(settings):
+            try:
+                detectors.append(make_aruco_detector(dictionary_name, profile))
+            except ValueError as exc:
+                last_error = exc
+                detectors = []
+                break
+        if not detectors:
             continue
         valid_dictionary_seen = True
-        for mode_index, (mode, source) in enumerate(modes):
-            corners, ids, rejected = detector.detectMarkers(source)
-            normalized = []
-            normalized_ids: list[int] = []
-            for marker_corners, marker_id in zip(
-                corners,
-                [] if ids is None else ids.reshape(-1),
-                strict=True,
-            ):
-                normalized_id = int(marker_id)
-                if required_ids and normalized_id not in required_ids:
-                    continue
-                normalized.append(
-                    np.asarray(marker_corners, dtype=np.float32).reshape(4, 2)
-                )
-                normalized_ids.append(normalized_id)
+        for mode_index, (mode, source, mirrored) in enumerate(modes):
+            merged: dict[int, np.ndarray] = {}
+            rejected_count = 0
+            for detector in detectors:
+                corners, ids, rejected = detector.detectMarkers(source)
+                rejected_count += len(rejected)
+                for marker_corners, marker_id in zip(
+                    corners,
+                    [] if ids is None else ids.reshape(-1),
+                    strict=True,
+                ):
+                    normalized_id = int(marker_id)
+                    if normalized_id in merged:
+                        continue
+                    if required_ids and normalized_id not in required_ids:
+                        continue
+                    marker_points = np.asarray(
+                        marker_corners,
+                        dtype=np.float32,
+                    ).reshape(4, 2)
+                    if mirrored:
+                        marker_points = _restore_mirrored_corners(
+                            marker_points,
+                            gray.shape[1],
+                        )
+                    merged[normalized_id] = marker_points
+            normalized_ids = sorted(merged)
+            normalized = [merged[marker_id] for marker_id in normalized_ids]
             filtered_ids = (
                 np.asarray(normalized_ids, dtype=np.int32).reshape(-1, 1)
                 if normalized_ids
@@ -720,7 +779,7 @@ def detect_fiducials(image_bgr: np.ndarray, settings: dict[str, Any]) -> Fiducia
             )
             score = _score_detection(
                 filtered_ids,
-                rejected,
+                rejected_count,
                 required_ids,
                 dictionary_index,
                 mode_index,
@@ -733,7 +792,7 @@ def detect_fiducials(image_bgr: np.ndarray, settings: dict[str, Any]) -> Fiducia
                     dictionary=dictionary_name,
                     mode=mode if normalized_ids else "none",
                     visible_ids=sorted(normalized_ids),
-                    rejected_count=len(rejected),
+                    rejected_count=rejected_count,
                 )
 
     if not valid_dictionary_seen and last_error is not None:
@@ -859,15 +918,8 @@ def marker_box_polygon(
 def workspace_robot_corners_by_tag(settings: dict[str, Any]) -> dict[int, np.ndarray]:
     required_ids = [int(value) for value in settings.get("required_ids", [])]
     tag_centers = settings.get("tag_centers_robot_mm")
-    polygon = settings.get("workspace_polygon_robot_mm")
-    if not required_ids or not isinstance(tag_centers, dict) or not isinstance(polygon, list):
-        return {}
-    try:
-        polygon_points = np.asarray(
-            [[float(point[0]), float(point[1])] for point in polygon],
-            dtype=np.float64,
-        )
-    except (TypeError, ValueError, IndexError):
+    polygon_points = workspace_polygon_robot_points(settings)
+    if not required_ids or not isinstance(tag_centers, dict) or polygon_points is None:
         return {}
     if len(polygon_points) < len(required_ids) or not np.all(np.isfinite(polygon_points)):
         return {}
@@ -889,6 +941,53 @@ def workspace_robot_corners_by_tag(settings: dict[str, Any]) -> dict[int, np.nda
         used_polygon_indices.add(polygon_index)
         result[marker_id] = polygon_points[polygon_index]
     return result
+
+
+def workspace_margin_mm(settings: dict[str, Any]) -> float:
+    try:
+        margin = float(settings.get("workspace_margin_mm", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(margin):
+        return 0.0
+    return max(0.0, margin)
+
+
+def workspace_polygon_robot_points(
+    settings: dict[str, Any],
+    *,
+    include_margin: bool = False,
+) -> np.ndarray | None:
+    polygon = settings.get("workspace_polygon_robot_mm")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return None
+    try:
+        points = np.asarray(
+            [[float(point[0]), float(point[1])] for point in polygon],
+            dtype=np.float64,
+        )
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not np.all(np.isfinite(points)):
+        return None
+
+    margin = workspace_margin_mm(settings) if include_margin else 0.0
+    if margin <= 0:
+        return points
+
+    min_x = float(np.min(points[:, 0])) - margin
+    max_x = float(np.max(points[:, 0])) + margin
+    min_y = float(np.min(points[:, 1])) - margin
+    max_y = float(np.max(points[:, 1])) + margin
+    return np.asarray(
+        [
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+        ],
+        dtype=np.float64,
+    )
 
 
 def _point_list_from_mapping(
@@ -1129,14 +1228,8 @@ def polygon_from_robot(
     homography_image_to_robot: np.ndarray,
     settings: dict[str, Any],
 ) -> np.ndarray | None:
-    polygon = settings.get("workspace_polygon_robot_mm")
-    if not isinstance(polygon, list) or len(polygon) < 3:
-        return None
-    try:
-        robot_points = np.asarray([[float(point[0]), float(point[1])] for point in polygon], dtype=np.float64)
-    except (TypeError, ValueError, IndexError):
-        return None
-    if not np.all(np.isfinite(robot_points)):
+    robot_points = workspace_polygon_robot_points(settings, include_margin=True)
+    if robot_points is None:
         return None
     robot_to_image = np.linalg.inv(homography_image_to_robot)
     image_points = cv2.perspectiveTransform(robot_points.reshape(-1, 1, 2), robot_to_image).reshape(-1, 2)

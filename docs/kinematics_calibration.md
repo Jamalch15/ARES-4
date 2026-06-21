@@ -131,8 +131,29 @@ the robot.
 
 Supported models:
 
+- `radial_reach_z_offset`;
 - `constant_xyz`;
 - `affine_xy_z_offset`.
+
+Use `radial_reach_z_offset` first when the observed error is mostly:
+
+- a constant height bias;
+- a constant reach bias, where reach means radial distance from the robot base
+  to the TCP in the X/Y plane.
+
+This model preserves the target angle around the base and only changes XY
+radius plus Z. It is easier to reason about than an affine XY correction and
+does not hide angular, camera-skew, or workspace-scale errors. Use
+`affine_xy_z_offset` only after measurements show the residual is not explained
+by constant reach and Z offsets.
+
+The reach/Z model can be entered manually in the Settings TCP calibration
+panel. Enter offsets as measured-minus-commanded error: positive reach means
+the TCP lands farther from the base than requested, and positive Z means it
+lands higher. Manual offsets still use the same command-correction path and
+stale signature checks as fitted profiles, but they do not require fit or
+validation samples. Treat them as operator-entered compensation, not proof that
+the model is physically correct.
 
 Validation trials can use a fitted correction at conservative speed without
 globally enabling it. Normal Cartesian paths use correction only when:
@@ -140,8 +161,10 @@ globally enabling it. Normal Cartesian paths use correction only when:
 - global and tool-profile enable flags are set;
 - tool/TCP, model, actuator, workspace, and measurement-reference signatures
   are fresh;
-- at least two held-out corrected landing samples pass;
+- at least two held-out corrected landing samples pass for fitted profiles;
 - correction magnitude is below configured limits;
+- radial samples are far enough from the base axis when fitting reach
+  correction;
 - affine sample coverage is adequate.
 
 Joint-space commands and live Cartesian velocity jogging remain uncorrected.

@@ -18,6 +18,7 @@ from .workspace_calibration import (
     polygon_from_robot,
     saved_homography,
     solve_image_to_robot_homography,
+    workspace_margin_mm,
 )
 
 
@@ -138,15 +139,137 @@ class CameraCapture:
             self._signature = None
 
 
-def detect_color_blob(image_bgr: np.ndarray, profile: dict[str, Any]) -> dict[str, Any]:
+def _clamped_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        numeric = int(round(float(value)))
+    except (TypeError, ValueError):
+        numeric = default
+    return max(minimum, min(maximum, numeric))
+
+
+def _hsv_triplet(raw: Any, default: list[int]) -> np.ndarray:
+    values = raw if isinstance(raw, (list, tuple)) else default
+    if len(values) < 3:
+        values = default
+    return np.asarray(
+        [
+            _clamped_int(values[0], default[0], 0, 179),
+            _clamped_int(values[1], default[1], 0, 255),
+            _clamped_int(values[2], default[2], 0, 255),
+        ],
+        dtype=np.uint8,
+    )
+
+
+def _normalize_hsv_range(raw: Any) -> tuple[np.ndarray, np.ndarray] | None:
+    lower_raw: Any | None = None
+    upper_raw: Any | None = None
+    if isinstance(raw, dict):
+        lower_raw = raw.get("hsv_min", raw.get("min", raw.get("lower")))
+        upper_raw = raw.get("hsv_max", raw.get("max", raw.get("upper")))
+    elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        lower_raw = raw[0]
+        upper_raw = raw[1]
+    if lower_raw is None or upper_raw is None:
+        return None
+    return (
+        _hsv_triplet(lower_raw, [0, 0, 0]),
+        _hsv_triplet(upper_raw, [179, 255, 255]),
+    )
+
+
+def _profile_hsv_ranges(label: str, profile: dict[str, Any]) -> list[tuple[np.ndarray, np.ndarray]]:
+    ranges: list[tuple[np.ndarray, np.ndarray]] = []
+    configured_ranges = profile.get("hsv_ranges")
+    if isinstance(configured_ranges, list):
+        for raw_range in configured_ranges:
+            normalized = _normalize_hsv_range(raw_range)
+            if normalized is not None:
+                ranges.append(normalized)
+
+    if not ranges:
+        lower = _hsv_triplet(profile.get("hsv_min"), [0, 0, 0])
+        upper = _hsv_triplet(profile.get("hsv_max"), [179, 255, 255])
+        ranges.append((lower, upper))
+        label_name = label.lower()
+        low_hue = int(lower[0])
+        high_hue = int(upper[0])
+        if (
+            label_name == "red"
+            and bool(profile.get("red_wraparound", True))
+            and low_hue <= high_hue <= 24
+        ):
+            wrap_lower = lower.copy()
+            wrap_upper = upper.copy()
+            span = max(8, high_hue - low_hue)
+            wrap_lower[0] = max(0, min(179, 180 - span))
+            wrap_upper[0] = 179
+            ranges.append((wrap_lower, wrap_upper))
+    return ranges
+
+
+def _hsv_range_mask(hsv: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    low_hue = int(lower[0])
+    high_hue = int(upper[0])
+    if low_hue <= high_hue:
+        return cv2.inRange(hsv, lower, upper)
+
+    lower_high = lower.copy()
+    upper_high = upper.copy()
+    upper_high[0] = 179
+    lower_low = lower.copy()
+    upper_low = upper.copy()
+    lower_low[0] = 0
+    return cv2.bitwise_or(
+        cv2.inRange(hsv, lower_high, upper_high),
+        cv2.inRange(hsv, lower_low, upper_low),
+    )
+
+
+def _profile_hsv_mask(hsv: np.ndarray, label: str, profile: dict[str, Any]) -> np.ndarray:
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in _profile_hsv_ranges(label, profile):
+        mask = cv2.bitwise_or(mask, _hsv_range_mask(hsv, lower, upper))
+    return mask
+
+
+def _morph_kernel_size(settings: dict[str, Any] | None, default: int = 5) -> int:
+    settings = settings or {}
+    kernel_size = max(1, int(settings.get("morph_kernel_px", default)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    return kernel_size
+
+
+def _clean_detection_mask(
+    mask: np.ndarray,
+    workspace_mask: np.ndarray | None = None,
+    kernel_size: int = 5,
+) -> np.ndarray:
+    if workspace_mask is not None:
+        mask = cv2.bitwise_and(mask, workspace_mask)
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if workspace_mask is not None:
+        mask = cv2.bitwise_and(mask, workspace_mask)
+    return mask
+
+
+def detect_color_blob(
+    image_bgr: np.ndarray,
+    profile: dict[str, Any],
+    label: str | None = None,
+) -> dict[str, Any]:
     """Compatibility helper for one configured HSV profile."""
 
-    hsv_min = np.array(profile.get("hsv_min", [0, 0, 0]), dtype=np.uint8)
-    hsv_max = np.array(profile.get("hsv_max", [179, 255, 255]), dtype=np.uint8)
     min_area = float(profile.get("min_area_px", 200.0))
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, hsv_min, hsv_max)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    mask = _profile_hsv_mask(hsv, str(label or profile.get("label", "object")), profile)
+    mask = _clean_detection_mask(
+        mask,
+        kernel_size=_morph_kernel_size(profile),
+    )
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return {"ok": False, "reason": "no contour", "area_px": 0.0}
@@ -296,7 +419,7 @@ def detect_configured_colors(
     for name, profile in profiles.items():
         if not bool(profile.get("enabled", True)):
             continue
-        result = detect_color_blob(image_bgr, profile)
+        result = detect_color_blob(image_bgr, profile, name)
         if not result.get("ok"):
             detections.append(
                 {
@@ -347,12 +470,14 @@ def workspace_aruco_settings(camera: dict[str, Any]) -> dict[str, Any]:
         "required_ids": [0, 1, 2, 3],
         "invert_first": True,
         "allow_normal_fallback": True,
+        "allow_mirror_fallback": True,
         "tag_centers_robot_mm": {},
         "tag_box_corner_index": {"0": 0, "1": 1, "2": 3, "3": 2},
         "reference_points_px": {},
         "reference_workspace_corners_px": {},
         "reference_resolution": {"width": 640, "height": 480},
         "workspace_polygon_robot_mm": [],
+        "workspace_margin_mm": 0.0,
         "projection_polygon_robot_mm": [],
         "projection_mode": "workplate",
         "projection_padding_mm": 0.0,
@@ -366,6 +491,7 @@ def workspace_aruco_settings(camera: dict[str, Any]) -> dict[str, Any]:
         "max_calibration_tag_center_error_mm": 12.0,
         "max_verification_rmse_mm": 5.0,
         "max_verification_error_mm": 10.0,
+        "reference_decode_max_hamming": 2,
     }
     defaults.update(raw)
     return defaults
@@ -374,7 +500,14 @@ def workspace_aruco_settings(camera: dict[str, Any]) -> dict[str, Any]:
 def _classify_color(hsv_pixels: np.ndarray) -> str:
     if hsv_pixels.size == 0:
         return "unknown"
-    hue = float(np.median(hsv_pixels[:, 0]))
+    hue_values = hsv_pixels[:, 0].astype(np.float64)
+    hue_angles = hue_values * (2.0 * np.pi / 180.0)
+    mean_sin = float(np.mean(np.sin(hue_angles)))
+    mean_cos = float(np.mean(np.cos(hue_angles)))
+    if abs(mean_sin) < 1e-9 and abs(mean_cos) < 1e-9:
+        hue = float(np.median(hue_values))
+    else:
+        hue = float((np.arctan2(mean_sin, mean_cos) % (2.0 * np.pi)) * 180.0 / (2.0 * np.pi))
     saturation = float(np.median(hsv_pixels[:, 1]))
     value = float(np.median(hsv_pixels[:, 2]))
     if value < 50:
@@ -418,7 +551,11 @@ def _workspace_robot_polygon(settings: dict[str, Any]) -> np.ndarray | None:
         return None
     if not np.all(np.isfinite(points)):
         return None
-    padding = max(0.0, float(settings.get("projection_padding_mm", 0.0)))
+    padding = max(
+        0.0,
+        float(settings.get("projection_padding_mm", 0.0)),
+        workspace_margin_mm(settings),
+    )
     if padding > 0:
         min_x = float(np.min(points[:, 0])) - padding
         max_x = float(np.max(points[:, 0])) + padding
@@ -512,37 +649,15 @@ def _workspace_projection_texture(
     }
 
 
-def _workspace_color_candidates(
-    image_bgr: np.ndarray,
-    workspace_polygon_px: np.ndarray | None,
-    settings: dict[str, Any],
-) -> tuple[list[dict[str, Any]], np.ndarray]:
-    blurred = cv2.GaussianBlur(image_bgr, (5, 5), 0)
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    lower = np.array(
-        [0, int(settings.get("min_saturation", 60)), int(settings.get("min_value", 50))],
-        dtype=np.uint8,
-    )
-    upper = np.array([179, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-    workspace_only = bool(settings.get("workspace_only", True))
-    polygon_mask = _workspace_mask(image_bgr.shape[:2], workspace_polygon_px)
-    if polygon_mask is not None:
-        mask = cv2.bitwise_and(mask, polygon_mask)
-    elif workspace_only:
-        return [], np.zeros(image_bgr.shape[:2], dtype=np.uint8)
-
-    kernel_size = max(1, int(settings.get("morph_kernel_px", 5)))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    if polygon_mask is not None:
-        mask = cv2.bitwise_and(mask, polygon_mask)
-
+def _color_contour_candidates(
+    hsv: np.ndarray,
+    mask: np.ndarray,
+    *,
+    label: str | None,
+    minimum_area: float,
+    profile_name: str | None = None,
+) -> list[dict[str, Any]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    minimum_area = max(1.0, float(settings.get("min_object_area_px", 400.0)))
     candidates: list[dict[str, Any]] = []
     for contour in contours:
         area = float(cv2.contourArea(contour))
@@ -556,17 +671,114 @@ def _workspace_color_candidates(
         x, y, width, height = cv2.boundingRect(contour)
         object_mask = np.zeros(mask.shape, dtype=np.uint8)
         cv2.drawContours(object_mask, [contour], -1, 255, -1)
-        candidates.append(
-            {
-                "label": _classify_color(hsv[object_mask == 255]),
-                "center_px": (center_x, center_y),
-                "bbox_px": (int(x), int(y), int(width), int(height)),
-                "area_px": area,
-                "confidence": min(1.0, area / (minimum_area * 4.0)),
-            }
+        hsv_pixels = hsv[object_mask == 255]
+        bbox_area = max(1.0, float(width * height))
+        fill_ratio = max(0.0, min(1.0, area / bbox_area))
+        saturation_score = (
+            float(np.median(hsv_pixels[:, 1])) / 255.0
+            if hsv_pixels.size
+            else 0.0
         )
+        value_score = (
+            float(np.median(hsv_pixels[:, 2])) / 255.0
+            if hsv_pixels.size
+            else 0.0
+        )
+        area_score = min(1.0, area / (minimum_area * 4.0))
+        confidence = min(
+            1.0,
+            max(
+                area_score,
+                0.45 * area_score
+                + 0.25 * fill_ratio
+                + 0.20 * saturation_score
+                + 0.10 * value_score,
+            ),
+        )
+        candidate: dict[str, Any] = {
+            "label": label or _classify_color(hsv_pixels),
+            "center_px": (center_x, center_y),
+            "bbox_px": (int(x), int(y), int(width), int(height)),
+            "area_px": area,
+            "confidence": confidence,
+        }
+        if profile_name is not None:
+            candidate["profile_name"] = profile_name
+        candidates.append(candidate)
+    return candidates
+
+
+def _workspace_color_candidates(
+    image_bgr: np.ndarray,
+    workspace_polygon_px: np.ndarray | None,
+    settings: dict[str, Any],
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    profiles = profiles or {}
+    blurred = cv2.GaussianBlur(image_bgr, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    lower = np.array(
+        [
+            0,
+            _clamped_int(settings.get("min_saturation", 60), 60, 0, 255),
+            _clamped_int(settings.get("min_value", 50), 50, 0, 255),
+        ],
+        dtype=np.uint8,
+    )
+    upper = np.array([179, 255, 255], dtype=np.uint8)
+    workspace_only = bool(settings.get("workspace_only", True))
+    polygon_mask = _workspace_mask(image_bgr.shape[:2], workspace_polygon_px)
+    if polygon_mask is None and workspace_only:
+        return [], np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    kernel_size = _morph_kernel_size(settings)
+    minimum_area = max(1.0, float(settings.get("min_object_area_px", 400.0)))
+    candidates: list[dict[str, Any]] = []
+    profile_mask_union = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+    output_mask = np.zeros(image_bgr.shape[:2], dtype=np.uint8)
+
+    for name, profile in profiles.items():
+        if not bool(profile.get("enabled", True)):
+            continue
+        profile_mask = _profile_hsv_mask(hsv, name, profile)
+        profile_mask = _clean_detection_mask(profile_mask, polygon_mask, kernel_size)
+        if cv2.countNonZero(profile_mask) == 0:
+            continue
+        profile_mask_union = cv2.bitwise_or(profile_mask_union, profile_mask)
+        output_mask = cv2.bitwise_or(output_mask, profile_mask)
+        profile_minimum = max(
+            1.0,
+            float(profile.get("min_area_px", minimum_area)),
+        )
+        candidates.extend(
+            _color_contour_candidates(
+                hsv,
+                profile_mask,
+                label=name,
+                minimum_area=profile_minimum,
+                profile_name=name,
+            )
+        )
+
+    show_unconfigured = bool(settings.get("show_unconfigured_colors", True))
+    if show_unconfigured:
+        broad_mask = cv2.inRange(hsv, lower, upper)
+        broad_mask = _clean_detection_mask(broad_mask, polygon_mask, kernel_size)
+        if cv2.countNonZero(profile_mask_union) > 0:
+            broad_mask = cv2.bitwise_and(broad_mask, cv2.bitwise_not(profile_mask_union))
+        if cv2.countNonZero(broad_mask) > 0:
+            output_mask = cv2.bitwise_or(output_mask, broad_mask)
+            candidates.extend(
+                _color_contour_candidates(
+                    hsv,
+                    broad_mask,
+                    label=None,
+                    minimum_area=minimum_area,
+                )
+            )
+
     candidates.sort(key=lambda item: (item["center_px"][0], item["center_px"][1]))
-    return candidates, mask
+    return candidates, output_mask
 
 
 @dataclass
@@ -672,6 +884,7 @@ class VisionPipeline:
             repr(settings.get("reference_points_px", {})),
             repr(settings.get("reference_workspace_corners_px", {})),
             repr(settings.get("workspace_polygon_robot_mm", [])),
+            repr(settings.get("workspace_margin_mm", 0.0)),
         )
 
     def configure(self, camera: dict[str, Any]) -> None:
@@ -785,12 +998,18 @@ class VisionPipeline:
                 image_bgr,
                 workspace.polygon_px,
                 detection_settings,
+                selected_profiles,
             )
             detections = []
             show_unconfigured = bool(detection_settings.get("show_unconfigured_colors", True))
             for index, candidate in enumerate(candidates, start=1):
                 label = str(candidate["label"])
-                profile = selected_profiles.get(label)
+                profile_name = candidate.get("profile_name")
+                profile = (
+                    selected_profiles.get(str(profile_name))
+                    if profile_name is not None
+                    else selected_profiles.get(label)
+                )
                 if profile is None and not show_unconfigured:
                     continue
                 if profile is not None and profile.get("enabled", True) is False:

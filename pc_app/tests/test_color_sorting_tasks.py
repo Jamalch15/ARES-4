@@ -52,8 +52,9 @@ def test_color_sorting_defaults_prefer_downward_orientation():
     settings = normalize_color_sorting_settings(config)
 
     assert settings["orientation_policy"] == "prefer_downward"
-    assert settings["pickup_preferred_phi_deg"] == -90.0
-    assert settings["drop_preferred_phi_deg"] == -90.0
+    assert settings["pickup_preferred_phi_deg"] == -100.0
+    assert settings["drop_preferred_phi_deg"] == -100.0
+    assert settings["cycle_confirmation"] == "automatic"
 
 
 def test_filtering_reports_structured_ignored_reasons():
@@ -187,9 +188,9 @@ def test_prefer_downward_targets_use_auto_phi_with_preference():
     assert plan["ok"]
     obj = plan["objects"][0]
     assert obj["object_target"]["phi_auto"] is True
-    assert obj["object_target"]["preferred_phi_deg"] == -90.0
+    assert obj["object_target"]["preferred_phi_deg"] == -100.0
     assert obj["drop_target"]["phi_auto"] is True
-    assert obj["drop_target"]["preferred_phi_deg"] == -90.0
+    assert obj["drop_target"]["preferred_phi_deg"] == -100.0
 
 
 def test_missing_drop_zone_errors_only_for_detected_relevant_color():

@@ -27,10 +27,19 @@ Each robot task may define:
 The current implementation uses a preview-first operator flow:
 
 1. Capture and inspect a detection snapshot.
-2. Select detections, or leave the selection empty to use all eligible detections.
+2. Inspect the detections; all eligible detections are included automatically.
 3. Resolve destinations only for the relevant detections in that snapshot.
 4. Preview the complete generated sequence.
 5. Execute the exact bound preview.
+
+The current operator UI uses every eligible detection automatically. Color
+destination changes apply to the next preview immediately and are persisted in
+the background; there is no separate task-mapping save step.
+
+Two execution behaviors are available:
+
+- automatic continuation after each completed object;
+- operator confirmation between objects, before the next object or recapture.
 
 The preview is bound to the detection snapshot, robot pose, robot
 configuration/model, task settings, and destination mappings. Any of those

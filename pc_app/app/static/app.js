@@ -68,6 +68,7 @@ const state = {
   settingsDirtyScopes: new Set(),
   taskPreviewId: null,
   taskPreviewCreatedAt: null,
+  taskPreviewPending: false,
   taskLocalStatusAt: 0,
   lastTaskPreview: null,
   selectedDetectionIds: new Set(),
@@ -80,6 +81,8 @@ const state = {
   taskColorProfilesDraft: null,
   taskDestinationsDraft: null,
   unsavedColorProfiles: new Set(),
+  taskMappingSaveTimer: null,
+  taskMappingSavePromise: null,
   positionLibraryDraft: null,
   positionLibraryErrors: {},
   positionLibrarySaving: false,
@@ -315,6 +318,7 @@ const elements = {
   taskStepPanels: document.querySelectorAll("[data-task-panel]"),
   taskSetupChecklist: $("#taskSetupChecklist"),
   executionStrategySelect: $("#executionStrategySelect"),
+  cycleConfirmationSelect: $("#cycleConfirmationSelect"),
   objectSelectionPolicySelect: $("#objectSelectionPolicySelect"),
   maxObjectsInput: $("#maxObjectsInput"),
   minConfidenceInput: $("#minConfidenceInput"),
@@ -339,6 +343,7 @@ const elements = {
   toolSettleInput: $("#toolSettleInput"),
   objectProfilesInput: $("#objectProfilesInput"),
   previewTaskBtn: $("#previewTaskBtn"),
+  taskPreviewFeedback: $("#taskPreviewFeedback"),
   executeTaskBtn: $("#executeTaskBtn"),
   taskStopBtn: $("#taskStopBtn"),
   taskStatus: $("#taskStatus"),
@@ -363,6 +368,8 @@ const elements = {
   geometryPresetEditor: $("#geometryPresetEditor"),
   modelTruthSummary: $("#modelTruthSummary"),
   toolCalibration: $("#toolCalibration"),
+  toolValidationStatus: $("#toolValidationStatus"),
+  toolValidationBtn: $("#toolValidationBtn"),
   encoderCalibration: $("#encoderCalibration"),
   workspaceCalibrationStatus: $("#workspaceCalibrationStatus"),
   cameraEnabledInput: $("#cameraEnabledInput"),
@@ -373,6 +380,7 @@ const elements = {
   workspaceArucoEnabledInput: $("#workspaceArucoEnabledInput"),
   workspaceArucoInvertInput: $("#workspaceArucoInvertInput"),
   workspaceArucoFallbackInput: $("#workspaceArucoFallbackInput"),
+  workspaceMarginInput: $("#workspaceMarginInput"),
   cameraFxInput: $("#cameraFxInput"),
   cameraFyInput: $("#cameraFyInput"),
   cameraCxInput: $("#cameraCxInput"),
@@ -418,8 +426,11 @@ const elements = {
   tcpCalFitPhysicalBtn: $("#tcpCalFitPhysicalBtn"),
   tcpCalApplyPhysicalBtn: $("#tcpCalApplyPhysicalBtn"),
   tcpCalibrationPhysicalMetrics: $("#tcpCalibrationPhysicalMetrics"),
+  tcpCalManualReachOffsetInput: $("#tcpCalManualReachOffsetInput"),
+  tcpCalManualZOffsetInput: $("#tcpCalManualZOffsetInput"),
   tcpCalModelSelect: $("#tcpCalModelSelect"),
   tcpCalEnableInput: $("#tcpCalEnableInput"),
+  tcpCalSaveManualOffsetsBtn: $("#tcpCalSaveManualOffsetsBtn"),
   tcpCalFitBtn: $("#tcpCalFitBtn"),
   tcpCalApplyEnableBtn: $("#tcpCalApplyEnableBtn"),
   tcpCalibrationMetrics: $("#tcpCalibrationMetrics"),
@@ -700,7 +711,9 @@ function updateSettingsSaveBar(options = {}) {
 
 function markSettingsDirty(scope, detail = null) {
   state.settingsDirtyScopes.add(scope);
-  if (["motion", "geometry", "tooling", "hardware", "camera"].includes(scope)) {
+  if (scope === "motion") {
+    invalidateTaskPreview("Motion settings changed - preview again");
+  } else if (["geometry", "tooling", "hardware", "camera"].includes(scope)) {
     invalidateTaskDetections(`${scope} settings changed - refresh detections`);
   }
   updateSettingsSaveBar({
@@ -1409,6 +1422,31 @@ function renderToolSelectOptions(activeOverride = null) {
   elements.toolSelect.value = active;
 }
 
+function activeToolDimensionsValidated() {
+  const tools = state.config?.tools || {};
+  const active = tools.active || state.robotState?.active_tool || "gripper";
+  const preset = tools.presets?.[active] || {};
+  if (Object.prototype.hasOwnProperty.call(preset, "dimensions_validated")) {
+    return Boolean(preset.dimensions_validated);
+  }
+  return Boolean(state.config?.calibration?.tool_dimensions_validated);
+}
+
+function renderToolValidationStatus() {
+  if (!elements.toolValidationStatus || !elements.toolValidationBtn) return;
+  const active = state.config?.tools?.active || state.robotState?.active_tool || "active tool";
+  const validated = activeToolDimensionsValidated();
+  elements.toolValidationStatus.textContent = validated
+    ? `${active} TCP dimensions are physically validated.`
+    : `${active} TCP dimensions are not physically validated.`;
+  elements.toolValidationStatus.classList.toggle("ready", validated);
+  elements.toolValidationStatus.classList.toggle("warning", !validated);
+  elements.toolValidationBtn.textContent = validated
+    ? "Clear validation"
+    : "Mark measured and verified";
+  elements.toolValidationBtn.dataset.validated = validated ? "true" : "false";
+}
+
 function renderToolEditor() {
   if (!elements.toolCalibration || !state.config) return;
   const tools = state.config.tools || { active: "gripper", presets: {} };
@@ -1461,6 +1499,27 @@ function renderToolEditor() {
       `;
     })
     .join("");
+  renderToolValidationStatus();
+}
+
+async function setActiveToolDimensionsValidation() {
+  const currentlyValidated = elements.toolValidationBtn?.dataset.validated === "true";
+  elements.toolValidationBtn.disabled = true;
+  try {
+    if (!currentlyValidated && state.settingsDirtyScopes.has("tooling")) {
+      const saved = await saveCalibration();
+      if (!saved.ok) return;
+    }
+    const payload = await postJson("/api/tools/validation", {
+      validated: !currentlyValidated,
+    });
+    if (payload.ok && payload.config) applyConfig(payload.config);
+    if (payload.state) renderState(payload.state);
+    if (!payload.ok) showLocalError(payload.error || "Tool validation could not be updated.");
+  } finally {
+    elements.toolValidationBtn.disabled = false;
+    renderToolValidationStatus();
+  }
 }
 
 function readToolsPayload() {
@@ -1674,8 +1733,19 @@ function invalidateTaskPreview(reason = "") {
   state.taskLocalStatusAt = Date.now() / 1000;
   if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = true;
   if (elements.taskStatus && reason) elements.taskStatus.textContent = reason;
+  if (elements.taskSummary) elements.taskSummary.innerHTML = "";
   if (elements.taskPlanPreview) elements.taskPlanPreview.innerHTML = "";
+  if (elements.taskPreviewFeedback && reason && !state.taskPreviewPending) {
+    elements.taskPreviewFeedback.className = "task-preview-feedback";
+    elements.taskPreviewFeedback.textContent = reason;
+  }
   state.view?.setTaskPreview?.(null);
+}
+
+function setTaskPreviewFeedback(mode, message) {
+  if (!elements.taskPreviewFeedback) return;
+  elements.taskPreviewFeedback.className = `task-preview-feedback ${mode || ""}`.trim();
+  elements.taskPreviewFeedback.textContent = message;
 }
 
 function invalidateTaskDetections(reason = "Refresh detections before planning") {
@@ -1797,9 +1867,6 @@ function ensureDetectedColorDrafts(detections = state.latestDetections, options 
     changed = true;
   });
   if (changed) {
-    if (options.markDirty) {
-      markSettingsDirty("task_destinations", "Detected new colors. Assign Position Library records and save before running.");
-    }
     renderColorPresetMapping();
   }
   return changed;
@@ -1813,16 +1880,18 @@ function colorProfileOverridesPayload() {
       {
         enabled: profile.enabled !== false,
         drop_zone: profile.drop_zone || "",
-        draft: Boolean(profile.draft || state.unsavedColorProfiles.has(name)),
       },
     ])
   );
 }
 
 function taskDraftBlocksRun() {
-  if (taskDestinationDraftChanged()) return true;
   const zones = availableTaskDestinations();
-  return Object.entries(taskColorProfiles()).some(([, profile]) => {
+  const relevantColors = new Set(
+    state.latestDetections.map(detectionColor).filter(Boolean)
+  );
+  return Object.entries(taskColorProfiles()).some(([color, profile]) => {
+    if (!relevantColors.has(color)) return false;
     if (profile.enabled === false) return false;
     return !profile.drop_zone || !zones[profile.drop_zone];
   });
@@ -1852,6 +1921,7 @@ function objectProfilesPayload() {
 function taskSettingsPayload() {
   return {
     execution_strategy: elements.executionStrategySelect?.value || "closed_loop",
+    cycle_confirmation: elements.cycleConfirmationSelect?.value || "automatic",
     max_objects: readRequiredNumber(elements.maxObjectsInput, "Max objects", { min: 1, integer: true }),
     filters: {
       min_confidence: readRequiredNumber(elements.minConfidenceInput, "Min confidence", { min: 0, max: 1 }),
@@ -1860,23 +1930,20 @@ function taskSettingsPayload() {
       require_robot_coordinates: true,
     },
     ordering: {
-      policy: elements.objectSelectionPolicySelect?.value || "nearest_to_safe",
-      color_priority: (elements.colorPriorityInput?.value || "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean),
+      policy: "nearest_to_safe",
+      color_priority: [],
     },
     missing_drop_zone_policy: elements.missingDropzonePolicySelect?.value || "error",
     unknown_color_policy: elements.unknownColorPolicySelect?.value || "ignore",
-    placement_policy: elements.placementPolicySelect?.value || "fixed",
+    placement_policy: "fixed",
     pickup_z_mm: readRequiredNumber(elements.pickupZInput, "Pickup Z", { min: 0 }),
     dropoff_z_mm: readRequiredNumber(elements.dropoffZInput, "Dropoff Z", { min: 0 }),
     approach_clearance_mm: readRequiredNumber(elements.approachClearanceInput, "Pickup clearance", { min: 0 }),
     drop_approach_clearance_mm: readRequiredNumber(elements.dropApproachClearanceInput, "Drop clearance", { min: 0 }),
     orientation_policy: elements.orientationPolicySelect?.value || "prefer_downward",
-    downward_phi_deg: -90,
-    pickup_preferred_phi_deg: -90,
-    drop_preferred_phi_deg: -90,
+    downward_phi_deg: -100,
+    pickup_preferred_phi_deg: -100,
+    drop_preferred_phi_deg: -100,
     pickup_phi_deg: readRequiredNumber(elements.pickupPhiInput, "Pickup phi"),
     drop_phi_deg: readRequiredNumber(elements.dropPhiInput, "Drop phi"),
     motion_modes: {
@@ -1889,10 +1956,23 @@ function taskSettingsPayload() {
     },
     capture_settle_ms: readRequiredNumber(elements.captureSettleInput, "Capture settle", { min: 0, integer: true }),
     tool_settle_ms: readRequiredNumber(elements.toolSettleInput, "Tool settle", { min: 0, integer: true }),
-    object_profiles: objectProfilesPayload(),
+    object_profiles: {},
     color_profile_overrides: colorProfileOverridesPayload(),
-    _has_unsaved_color_profiles: taskDraftBlocksRun(),
+    task_destination_overrides: {
+      schema_version: 1,
+      destinations: taskDestinationsForSave(),
+    },
+    _has_unsaved_color_profiles: false,
   };
+}
+
+function syncTaskOrientationControls() {
+  const fixed = elements.orientationPolicySelect?.value === "fixed";
+  document.querySelectorAll("[data-fixed-phi-field]").forEach((label) => {
+    label.hidden = !fixed;
+    const input = label.querySelector("input");
+    if (input) input.disabled = !fixed;
+  });
 }
 
 function applyTaskSettingsControls() {
@@ -1905,13 +1985,14 @@ function applyTaskSettingsControls() {
     element.value = String(value);
   };
   setValue(elements.executionStrategySelect, defaults.execution_strategy || "closed_loop");
-  setValue(elements.objectSelectionPolicySelect, ordering.policy || "nearest_to_safe");
+  setValue(elements.cycleConfirmationSelect, defaults.cycle_confirmation || "automatic");
+  setValue(elements.objectSelectionPolicySelect, "nearest_to_safe");
   setValue(elements.maxObjectsInput, defaults.max_objects ?? 10);
   setValue(elements.minConfidenceInput, filters.min_confidence ?? 0);
-  setValue(elements.colorPriorityInput, (ordering.color_priority || []).join(", "));
+  setValue(elements.colorPriorityInput, "");
   setValue(elements.missingDropzonePolicySelect, defaults.missing_drop_zone_policy || "error");
   setValue(elements.unknownColorPolicySelect, defaults.unknown_color_policy || "ignore");
-  setValue(elements.placementPolicySelect, defaults.placement_policy || "fixed");
+  setValue(elements.placementPolicySelect, "fixed");
   setValue(elements.pickupZInput, defaults.pickup_z_mm ?? 25);
   setValue(elements.dropoffZInput, defaults.dropoff_z_mm ?? 45);
   setValue(elements.approachClearanceInput, defaults.approach_clearance_mm ?? 55);
@@ -1926,11 +2007,9 @@ function applyTaskSettingsControls() {
   setValue(elements.captureSettleInput, defaults.capture_settle_ms ?? 250);
   setValue(elements.toolSettleInput, defaults.tool_settle_ms ?? 150);
   if (elements.objectProfilesInput) {
-    const objectProfiles = defaults.object_profiles || {};
-    elements.objectProfilesInput.value = Object.keys(objectProfiles).length
-      ? JSON.stringify(objectProfiles, null, 2)
-      : "";
+    elements.objectProfilesInput.value = "";
   }
+  syncTaskOrientationControls();
 }
 
 function renderSetupChecklist() {
@@ -1951,7 +2030,15 @@ function renderSetupChecklist() {
     ["Config sync", Boolean(robot.simulation || robot.config_sync_status === "synced"), robot.simulation ? "simulation" : robot.config_sync_status || "unknown"],
     ["Active tool", Boolean(robot.active_tool), `${robot.active_tool || "-"} / ${robot.tool_type || "-"}`],
     ["Camera", Boolean(camera.enabled), camera.enabled ? `enabled index ${camera.source_index}` : "disabled"],
-    ["Tool/TCP dimensions", Boolean(calibration.tool_dimensions_validated), calibration.tool_dimensions_validated ? "validated" : "not validated"],
+    [
+      "Tool/TCP dimensions",
+      activeToolDimensionsValidated() || Boolean(robot.simulation),
+      activeToolDimensionsValidated()
+        ? "physically validated"
+        : robot.simulation
+          ? "not physically validated; simulation can continue"
+          : "not physically validated",
+    ],
     ["Safe pose", !state.config?.validation?.named_position_errors?.safe, state.config?.validation?.named_position_errors?.safe?.join("; ") || "valid"],
     ["Task destinations", missingZones.length === 0, missingZones.length ? `missing ${missingZones.join(", ")}` : `${Object.keys(zones).length} configured`],
   ];
@@ -1964,13 +2051,10 @@ function renderSetupChecklist() {
 }
 
 function colorStatusBadge(color, profile, zones) {
-  const savedProfile = state.config?.color_profiles?.[color];
-  const draft = profile?.draft || state.unsavedColorProfiles.has(color)
-    || JSON.stringify(savedProfile || null) !== JSON.stringify(profile || null);
   if (!profile?.drop_zone || !zones[profile.drop_zone]) {
     return `<span class="missing-badge">Needs destination</span>`;
   }
-  return draft ? `<span class="draft-badge">Draft</span>` : `<span class="saved-badge">Saved</span>`;
+  return `<span class="saved-badge">Ready</span>`;
 }
 
 function zoneOptionsHtml(selected = "") {
@@ -2040,26 +2124,45 @@ function updateTaskMappingControls() {
   if (elements.discardTaskMappingsBtn) elements.discardTaskMappingsBtn.disabled = !dirty;
 }
 
-async function saveTaskMappingEdits() {
+function applyTaskMappingConfig(config) {
+  state.config = config;
+  state.taskColorProfilesDraft = clonePlain(config.color_profiles || {});
+  state.taskDestinationsDraft = savedTaskDestinations();
+  state.unsavedColorProfiles.clear();
+  renderColorPresetMapping();
+  renderSetupChecklist();
+}
+
+async function saveTaskMappingEdits(options = {}) {
   if (!state.config) return { ok: false, error: "configuration not loaded" };
-  const payload = await postJson("/api/task-mappings", {
-    color_profiles: taskColorProfiles(),
-    task_destinations: {
-      schema_version: 1,
-      destinations: taskDestinationsForSave(),
-    },
-  });
+  let payload;
+  try {
+    payload = await postJson("/api/task-mappings", {
+      color_profiles: taskColorProfiles(),
+      task_destinations: {
+        schema_version: 1,
+        destinations: taskDestinationsForSave(),
+      },
+    });
+  } catch (error) {
+    payload = {
+      ok: false,
+      error: `Automatic mapping save failed: ${error.message || error}`,
+    };
+  }
   if (payload.ok) {
-    if (payload.config) applyConfig(payload.config);
+    if (payload.config) applyTaskMappingConfig(payload.config);
     if (payload.state) renderState(payload.state);
     clearSettingsDirty("task_destinations");
-    invalidateTaskDetections("Task mappings saved - refresh detections");
+    state.unsavedColorProfiles.clear();
   } else {
-    updateSettingsSaveBar({
-      mode: "error",
-      title: "Task mappings could not be saved",
-      detail: payload.error || "Review the task destinations and color assignments.",
-    });
+    if (!options.silent) {
+      updateSettingsSaveBar({
+        mode: "error",
+        title: "Task mappings could not be saved",
+        detail: payload.error || "Review the task destinations and color assignments.",
+      });
+    }
   }
   updateTaskMappingControls();
   return payload;
@@ -2077,10 +2180,15 @@ function discardTaskMappingEdits() {
 }
 
 function markTaskDestinationDraftDirty(detail = "Task mappings changed. Save task mappings before running.") {
-  markSettingsDirty("task_destinations", detail);
-  invalidateTaskDetections("Task mappings changed - refresh detections");
+  invalidateTaskPreview("Destination mapping changed - preview again");
   renderColorPresetMapping();
   updateTaskMappingControls();
+  window.clearTimeout(state.taskMappingSaveTimer);
+  state.taskMappingSaveTimer = window.setTimeout(() => {
+    state.taskMappingSavePromise = saveTaskMappingEdits({ silent: true }).finally(() => {
+      state.taskMappingSavePromise = null;
+    });
+  }, 500);
 }
 
 function updateColorProfileDraft(color, patch, detail = "Color destination mapping changed. Save all settings before running.") {
@@ -2196,12 +2304,6 @@ function renderOperatorPanels() {
       option.textContent = name;
       option.selected = profile.enabled !== false;
       elements.includeColorsSelect.appendChild(option);
-    }
-    if (elements.visionProfileList) {
-      const line = document.createElement("div");
-      line.className = "log-line";
-      line.innerHTML = `<span>${name}</span><code>${profile.enabled === false ? "off" : "on"} -> ${profile.drop_zone || "-"}</code>`;
-      elements.visionProfileList.appendChild(line);
     }
   });
   renderColorPresetMapping();
@@ -2562,6 +2664,7 @@ function renderTaskSummary(sequence, preview) {
     ${motionContractHtml(preview, trajectory)}
     <div class="log-line"><span>TCP correction</span><code>${calibrationApplied ? "enabled for Cartesian task targets" : "not applied"}</code></div>
     <div class="log-line"><span>Strategy</span><code>${taskPreview.strategy || sequence?.strategy || "-"}</code></div>
+    <div class="log-line"><span>Between objects</span><code>${normalized.cycle_confirmation === "confirm_each_object" ? "pause for operator" : "automatic"}</code></div>
     <div class="log-line"><span>Objects</span><code>${taskPreview.selected_objects?.length || sequence?.object_count || 0}</code></div>
     <div class="log-line"><span>TCP Z</span><code>pick ${format(normalized.pickup_z_mm)} / drop ${format(normalized.dropoff_z_mm)} mm</code></div>
     <div class="log-line"><span>Orientation</span><code>${orientation}</code></div>
@@ -2628,8 +2731,24 @@ function renderTaskPlanPreview(taskPreview = {}, sequence = {}) {
 }
 
 async function previewTask() {
+  if (state.taskPreviewPending) return;
+  state.taskPreviewPending = true;
   state.taskLocalStatusAt = Date.now() / 1000;
-  elements.taskStatus.textContent = "Previewing...";
+  elements.taskStatus.textContent = "Building preview...";
+  elements.previewTaskBtn.disabled = true;
+  elements.previewTaskBtn.textContent = "Building Preview...";
+  elements.previewTaskBtn.setAttribute("aria-busy", "true");
+  setTaskPreviewFeedback("working", "Validating detections, generating robot steps, and checking every motion target...");
+  window.clearTimeout(state.taskMappingSaveTimer);
+  state.taskMappingSaveTimer = null;
+  if (taskDestinationDraftChanged()) {
+    state.taskMappingSavePromise = saveTaskMappingEdits({ silent: true }).finally(() => {
+      state.taskMappingSavePromise = null;
+    });
+    await state.taskMappingSavePromise;
+  } else if (state.taskMappingSavePromise) {
+    await state.taskMappingSavePromise;
+  }
   const task = "color_sorting";
   if (elements.taskModeSelect) elements.taskModeSelect.value = "color_sorting";
   const selectedIds = [...state.selectedDetectionIds];
@@ -2639,10 +2758,20 @@ async function previewTask() {
   } catch (error) {
     elements.taskStatus.textContent = error.message;
     invalidateTaskPreview(error.message);
+    setTaskPreviewFeedback("error", error.message);
+    state.taskPreviewPending = false;
+    elements.previewTaskBtn.textContent = "Preview Task";
+    elements.previewTaskBtn.removeAttribute("aria-busy");
+    updateDisabledState();
     return;
   }
   if (!state.taskDetectionsCapturedAt || !state.latestDetections.length) {
     invalidateTaskPreview("Refresh detections before previewing a task");
+    setTaskPreviewFeedback("error", "No current detection snapshot. Return to Detect and refresh detections.");
+    state.taskPreviewPending = false;
+    elements.previewTaskBtn.textContent = "Preview Task";
+    elements.previewTaskBtn.removeAttribute("aria-busy");
+    updateDisabledState();
     return;
   }
   let motionSettings;
@@ -2650,6 +2779,11 @@ async function previewTask() {
     motionSettings = taskPathSettingsPayload();
   } catch (error) {
     invalidateTaskPreview(error.message);
+    setTaskPreviewFeedback("error", error.message);
+    state.taskPreviewPending = false;
+    elements.previewTaskBtn.textContent = "Preview Task";
+    elements.previewTaskBtn.removeAttribute("aria-busy");
+    updateDisabledState();
     return;
   }
   const request =
@@ -2672,7 +2806,19 @@ async function previewTask() {
           settings: motionSettings,
           branch: elements.ikBranchSelect.value,
         };
-  const payload = await postJson("/api/task/preview", request);
+  let payload;
+  try {
+    payload = await postJson("/api/task/preview", request);
+  } catch (error) {
+    const message = `Preview request failed: ${error.message || error}`;
+    invalidateTaskPreview(message);
+    setTaskPreviewFeedback("error", message);
+    state.taskPreviewPending = false;
+    elements.previewTaskBtn.textContent = "Preview Task";
+    elements.previewTaskBtn.removeAttribute("aria-busy");
+    updateDisabledState();
+    return;
+  }
   if (payload.ok) {
     renderPreview(payload.preview);
     state.taskPreviewId = payload.preview_id;
@@ -2682,24 +2828,43 @@ async function previewTask() {
     renderTaskSummary(payload.sequence, payload.preview);
     renderTaskPlanPreview(state.lastTaskPreview, payload.sequence);
     state.view?.setTaskPreview?.(state.lastTaskPreview);
-    const blockedByDraft = taskDraftBlocksRun();
-    elements.executeTaskBtn.disabled = blockedByDraft;
-    elements.taskStatus.textContent = blockedByDraft ? "Preview ready - save mappings before Run" : "Preview ready";
-    renderWorkflowStepper("preview");
+    elements.executeTaskBtn.disabled = false;
+    elements.taskStatus.textContent = "Preview ready";
+    setTaskPreviewFeedback(
+      "success",
+      `Preview ready: ${payload.sequence?.object_count || state.lastTaskPreview?.selected_objects?.length || 0} object(s), ${payload.sequence?.steps?.length || 0} generated steps.`
+    );
+    state.activeTaskStep = "run";
+    renderWorkflowStepper("run");
+    renderTaskExecution();
   } else {
     renderPreviewFailure(payload);
     state.lastTaskPreview = payload.task_preview || payload.sequence?.task_preview || null;
     renderTaskPlanPreview(state.lastTaskPreview, payload.sequence);
     state.view?.setTaskPreview?.(state.lastTaskPreview);
     elements.taskStatus.textContent = payload.error || "Task preview failed";
+    setTaskPreviewFeedback("error", payload.error || "Task preview failed. Review the generated diagnostics.");
     state.taskLocalStatusAt = Date.now() / 1000;
   }
+  state.taskPreviewPending = false;
+  elements.previewTaskBtn.textContent = "Preview Task";
+  elements.previewTaskBtn.removeAttribute("aria-busy");
+  updateDisabledState();
   await refreshDiagnostics();
 }
 
 async function executeTask() {
   if (!state.taskPreviewId) return;
-  const payload = await postJson("/api/task/execute", { preview_id: state.taskPreviewId });
+  elements.executeTaskBtn.disabled = true;
+  elements.taskStatus.textContent = "Starting task...";
+  let payload;
+  try {
+    payload = await postJson("/api/task/execute", { preview_id: state.taskPreviewId });
+  } catch (error) {
+    elements.taskStatus.textContent = `Could not start task: ${error.message || error}`;
+    updateDisabledState();
+    return;
+  }
   if (payload.ok) {
     releaseJointControlIntent();
     state.previewId = null;
@@ -2728,11 +2893,31 @@ async function executeTask() {
 }
 
 async function stopTask() {
-  const payload = await postJson("/api/task/stop", {});
+  let payload;
+  try {
+    payload = await postJson("/api/task/stop", {});
+  } catch (error) {
+    showLocalError(`Could not stop task: ${error.message || error}`);
+    return;
+  }
   if (payload.state) renderState(payload.state);
   elements.taskStatus.textContent = payload.ok ? "Task stopped" : payload.error || "Stop failed";
   state.taskLocalStatusAt = Date.now() / 1000;
   await refreshDiagnostics();
+}
+
+async function continueTask() {
+  const runId = state.robotState?.task_execution?.run_id;
+  if (!runId) return;
+  let payload;
+  try {
+    payload = await postJson("/api/task/continue", { run_id: runId });
+  } catch (error) {
+    showLocalError(`Could not continue task: ${error.message || error}`);
+    return;
+  }
+  if (payload.state) renderState(payload.state);
+  if (!payload.ok) showLocalError(payload.error || "Task could not continue.");
 }
 
 async function selectRuntimeDetection(detectionId) {
@@ -2955,6 +3140,9 @@ function renderCameraIntrinsics(camera = state.config?.camera || {}) {
   if (elements.workspaceArucoFallbackInput) {
     elements.workspaceArucoFallbackInput.checked = workspaceAruco.allow_normal_fallback !== false;
   }
+  if (elements.workspaceMarginInput) {
+    elements.workspaceMarginInput.value = format(workspaceAruco.workspace_margin_mm ?? 0, 1);
+  }
   if (elements.cameraFxInput) elements.cameraFxInput.value = intrinsics.fx_px ?? "";
   if (elements.cameraFyInput) elements.cameraFyInput.value = intrinsics.fy_px ?? "";
   if (elements.cameraCxInput) elements.cameraCxInput.value = intrinsics.cx_px ?? "";
@@ -3004,6 +3192,7 @@ function cameraSettingsDraft() {
     enabled: Boolean(elements.workspaceArucoEnabledInput?.checked),
     invert_first: Boolean(elements.workspaceArucoInvertInput?.checked),
     allow_normal_fallback: Boolean(elements.workspaceArucoFallbackInput?.checked),
+    workspace_margin_mm: Math.max(0, readNumber(elements.workspaceMarginInput, 0)),
   };
   camera.intrinsics = {
     ...(camera.intrinsics || {}),
@@ -3070,8 +3259,9 @@ function renderWorkspaceCalibration(payload = {}) {
   const polygon = settings.workspace_polygon_robot_mm || [];
   const xValues = polygon.map((point) => Number(point?.[0])).filter(Number.isFinite);
   const yValues = polygon.map((point) => Number(point?.[1])).filter(Number.isFinite);
+  const workspaceMargin = Math.max(0, Number(settings.workspace_margin_mm) || 0);
   const bounds = xValues.length && yValues.length
-    ? `X ${format(Math.min(...xValues), 1)} to ${format(Math.max(...xValues), 1)} mm | Y ${format(Math.min(...yValues), 1)} to ${format(Math.max(...yValues), 1)} mm`
+    ? `X ${format(Math.min(...xValues) - workspaceMargin, 1)} to ${format(Math.max(...xValues) + workspaceMargin, 1)} mm | Y ${format(Math.min(...yValues) - workspaceMargin, 1)} to ${format(Math.max(...yValues) + workspaceMargin, 1)} mm | margin ${format(workspaceMargin, 1)} mm`
     : "not configured";
   const centerCounts = session.tag_observation_counts || {};
   const cornerCounts = session.corner_observation_counts || {};
@@ -3150,7 +3340,7 @@ async function calibrateWorkspace() {
     const saved = await saveAllSettings();
     if (!saved) return;
     const payload = await postJson("/api/vision/workspace/calibrate", {
-      max_frames: 36,
+      max_frames: 120,
       sample_interval_ms: 40,
     });
     if (payload.ok && payload.config) applyConfig(payload.config);
@@ -3198,6 +3388,23 @@ function tcpMetricText(metrics) {
   return `XY ${format(metrics.xy_rmse_mm, 2)} RMSE / ${format(metrics.xy_max_mm, 2)} max; Z ${format(metrics.z_rmse_mm, 2)} RMSE / ${format(metrics.z_max_abs_mm, 2)} max`;
 }
 
+function tcpCorrectionText(result) {
+  const coefficients = result?.coefficients || {};
+  const zOffset = format(coefficients.z_offset_mm ?? 0, 2);
+  if (result?.model_type === "radial_reach_z_offset") {
+    return `reach ${format(coefficients.reach_offset_mm ?? 0, 2)} mm; Z ${zOffset} mm`;
+  }
+  if (result?.model_type === "constant_xyz") {
+    const xy = coefficients.xy_offset_mm || [0, 0];
+    return `X ${format(xy[0], 2)} mm; Y ${format(xy[1], 2)} mm; Z ${zOffset} mm`;
+  }
+  if (result?.model_type === "affine_xy_z_offset") {
+    const xy = coefficients.xy_offset_mm || [0, 0];
+    return `affine XY, offset ${format(xy[0], 2)} / ${format(xy[1], 2)} mm; Z ${zOffset} mm`;
+  }
+  return "not fitted";
+}
+
 function renderTcpCalibrationTargets() {
   if (!elements.tcpCalibrationTargetList) return;
   elements.tcpCalibrationTargetList.innerHTML = "";
@@ -3227,6 +3434,7 @@ function renderTcpCalibration() {
   const settings = summary.settings || {};
   const profile = summary.active_profile || {};
   const result = profile.result || null;
+  const manualResult = result?.source === "manual_offsets";
   const physicalResult = profile.physical_model_result || state.tcpCalibrationPhysicalResult || null;
   const workspace = summary.workspace || {};
   const freshness = summary.freshness || {};
@@ -3240,13 +3448,20 @@ function renderTcpCalibration() {
     : freshness.fresh === false && result
       ? "Stale, disabled"
       : result
-        ? "Fitted, disabled"
+        ? manualResult ? "Manual, disabled" : "Fitted, disabled"
         : "Audit required";
   elements.tcpCalibrationStatus.classList.toggle("ready", enabled);
   elements.tcpCalibrationStatus.classList.toggle("warning", !enabled && Boolean(result || freshness.fresh === false));
   elements.tcpCalEnableInput.checked = Boolean(settings.enabled && profile.enabled);
   elements.tcpCalEnableInput.disabled = !activation.eligible;
-  elements.tcpCalModelSelect.value = profile.model_type || settings.default_model || "affine_xy_z_offset";
+  elements.tcpCalModelSelect.value = profile.model_type || settings.default_model || "radial_reach_z_offset";
+  const coefficients = result?.coefficients || {};
+  if (elements.tcpCalManualReachOffsetInput && document.activeElement !== elements.tcpCalManualReachOffsetInput) {
+    elements.tcpCalManualReachOffsetInput.value = format(coefficients.reach_offset_mm ?? 0, 2);
+  }
+  if (elements.tcpCalManualZOffsetInput && document.activeElement !== elements.tcpCalManualZOffsetInput) {
+    elements.tcpCalManualZOffsetInput.value = format(coefficients.z_offset_mm ?? 0, 2);
+  }
   if (elements.tcpCalWorkspacePlaneZInput && document.activeElement !== elements.tcpCalWorkspacePlaneZInput) {
     elements.tcpCalWorkspacePlaneZInput.value = format(reference.workspace_plane_z_mm ?? 0, 2);
   }
@@ -3278,6 +3493,7 @@ function renderTcpCalibration() {
   const diagnostics = result?.diagnostics || [];
   elements.tcpCalibrationMetrics.innerHTML = `
     <div class="log-line"><span>Before correction</span><code>${tcpMetricText(fit?.before)}</code></div>
+    <div class="log-line"><span>Correction</span><code>${tcpCorrectionText(result)}</code></div>
     <div class="log-line"><span>Fit residual</span><code>${tcpMetricText(fit?.after_model)} (${fit?.status || "not run"})</code></div>
     <div class="log-line"><span>Validation landing</span><code>${tcpMetricText(validation?.landing)} (${validation?.status || "not run"})</code></div>
     <div class="log-line"><span>Worst fit</span><code>${(fit?.worst_samples || []).slice(0, 3).map((item) => `${item.id}: ${format(item.error_xy_mm, 1)} XY`).join(" | ") || "-"}</code></div>
@@ -3522,6 +3738,30 @@ async function fitTcpCalibration() {
   if (payload.config) applyConfig(payload.config);
 }
 
+async function saveManualTcpCalibrationOffsets() {
+  let reachOffset;
+  let zOffset;
+  try {
+    reachOffset = readRequiredNumber(elements.tcpCalManualReachOffsetInput, "Manual reach offset");
+    zOffset = readRequiredNumber(elements.tcpCalManualZOffsetInput, "Manual Z offset");
+  } catch (error) {
+    showLocalError(error?.message || String(error));
+    return;
+  }
+  elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Status</span><code>Saving manual offsets...</code></div>`;
+  const payload = await postJson("/api/kinematics-calibration/manual-offsets", {
+    reach_offset_mm: reachOffset,
+    z_offset_mm: zOffset,
+    enabled: Boolean(elements.tcpCalEnableInput.checked),
+  });
+  if (!payload.ok) {
+    elements.tcpCalibrationMetrics.innerHTML = `<div class="log-line"><span>Manual offset error</span><code>${escapeHtml(payload.error || "failed")}</code></div>`;
+    return;
+  }
+  if (elements.tcpCalModelSelect) elements.tcpCalModelSelect.value = "radial_reach_z_offset";
+  if (payload.config) applyConfig(payload.config);
+}
+
 async function fitTcpPhysicalModel() {
   elements.tcpCalibrationPhysicalMetrics.innerHTML = `<div class="log-line"><span>Status</span><code>Fitting constrained physical model...</code></div>`;
   const payload = await postJson("/api/kinematics-calibration/physical-model/fit", {
@@ -3594,13 +3834,13 @@ function renderDetectionList(detections) {
     table.innerHTML = `
       <thead>
         <tr>
-          <th>Use</th>
           <th>Color</th>
           <th>Conf</th>
           <th>Area</th>
           <th>Robot X/Y</th>
           <th>Eligibility</th>
           <th>Reason</th>
+          <th>Action</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -3623,27 +3863,16 @@ function renderDetectionList(detections) {
       ? `${format(detection.robot.x_mm)}, ${format(detection.robot.y_mm)}`
       : "-";
     const eligible = Boolean(detection.ok && detection.robot);
-    const selected = state.selectedDetectionIds.has(detectionId);
-    row.className = `${eligible ? "" : "invalid"} ${selected ? "selected" : ""}`;
+    row.className = eligible ? "" : "invalid";
     row.innerHTML = `
-      <td>
-        <input type="checkbox" data-detection-select="${detectionId}" ${selected ? "checked" : ""} ${eligible ? "" : "disabled"} />
-      </td>
       <td><strong>${label}</strong><small>${detectionId}</small></td>
       <td>${detection.confidence == null ? "-" : format(detection.confidence, 2)}</td>
       <td>${area == null ? "-" : format(area, 0)}</td>
       <td>${robot}</td>
       <td>${eligible ? "eligible" : "ignored"}</td>
       <td>${detection.projection_error || detection.reason || detection.coordinate_source || "-"}</td>
+      <td data-detection-action>${waitingRun && candidateIds.has(detectionId) ? `<button type="button" class="ghost compact-action" data-runtime-select="${detectionId}">Pick</button>` : "-"}</td>
     `;
-    if (waitingRun && candidateIds.has(detectionId)) {
-      const action = document.createElement("button");
-      action.type = "button";
-      action.className = "ghost compact-action";
-      action.textContent = "Pick";
-      action.dataset.runtimeSelect = detectionId;
-      row.children[0].appendChild(action);
-    }
     tbody.appendChild(row);
   });
   [...tbody.querySelectorAll("tr[data-detection-row]")].forEach((row) => {
@@ -4109,7 +4338,9 @@ function renderTaskExecution(robotState = state.robotState) {
   const executionUpdatedAt = Number(execution.updated_at || 0);
   const localStatusIsNewer = state.taskLocalStatusAt > executionUpdatedAt;
   if (!execution.status) {
-    elements.taskRunMonitor.innerHTML = `<div class="empty-state">No task running. Preview first, then start.</div>`;
+    elements.taskRunMonitor.innerHTML = state.taskPreviewId
+      ? `<div class="task-ready-state"><strong>Preview ready</strong><span>Review the generated sequence above, then press Run Preview. The task will use exactly this bound preview.</span></div>`
+      : `<div class="empty-state">No task running. Return to Plan and build a preview first.</div>`;
     if (elements.taskStatus && !localStatusIsNewer) {
       const currentStatus = elements.taskStatus.textContent || "";
       const keepLocalStatus = /preview|task settings|detection|preset|mapping|save|ik|waypoint|unreachable|failed/i.test(currentStatus);
@@ -4146,6 +4377,7 @@ function renderTaskExecution(robotState = state.robotState) {
       <div class="run-metric"><span>Safe retreat</span><strong>${recovery.safe_retreat_available ? "available" : "unavailable"}</strong><small>${step.phase || execution.phase || "-"}</small></div>
     </div>
     ${execution.status === "waiting_for_selection" ? `<div class="task-waiting">Manual mode: choose a candidate with the Pick button in the detection table.</div>` : ""}
+    ${execution.status === "waiting_for_confirmation" ? `<div class="task-waiting task-confirmation"><div><strong>Object complete.</strong><span>The robot is paused before the next capture or object.</span></div><button type="button" class="primary" data-task-continue>Continue</button></div>` : ""}
     <div class="task-object-queue compact">
       ${candidates.slice(0, 8).map((item) => `<div class="task-object-row"><span>${item.detection_id}</span><strong>${item.color}</strong><code>x ${format(item.robot?.x_mm)}, y ${format(item.robot?.y_mm)}</code><small>${item.drop_zone || "-"}</small>${execution.status === "waiting_for_selection" ? `<button type="button" class="ghost compact-action" data-runtime-select="${item.detection_id}">Pick</button>` : ""}</div>`).join("") || `<div class="empty-state">No candidate queue exposed.</div>`}
     </div>
@@ -4561,11 +4793,11 @@ function updateDisabledState() {
     fader.classList.toggle("disabled", disabled);
     fader.setAttribute("aria-disabled", disabled ? "true" : "false");
   });
-  if (elements.previewTaskBtn) elements.previewTaskBtn.disabled = !state.config;
+  if (elements.previewTaskBtn) elements.previewTaskBtn.disabled = !state.config || state.taskPreviewPending;
   if (elements.executeTaskBtn) elements.executeTaskBtn.disabled = !state.taskPreviewId || !enabled || taskDraftBlocksRun();
   if (elements.taskStopBtn) {
     const taskStatus = state.robotState?.task_execution?.status;
-    elements.taskStopBtn.disabled = !["queued", "running", "capturing", "planning", "executing", "waiting_for_selection"].includes(taskStatus);
+    elements.taskStopBtn.disabled = !["queued", "running", "capturing", "planning", "executing", "waiting_for_selection", "waiting_for_confirmation"].includes(taskStatus);
   }
 }
 
@@ -6277,10 +6509,21 @@ async function executeProgram() {
   state.programExecutionError = "";
   setActiveProgramStage("run");
   renderProgramBuilder({ inspector: false });
-  const payload = await postJson("/api/path/execute", {
-    preview_id: previewId,
-    program_revision: state.programRevision,
-  });
+  let payload;
+  try {
+    payload = await postJson("/api/path/execute", {
+      preview_id: previewId,
+      program_revision: state.programRevision,
+    });
+  } catch (error) {
+    state.programExecutionActive = false;
+    state.programExecutionAwaitingStart = false;
+    state.programExecutionFailed = true;
+    state.programExecutionError = `Could not start program execution: ${error.message || error}`;
+    showLocalError(state.programExecutionError);
+    renderProgramBuilder({ inspector: false });
+    return;
+  }
   if (payload.ok) {
     releaseJointControlIntent();
     state.previewId = null;
@@ -6315,11 +6558,17 @@ function syncProgramExecutionState(robotState) {
       return;
     }
   }
-  if (result === "failed" || result === "stopped") {
+  if (result === "failed") {
     state.programExecutionActive = false;
     state.programExecutionAwaitingStart = false;
     state.programExecutionFailed = true;
-    state.programExecutionError = diagnostics.error || robotState?.last_error || `Program ${result}.`;
+    state.programExecutionError = diagnostics.error || robotState?.last_error || "Program failed.";
+  } else if (result === "stopped") {
+    state.programExecutionActive = false;
+    state.programExecutionAwaitingStart = false;
+    state.programExecutionFailed = false;
+    state.programExecutionError = "";
+    state.programLastEditReason = "Execution stopped";
   } else if (result === "reached") {
     const activeStepIndex = Number(diagnostics.active_step_index || 0);
     const activeStepTotal = Number(diagnostics.active_step_total || 0);
@@ -6506,7 +6755,7 @@ async function discardSettingsChanges() {
   clearSettingsDirty();
 }
 
-function applyConfig(config) {
+function applyConfig(config, options = {}) {
   const previousConfigId = state.config?.app_version?.running_config_id;
   const nextConfigId = config?.app_version?.running_config_id;
   const replacingConfig = Boolean(state.config && previousConfigId !== nextConfigId);
@@ -6573,7 +6822,9 @@ function applyConfig(config) {
     scheduleWorkspaceProjection(0);
   }
   updateSettingsSaveBar();
-  if (replacingConfig) invalidateTaskDetections("Robot configuration changed - refresh detections");
+  if (replacingConfig && !options.preserveTaskDetections) {
+    invalidateTaskDetections("Robot configuration changed - refresh detections");
+  }
   if (replacingConfig && state.programWaypoints.length && !state.programExecutionActive) {
     markProgramEdited("Robot configuration changed", { inspector: false });
   }
@@ -7080,6 +7331,7 @@ function bindActions() {
     elements.workspaceArucoEnabledInput,
     elements.workspaceArucoInvertInput,
     elements.workspaceArucoFallbackInput,
+    elements.workspaceMarginInput,
     elements.cameraFxInput,
     elements.cameraFyInput,
     elements.cameraCxInput,
@@ -7230,6 +7482,7 @@ function bindActions() {
   [
     elements.taskModeSelect,
     elements.executionStrategySelect,
+    elements.cycleConfirmationSelect,
     elements.objectSelectionPolicySelect,
     elements.maxObjectsInput,
     elements.minConfidenceInput,
@@ -7258,6 +7511,7 @@ function bindActions() {
   [
     elements.taskModeSelect,
     elements.executionStrategySelect,
+    elements.cycleConfirmationSelect,
     elements.objectSelectionPolicySelect,
     elements.includeColorsSelect,
     elements.missingDropzonePolicySelect,
@@ -7270,7 +7524,10 @@ function bindActions() {
     elements.pickupDescentModeSelect,
     elements.liftModeSelect,
     elements.dropDescentModeSelect,
-  ].forEach((input) => input?.addEventListener("change", () => invalidateTaskPreview("Task settings changed")));
+  ].forEach((input) => input?.addEventListener("change", () => {
+    if (input === elements.orientationPolicySelect) syncTaskOrientationControls();
+    invalidateTaskPreview("Task settings changed");
+  }));
   elements.detectionList?.addEventListener("change", (event) => {
     const input = event.target.closest("[data-detection-select]");
     if (!input) return;
@@ -7286,6 +7543,11 @@ function bindActions() {
     selectRuntimeDetection(button.dataset.runtimeSelect);
   });
   elements.taskRunMonitor?.addEventListener("click", (event) => {
+    const continueButton = event.target.closest("[data-task-continue]");
+    if (continueButton) {
+      continueTask();
+      return;
+    }
     const button = event.target.closest("[data-runtime-select]");
     if (!button) return;
     selectRuntimeDetection(button.dataset.runtimeSelect);
@@ -7293,6 +7555,7 @@ function bindActions() {
   elements.previewTaskBtn.addEventListener("click", previewTask);
   elements.executeTaskBtn.addEventListener("click", executeTask);
   elements.taskStopBtn?.addEventListener("click", stopTask);
+  elements.toolValidationBtn?.addEventListener("click", setActiveToolDimensionsValidation);
   elements.viewCameraBtn?.addEventListener("click", () => {
     setCameraPopupVisible(true);
     detectVision();
@@ -7312,6 +7575,7 @@ function bindActions() {
   elements.tcpCalSaveSampleBtn?.addEventListener("click", saveTcpCalibrationSample);
   elements.tcpCalFitPhysicalBtn?.addEventListener("click", fitTcpPhysicalModel);
   elements.tcpCalApplyPhysicalBtn?.addEventListener("click", applyTcpPhysicalModel);
+  elements.tcpCalSaveManualOffsetsBtn?.addEventListener("click", saveManualTcpCalibrationOffsets);
   elements.tcpCalFitBtn?.addEventListener("click", fitTcpCalibration);
   elements.tcpCalApplyEnableBtn?.addEventListener("click", applyTcpCalibrationEnableState);
   elements.tcpCalibrationTargetList?.addEventListener("click", (event) => {
@@ -7437,8 +7701,23 @@ function bindActions() {
   });
   elements.executeProgramBtn.addEventListener("click", executeProgram);
   elements.stopProgramBtn.addEventListener("click", async () => {
-    const payload = await postJson("/api/stop");
+    const stoppingProgram = state.programExecutionActive;
+    let payload;
+    try {
+      payload = await postJson("/api/stop");
+    } catch (error) {
+      showLocalError(`Could not stop motion: ${error.message || error}`);
+      return;
+    }
+    if (payload.ok && stoppingProgram) {
+      state.programExecutionActive = false;
+      state.programExecutionAwaitingStart = false;
+      state.programExecutionFailed = false;
+      state.programExecutionError = "";
+      state.programLastEditReason = "Execution stopped";
+    }
     if (payload.state) renderState(payload.state);
+    renderProgramBuilder({ inspector: false });
   });
   elements.programList.addEventListener("click", (event) => {
     const actionControl = event.target.closest("[data-program-action]");

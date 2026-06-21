@@ -6,7 +6,12 @@ from math import isfinite
 from typing import Any
 
 from .config import RobotConfig
-from .demo_settings import calibration_settings, geometry_settings, tools_settings
+from .demo_settings import (
+    active_tool_dimensions_validated,
+    calibration_settings,
+    geometry_settings,
+    tools_settings,
+)
 from .kinematics import forward_kinematics
 
 
@@ -166,7 +171,7 @@ def _active_tool(config: RobotConfig) -> dict[str, Any]:
             "tool_y": "local DH +Z",
             "tool_z": "local DH +X / tool-forward",
         },
-        "dimensions_validated": bool(calibration_settings(config).get("tool_dimensions_validated", False)),
+        "dimensions_validated": active_tool_dimensions_validated(config),
     }
 
 

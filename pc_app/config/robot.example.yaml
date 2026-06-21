@@ -300,12 +300,14 @@ camera:
       required_ids: [0, 1, 2, 3]
       invert_first: true
       allow_normal_fallback: true
+      allow_mirror_fallback: true
       minimum_samples: 12
       max_calibration_rmse_mm: 3.0
       max_calibration_error_mm: 7.0
       max_calibration_tag_center_error_mm: 12.0
       max_verification_rmse_mm: 5.0
       max_verification_error_mm: 10.0
+      reference_decode_max_hamming: 2
       tag_centers_robot_mm:
         "0": [-218.5, 111.5]
         "1": [218.5, 111.5]
@@ -333,6 +335,10 @@ camera:
         - [239.0, 86.5]
         - [239.0, 401.5]
         - [-239.0, 401.5]
+      # Extra robot-coordinate margin used for the camera-visible workspace
+      # mask and projected view. This does not change the solved tag-corner
+      # calibration.
+      workspace_margin_mm: 0.0
       # Full work-plate area shown in the live 3D projection. This includes
       # the four tags and matches the calibrated outer polygon above.
       projection_polygon_robot_mm:
@@ -406,6 +412,7 @@ task_defaults:
 tasks:
   color_sorting:
     execution_strategy: closed_loop
+    cycle_confirmation: automatic
     max_objects: 10
     filters:
       min_confidence: 0.0
@@ -423,9 +430,9 @@ tasks:
     drop_approach_clearance_mm: 35.0
     pickup_phi_deg: 0.0
     drop_phi_deg: 0.0
-    downward_phi_deg: -90.0
-    pickup_preferred_phi_deg: -90.0
-    drop_preferred_phi_deg: -90.0
+    downward_phi_deg: -100.0
+    pickup_preferred_phi_deg: -100.0
+    drop_preferred_phi_deg: -100.0
     orientation_policy: prefer_downward
     motion_modes:
       transfer: joint
@@ -466,6 +473,7 @@ tools:
     gripper:
       type: servo_gripper
       label: Gripper
+      dimensions_validated: false
       open_value: 0.0
       closed_value: 1.0
       tcp_offset_mm:
@@ -480,6 +488,7 @@ tools:
     magnet:
       type: electromagnet
       label: Magnet
+      dimensions_validated: false
       tcp_offset_mm:
         x: 0.0
         y: 0.0
@@ -541,7 +550,7 @@ kinematics_calibration:
   schema_version: 2
   enabled: false
   active_profile: gripper
-  default_model: affine_xy_z_offset
+  default_model: radial_reach_z_offset
   thresholds:
     good_xy_rmse_mm: 5.0
     acceptable_xy_max_mm: 10.0
@@ -557,9 +566,11 @@ kinematics_calibration:
     outlier_mad_scale: 3.5
     minimum_validation_samples: 2
     minimum_xy_span_mm: 80.0
+    minimum_radial_reach_mm: 40.0
     minimum_z_span_mm: 15.0
     minimum_phi_span_deg: 20.0
     maximum_enable_xy_correction_mm: 35.0
+    maximum_enable_reach_correction_mm: 35.0
     maximum_enable_z_correction_mm: 20.0
   profiles: {}
 

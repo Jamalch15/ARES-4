@@ -143,20 +143,20 @@
                     </div>
                   </div>
                   <div id="taskSetupChecklist" class="setup-checklist"></div>
+                  <div id="visionProfileList" class="path-summary task-vision-config"></div>
                 </section>
 
                 <section class="panel-section task-rail task-step-panel" data-task-panel="detect" hidden>
                   <div class="section-header">
                     <div>
                       <h2>Detect</h2>
-                      <p class="hint">Capture, inspect, and optionally select detections. If none are selected, all eligible detections are planned. Capture never starts motion.</p>
+                      <p class="hint">Capture and inspect the workspace. Every eligible detection is included automatically. Capture never starts motion.</p>
                     </div>
                   </div>
                   <div class="button-row action-row">
                     <button id="viewCameraBtn" class="primary" type="button">View Camera</button>
                     <button id="detectVisionBtn" type="button">Refresh Detections</button>
                   </div>
-                  <div id="visionProfileList" class="path-summary"></div>
                   <div id="visionSummary" class="path-summary"></div>
                   <div id="detectionList" class="task-detection-table"></div>
                 </section>
@@ -169,25 +169,27 @@
                     </div>
                   </div>
                   <div class="control-grid">
-                    <label>Task
+                    <label class="task-legacy-field">Task
                       <select id="taskModeSelect">
                         <option value="color_sorting">Color Sorting</option>
                         <option value="pick_and_place" disabled>Pick and Place - later</option>
                       </select>
                     </label>
-                    <label>Strategy
+                    <label>Capture behavior
                       <select id="executionStrategySelect">
-                        <option value="closed_loop">Closed loop</option>
-                        <option value="batch_once">Batch once</option>
+                        <option value="closed_loop">Recapture after each object</option>
+                        <option value="batch_once">Use this detection snapshot only</option>
                       </select>
                     </label>
-                    <label>Ordering
+                    <label>Between objects
+                      <select id="cycleConfirmationSelect">
+                        <option value="automatic">Continue automatically</option>
+                        <option value="confirm_each_object">Pause for operator confirmation</option>
+                      </select>
+                    </label>
+                    <label class="task-legacy-field">Ordering
                       <select id="objectSelectionPolicySelect">
                         <option value="nearest_to_safe">Nearest to safe</option>
-                        <option value="largest">Largest</option>
-                        <option value="left_to_right">Left to right</option>
-                        <option value="color_priority">Color priority</option>
-                        <option value="manual">Manual</option>
                       </select>
                     </label>
                     <label>Max objects
@@ -199,14 +201,7 @@
                     <label class="wide-field task-colors-field">Colors
                       <select id="includeColorsSelect" multiple hidden></select>
                       <div id="colorPresetMapping" class="color-preset-mapping"></div>
-                      <span class="field-help">Choose a saved Position Library record. Draft means this color assignment has not been saved.</span>
-                      <div class="button-row task-mapping-actions">
-                        <button id="saveTaskMappingsBtn" class="ghost" type="button" disabled>Save task mappings</button>
-                        <button id="discardTaskMappingsBtn" class="ghost" type="button" disabled>Discard task edits</button>
-                      </div>
-                    </label>
-                    <label>Color priority
-                      <input id="colorPriorityInput" type="text" placeholder="red, blue" />
+                      <span class="field-help">Choose a Position Library destination. Changes apply to the next preview and are saved automatically.</span>
                     </label>
                     <label>Missing zone
                       <select id="missingDropzonePolicySelect">
@@ -220,12 +215,12 @@
                         <option value="error">Error</option>
                       </select>
                     </label>
-                    <label>Placement
+                    <label class="task-legacy-field">Placement
                       <select id="placementPolicySelect">
                         <option value="fixed">Fixed anchor</option>
-                        <option value="grid">Zone grid</option>
                       </select>
                     </label>
+                    <input id="colorPriorityInput" type="hidden" value="" />
                     <label class="task-legacy-field">Task destination
                       <select id="dropZoneSelect"></select>
                     </label>
@@ -246,14 +241,13 @@
                         <label>Drop clearance <input id="dropApproachClearanceInput" type="number" min="0" step="1" /></label>
                         <label>Orientation
                           <select id="orientationPolicySelect">
-                            <option value="prefer_downward">Prefer downward</option>
+                            <option value="prefer_downward">Automatic, prefer &phi; below &minus;90&deg;</option>
                             <option value="fixed">Fixed</option>
                             <option value="auto">Auto</option>
-                            <option value="per_color">Per color</option>
                           </select>
                         </label>
-                        <label>Pickup phi <input id="pickupPhiInput" type="number" step="1" /></label>
-                        <label>Drop phi <input id="dropPhiInput" type="number" step="1" /></label>
+                        <label data-fixed-phi-field>Fixed pickup phi <input id="pickupPhiInput" type="number" step="1" /></label>
+                        <label data-fixed-phi-field>Fixed drop phi <input id="dropPhiInput" type="number" step="1" /></label>
                         <label>Transfer mode
                           <select id="transferModeSelect">
                             <option value="joint">Joint</option>
@@ -280,18 +274,13 @@
                         </label>
                         <label>Capture settle ms <input id="captureSettleInput" type="number" min="0" step="10" /></label>
                         <label>Tool settle ms <input id="toolSettleInput" type="number" min="0" step="10" /></label>
-                        <label class="wide-field">Per-color object overrides
-                          <textarea id="objectProfilesInput" rows="4" spellcheck="false" placeholder='{"red":{"pickup_z_mm":25}}'></textarea>
-                        </label>
                       </div>
                     </div>
                   </details>
                   <div class="button-row action-row">
                     <button id="previewTaskBtn" class="primary" type="button">Preview Task</button>
-                    <button id="executeTaskBtn" type="button" disabled>Start Task</button>
                   </div>
-                  <div id="taskSummary" class="path-summary"></div>
-                  <div id="taskPlanPreview" class="task-plan-preview"></div>
+                  <div id="taskPreviewFeedback" class="task-preview-feedback" role="status" aria-live="polite">Refresh detections, then preview the generated task.</div>
                 </section>
 
                 <section class="panel-section task-rail task-step-panel" data-task-panel="run" hidden>
@@ -300,8 +289,13 @@
                       <h2>Run</h2>
                       <p class="hint">Closed-loop progress, current and last-completed steps, hold uncertainty, and recovery options.</p>
                     </div>
-                    <button id="taskStopBtn" class="warn" type="button">Stop Task</button>
+                    <div class="button-row">
+                      <button id="executeTaskBtn" class="primary" type="button" disabled>Run Preview</button>
+                      <button id="taskStopBtn" class="warn" type="button">Stop Task</button>
+                    </div>
                   </div>
+                  <div id="taskSummary" class="path-summary"></div>
+                  <div id="taskPlanPreview" class="task-plan-preview"></div>
                   <div id="taskRunMonitor" class="task-run-monitor"></div>
                 </section>
               </section>
@@ -653,6 +647,13 @@
                     </div>
                   </div>
                   <div id="toolCalibration" class="path-summary"></div>
+                  <div class="tool-validation-panel">
+                    <div>
+                      <strong id="toolValidationStatus">Active tool dimensions are not physically validated.</strong>
+                      <p class="hint">Measure the active TCP offsets, save the tooling values, then mark them verified. Editing the tool type or TCP offsets clears this validation.</p>
+                    </div>
+                    <button id="toolValidationBtn" type="button">Mark measured and verified</button>
+                  </div>
                 </section>
 
                 <section class="panel-section settings-section" id="settingsCamera">
@@ -696,6 +697,9 @@
                     <label class="toggle-label compact-toggle">
                       <input id="workspaceArucoFallbackInput" type="checkbox" />
                       <span class="toggle-text">Allow normal-image fallback</span>
+                    </label>
+                    <label>Workspace margin (mm)
+                      <input id="workspaceMarginInput" type="number" min="0" step="1" />
                     </label>
                   </div>
                   <details class="advanced-block" hidden>
@@ -842,22 +846,30 @@
                   <div id="tcpCalibrationPhysicalMetrics" class="path-summary"></div>
 
                   <div class="subsection-heading">
-                    <h3>5. Fit optional residual command correction</h3>
-                    <p class="hint">Requires held-out validation, fresh signatures, acceptable correction magnitude, and explicit enablement.</p>
+                    <h3>5. Apply optional residual command correction</h3>
+                    <p class="hint">Enter measured-minus-commanded reach/Z offsets directly, or fit a correction from saved samples. Positive reach means the TCP lands farther from the base; positive Z means it lands higher.</p>
                   </div>
                   <div class="settings-field-grid tcp-calibration-grid">
+                    <label>Manual reach offset
+                      <span class="input-with-unit"><input id="tcpCalManualReachOffsetInput" type="number" step="0.1" value="0" /><span>mm</span></span>
+                    </label>
+                    <label>Manual Z offset
+                      <span class="input-with-unit"><input id="tcpCalManualZOffsetInput" type="number" step="0.1" value="0" /><span>mm</span></span>
+                    </label>
                     <label>Calibration model
                       <select id="tcpCalModelSelect">
+                        <option value="radial_reach_z_offset">Radial reach + Z offset</option>
                         <option value="affine_xy_z_offset">Affine XY + Z offset</option>
                         <option value="constant_xyz">Constant XYZ offset</option>
                       </select>
                     </label>
                     <label class="toggle-label compact-toggle">
                       <input id="tcpCalEnableInput" type="checkbox" />
-                      <span class="toggle-text">Enable fitted correction</span>
+                      <span class="toggle-text">Enable correction</span>
                     </label>
                   </div>
                   <div class="button-row calibration-actions">
+                    <button id="tcpCalSaveManualOffsetsBtn" type="button">Save manual reach/Z offsets</button>
                     <button id="tcpCalFitBtn" class="primary" type="button">Fit and save</button>
                     <button id="tcpCalApplyEnableBtn" type="button">Apply enable state</button>
                   </div>

@@ -113,12 +113,14 @@ def camera_settings(config: RobotConfig) -> dict[str, Any]:
                 "required_ids": [0, 1, 2, 3],
                 "invert_first": True,
                 "allow_normal_fallback": True,
+                "allow_mirror_fallback": True,
                 "minimum_samples": 12,
                 "max_calibration_rmse_mm": 3.0,
                 "max_calibration_error_mm": 7.0,
                 "max_calibration_tag_center_error_mm": 12.0,
                 "max_verification_rmse_mm": 5.0,
                 "max_verification_error_mm": 10.0,
+                "reference_decode_max_hamming": 2,
                 "tag_centers_robot_mm": {
                     "0": [-218.5, 111.5],
                     "1": [218.5, 111.5],
@@ -147,6 +149,7 @@ def camera_settings(config: RobotConfig) -> dict[str, Any]:
                     [239.0, 401.5],
                     [-239.0, 401.5],
                 ],
+                "workspace_margin_mm": 0.0,
                 "projection_polygon_robot_mm": [
                     [-239.0, 86.5],
                     [239.0, 86.5],
@@ -282,6 +285,16 @@ def tools_settings(config: RobotConfig) -> dict[str, Any]:
     return defaults
 
 
+def active_tool_dimensions_validated(config: RobotConfig) -> bool:
+    raw_tools = config.raw.get("tools") if isinstance(config.raw.get("tools"), dict) else {}
+    active = str(raw_tools.get("active") or tools_settings(config).get("active", "gripper"))
+    raw_presets = raw_tools.get("presets") if isinstance(raw_tools.get("presets"), dict) else {}
+    raw_preset = raw_presets.get(active) if isinstance(raw_presets.get(active), dict) else {}
+    if "dimensions_validated" in raw_preset:
+        return bool(raw_preset.get("dimensions_validated"))
+    return bool(calibration_settings(config).get("tool_dimensions_validated", False))
+
+
 def encoder_settings(config: RobotConfig) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "enabled": True,
@@ -384,6 +397,7 @@ def color_sorting_task_defaults(config: RobotConfig) -> dict[str, Any]:
     drop_clearance = max(0.0, legacy_approach_height - dropoff_z)
     defaults: dict[str, Any] = {
         "execution_strategy": "closed_loop",
+        "cycle_confirmation": "automatic",
         "max_objects": 10,
         "filters": {
             "min_confidence": 0.0,
@@ -403,9 +417,9 @@ def color_sorting_task_defaults(config: RobotConfig) -> dict[str, Any]:
         "drop_approach_clearance_mm": drop_clearance,
         "pickup_phi_deg": 0.0,
         "drop_phi_deg": 0.0,
-        "downward_phi_deg": -90.0,
-        "pickup_preferred_phi_deg": -90.0,
-        "drop_preferred_phi_deg": -90.0,
+        "downward_phi_deg": -100.0,
+        "pickup_preferred_phi_deg": -100.0,
+        "drop_preferred_phi_deg": -100.0,
         "orientation_policy": "prefer_downward",
         "motion_modes": {
             "transfer": "joint",

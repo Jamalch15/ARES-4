@@ -11,7 +11,7 @@ from app import main
 from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import camera_settings, color_profiles
 from app.vision import VisionPipeline, workspace_aruco_settings
-from app.workspace_calibration import detect_fiducials
+from app.workspace_calibration import detect_fiducials, saved_homography
 
 
 def working_camera() -> dict:
@@ -53,6 +53,17 @@ def paste_aruco_marker(
     image[y0 : y0 + size_px, x0 : x0 + size_px] = marker_bgr
 
 
+def image_point_for_robot(settings: dict, robot_xy: list[float]) -> tuple[int, int]:
+    homography, metrics = saved_homography(settings, (480, 640, 3))
+    assert homography is not None, metrics
+    robot_to_image = np.linalg.inv(homography)
+    point = cv2.perspectiveTransform(
+        np.asarray([[[float(robot_xy[0]), float(robot_xy[1])]]], dtype=np.float64),
+        robot_to_image,
+    )[0][0]
+    return int(round(float(point[0]))), int(round(float(point[1])))
+
+
 def test_workspace_pipeline_detects_multiple_objects_and_masks_outside_workspace():
     camera = working_camera()
     image = np.full((480, 640, 3), 80, dtype=np.uint8)
@@ -76,6 +87,89 @@ def test_workspace_pipeline_detects_multiple_objects_and_masks_outside_workspace
     assert all({"id", "confidence", "center_px", "bbox_px", "timestamp"} <= detection.keys() for detection in result["detections"])
 
 
+def test_workspace_color_profile_detects_red_hue_wraparound_without_broad_fallback():
+    camera = working_camera()
+    camera["detection"] = {
+        **camera["detection"],
+        "show_unconfigured_colors": False,
+    }
+    image = np.full((480, 640, 3), 80, dtype=np.uint8)
+    wrapped_red = cv2.cvtColor(
+        np.asarray([[[176, 230, 235]]], dtype=np.uint8),
+        cv2.COLOR_HSV2BGR,
+    )[0][0]
+    cv2.circle(image, (260, 220), 18, tuple(int(value) for value in wrapped_red), -1)
+
+    result = VisionPipeline().process(image, camera, color_profiles(load_config(EXAMPLE_CONFIG_PATH)))
+
+    assert len(result["detections"]) == 1
+    detection = result["detections"][0]
+    assert detection["label"] == "red"
+    assert detection["task_eligible"]
+    assert detection["detector"] == "workspace_color"
+
+
+def test_workspace_color_uses_custom_profile_label_before_hardcoded_hue_name():
+    camera = working_camera()
+    camera["detection"] = {
+        **camera["detection"],
+        "show_unconfigured_colors": False,
+    }
+    profiles = {
+        "fixture_orange": {
+            "enabled": True,
+            "hsv_min": [15, 80, 60],
+            "hsv_max": [25, 255, 255],
+            "min_area_px": 50,
+            "drop_zone": "dropoff_a",
+        }
+    }
+    image = np.full((480, 640, 3), 80, dtype=np.uint8)
+    orange = cv2.cvtColor(
+        np.asarray([[[20, 220, 235]]], dtype=np.uint8),
+        cv2.COLOR_HSV2BGR,
+    )[0][0]
+    cv2.circle(image, (260, 220), 18, tuple(int(value) for value in orange), -1)
+
+    result = VisionPipeline().process(image, camera, profiles)
+
+    assert len(result["detections"]) == 1
+    detection = result["detections"][0]
+    assert detection["label"] == "fixture_orange"
+    assert detection["task_eligible"]
+
+
+def test_workspace_margin_expands_color_detection_mask():
+    camera = working_camera()
+    camera["detection"] = {
+        **camera["detection"],
+        "min_object_area_px": 20,
+    }
+    outside_left_edge_px = image_point_for_robot(
+        camera["calibration"]["workspace_aruco"],
+        [-250.0, 250.0],
+    )
+    image = np.full((480, 640, 3), 80, dtype=np.uint8)
+    cv2.circle(image, outside_left_edge_px, 7, (0, 0, 255), -1)
+
+    without_margin = VisionPipeline().process(
+        image,
+        camera,
+        {},
+    )
+
+    camera["calibration"]["workspace_aruco"]["workspace_margin_mm"] = 30.0
+    with_margin = VisionPipeline().process(
+        image,
+        camera,
+        {},
+    )
+
+    assert without_margin["detections"] == []
+    assert len(with_margin["detections"]) == 1
+    assert with_margin["detections"][0]["coordinate_source"] == "workspace_aruco_saved"
+
+
 def test_workspace_tag_detection_falls_back_to_apriltag_dictionary():
     camera = working_camera()
     settings = camera["calibration"]["workspace_aruco"]
@@ -96,6 +190,39 @@ def test_workspace_tag_detection_falls_back_to_apriltag_dictionary():
     assert detection.dictionary == "DICT_APRILTAG_36H11"
     assert detection.mode == "normal"
     assert detection.visible_ids == [0, 1, 2, 3]
+
+
+def test_workspace_tag_detection_handles_mirrored_camera_frames():
+    camera = working_camera()
+    settings = workspace_aruco_settings(camera)
+    image = np.full((480, 640, 3), 220, dtype=np.uint8)
+
+    for marker_id, center in settings["reference_points_px"].items():
+        paste_aruco_marker(
+            image,
+            "DICT_4X4_50",
+            int(marker_id),
+            (float(center[0]), float(center[1])),
+        )
+
+    mirrored = cv2.flip(image, 1)
+    detection = detect_fiducials(mirrored, settings)
+    centers = {
+        int(marker_id): np.mean(marker_corners, axis=0)
+        for marker_corners, marker_id in zip(
+            detection.corners,
+            detection.ids.reshape(-1),
+            strict=True,
+        )
+    }
+
+    assert detection.dictionary == "DICT_4X4_50"
+    assert detection.mode == "normal+mirror_x"
+    assert detection.visible_ids == [0, 1, 2, 3]
+    for marker_id, reference in settings["reference_points_px"].items():
+        center = centers[int(marker_id)]
+        assert center[0] == approx(mirrored.shape[1] - 1 - float(reference[0]), abs=1.5)
+        assert center[1] == approx(float(reference[1]), abs=1.5)
 
 
 def test_normal_pipeline_never_recalibrates_from_live_tags():
@@ -180,6 +307,29 @@ def test_workspace_projection_texture_uses_saved_homography_bounds():
     assert texture.shape == (316, 479, 3)
 
 
+def test_workspace_margin_expands_projection_texture_bounds():
+    camera = working_camera()
+    camera["calibration"]["workspace_aruco"]["workspace_margin_mm"] = 10.0
+    image = np.full((480, 640, 3), 80, dtype=np.uint8)
+
+    result = VisionPipeline().process(
+        image,
+        camera,
+        color_profiles(load_config(EXAMPLE_CONFIG_PATH)),
+        include_workspace_projection=True,
+    )
+    projection = result["workspace_projection"]
+
+    assert projection["robot_bounds_mm"] == {
+        "min_x": approx(-249.0),
+        "max_x": approx(249.0),
+        "min_y": approx(76.5),
+        "max_y": approx(411.5),
+        "z": approx(1.2),
+    }
+    assert projection["texture_size_px"] == {"width": 499, "height": 336}
+
+
 def test_reference_guided_detection_does_not_invent_tags_on_empty_workplate():
     settings = workspace_aruco_settings(working_camera())
     image = np.full((480, 640, 3), 170, dtype=np.uint8)
@@ -233,6 +383,40 @@ def test_workspace_calibrate_endpoint_collects_solves_and_saves(monkeypatch):
     assert payload["calibrated"]
     assert payload["result"]["frame_count"] == 12
     assert payload["result"]["metrics"]["fit_source"] == "workspace_outer_corners"
+    assert len(saved_results) == 1
+
+
+def test_workspace_calibrate_endpoint_accepts_mirrored_camera_frames(monkeypatch):
+    camera = working_camera()
+    settings = workspace_aruco_settings(camera)
+    image = np.full((480, 640, 3), 220, dtype=np.uint8)
+    for marker_id, center in settings["reference_points_px"].items():
+        paste_aruco_marker(
+            image,
+            "DICT_4X4_50",
+            int(marker_id),
+            (float(center[0]), float(center[1])),
+        )
+    mirrored = cv2.flip(image, 1)
+    saved_results = []
+    monkeypatch.setattr(main, "camera_settings", lambda _config: camera)
+    monkeypatch.setattr(main.camera_capture, "read", lambda _camera: mirrored.copy())
+    monkeypatch.setattr(
+        main,
+        "persist_workspace_calibration_result",
+        lambda result: saved_results.append(result) or {},
+    )
+
+    response = TestClient(main.app).post(
+        "/api/vision/workspace/calibrate",
+        json={"max_frames": 12, "sample_interval_ms": 0},
+    )
+    payload = response.json()
+
+    assert payload["ok"], payload.get("error")
+    assert payload["calibrated"]
+    assert payload["result"]["detection_mode"] == "normal+mirror_x"
+    assert payload["detections"][0]["center_px"]["x"] > 500
     assert len(saved_results) == 1
 
 

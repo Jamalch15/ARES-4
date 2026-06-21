@@ -9,7 +9,13 @@ from app.config import (
     load_config,
     matlab_geometry_to_dh_rows,
 )
-from app.kinematics import differential_ik_step, forward_kinematics, inverse_kinematics
+from app.kinematics import (
+    _candidate_continuity_error,
+    _task_vector,
+    differential_ik_step,
+    forward_kinematics,
+    inverse_kinematics,
+)
 
 
 def test_forward_kinematics_zero_pose_extends_up_from_shoulder():
@@ -126,6 +132,23 @@ def test_forward_kinematics_exposes_flange_tool_and_tcp_frames():
     assert result["tcp_frame"]["axes"]["z"]["y"] == approx(1.0, abs=1e-9)
     assert result["tcp_frame"]["axes"]["z"]["z"] == approx(0.0, abs=1e-9)
     assert result["tcp_frame"]["notes"].startswith("Origin is flange origin")
+
+
+def test_compact_ik_task_vector_matches_full_forward_kinematics():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+
+    for angles in (
+        config.home_pose,
+        [15.0, 35.0, 30.0, -20.0],
+        [-60.0, -20.0, 30.0, -80.0],
+    ):
+        full = forward_kinematics(angles, config.links)
+        compact = _task_vector(angles, config.links)
+
+        assert compact[0] == approx(full["x_mm"], abs=1e-9)
+        assert compact[1] == approx(full["y_mm"], abs=1e-9)
+        assert compact[2] == approx(full["z_mm"], abs=1e-9)
+        assert compact[3] == approx(full["tool_phi_deg"], abs=1e-9)
 
 
 def test_inverse_kinematics_round_trips_reachable_target():
@@ -384,6 +407,16 @@ def test_inverse_kinematics_prefers_nearest_valid_solution():
     assert second["selected_branch"] == expected["branch"]
 
 
+def test_ik_continuity_scores_actual_commanded_joint_travel_not_wrapped_distance():
+    current = [135.0, 0.0, 0.0, 0.0]
+    numerically_short = {"angles_deg": [45.0, 0.0, 0.0, 0.0]}
+    wrapped_long = {"angles_deg": [-135.0, 0.0, 0.0, 0.0]}
+
+    assert _candidate_continuity_error(numerically_short, current) == approx(90.0)
+    assert _candidate_continuity_error(wrapped_long, current) == approx(270.0)
+    assert _candidate_continuity_error(numerically_short, current) < _candidate_continuity_error(wrapped_long, current)
+
+
 def test_inverse_kinematics_auto_prefers_continuity_over_tiny_error_difference():
     config = load_config(EXAMPLE_CONFIG_PATH)
     current = [40.0, 45.0, 20.0, 40.0]
@@ -428,6 +461,53 @@ def test_analytic_seed_round_trips_multiple_fk_targets_from_home():
         assert "analytic_seed" in result["notes"]
         assert result["selected"]["position_error_mm"] <= 1.0
         assert result["selected"]["phi_error_deg"] <= 1.0
+
+
+def test_analytic_seed_handles_non_forward_tcp_offset_components():
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    rows = [
+        replace(row, d_mm=157.3)
+        if row.joint_index == 0
+        else replace(row, d_mm=42.7)
+        if row.joint_index == 1
+        else replace(row, d_mm=-41.5)
+        if row.joint_index == 2
+        else replace(row, d_mm=48.7, a_mm=41.99)
+        for row in config.links.dh_rows
+    ]
+    links = replace(
+        config.links,
+        base_side_offset_mm=33.7,
+        dh_rows=rows,
+        tool_tcp_offset_mm={"x": -20.0, "y": 0.0, "z": 145.6},
+    )
+    joints = [
+        replace(config.joints[0], min_deg=-160.0, max_deg=160.0),
+        replace(config.joints[1], min_deg=0.0, max_deg=180.0, home_deg=90.0),
+        replace(config.joints[2], min_deg=-120.0, max_deg=120.0),
+        replace(config.joints[3], min_deg=-120.0, max_deg=120.0),
+    ]
+    pose = [126.7, 171.85, 56.37, 110.37]
+    target_fk = forward_kinematics(pose, links)
+
+    result = inverse_kinematics(
+        {
+            "x_mm": target_fk["x_mm"],
+            "y_mm": target_fk["y_mm"],
+            "z_mm": target_fk["z_mm"],
+            "phi_deg": target_fk["tool_phi_deg"],
+        },
+        links,
+        joints,
+        [joint.home_deg for joint in joints],
+    )
+
+    assert result["ok"], result["notes"]
+    selected_fk = result["selected"]["fk"]
+    assert selected_fk["x_mm"] == approx(target_fk["x_mm"], abs=1.0)
+    assert selected_fk["y_mm"] == approx(target_fk["y_mm"], abs=1.0)
+    assert selected_fk["z_mm"] == approx(target_fk["z_mm"], abs=1.0)
+    assert selected_fk["tool_phi_deg"] == approx(target_fk["tool_phi_deg"], abs=1.0)
 
 
 def test_forward_kinematics_exposes_dh_frames():

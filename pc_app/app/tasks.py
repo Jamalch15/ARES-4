@@ -7,7 +7,7 @@ from typing import Any
 
 from .config import RobotConfig
 from .demo_settings import (
-    calibration_settings,
+    active_tool_dimensions_validated,
     color_sorting_task_defaults,
     drop_zones,
     named_positions,
@@ -21,13 +21,14 @@ from .task_destinations import task_destination_errors
 
 
 SUPPORTED_STRATEGIES = {"closed_loop", "batch_once"}
+SUPPORTED_CYCLE_CONFIRMATION = {"automatic", "confirm_each_object"}
 SUPPORTED_ORDERING = {"nearest_to_safe", "largest", "left_to_right", "color_priority", "manual", "color"}
 SUPPORTED_ORIENTATION = {"fixed", "auto", "per_color", "prefer_downward"}
 SUPPORTED_MOTION_MODES = {"joint", "linear"}
 SUPPORTED_PLACEMENT = {"fixed", "grid", "zone_grid"}
 SUPPORTED_MISSING_ZONE_POLICIES = {"error", "ignore"}
 SUPPORTED_UNKNOWN_COLOR_POLICIES = {"error", "ignore"}
-DEFAULT_DOWNWARD_PHI_DEG = -90.0
+DEFAULT_DOWNWARD_PHI_DEG = -100.0
 
 
 class TaskSettingsError(ValueError):
@@ -200,6 +201,11 @@ def normalize_color_sorting_settings(
 
     strategy = _choice(settings.get("execution_strategy", "closed_loop"), SUPPORTED_STRATEGIES, "execution_strategy")
     settings["execution_strategy"] = strategy
+    settings["cycle_confirmation"] = _choice(
+        settings.get("cycle_confirmation", "automatic"),
+        SUPPORTED_CYCLE_CONFIRMATION,
+        "cycle_confirmation",
+    )
     settings["max_objects"] = _positive_int(settings.get("max_objects", 10), "max_objects")
     settings["pickup_z_mm"] = _nonnegative_number(settings.get("pickup_z_mm", 25.0), "pickup_z_mm")
     settings["dropoff_z_mm"] = _nonnegative_number(settings.get("dropoff_z_mm", 45.0), "dropoff_z_mm")
@@ -699,8 +705,20 @@ def build_pick_and_place_sequence(
     ]
     for tool_step in [release_tool, capture_tool, final_release_tool]:
         tool_step.update({key: value for key, value in object_meta.items() if value is not None})
+    waypoint_meta_keys = (
+        "object_index",
+        "detection_id",
+        "color",
+        "drop_zone",
+        "grid_slot",
+        "phase",
+    )
     waypoints = [
-        {**step["waypoint"], "label": step.get("label")}
+        {
+            **step["waypoint"],
+            "label": step.get("label"),
+            **{key: deepcopy(step[key]) for key in waypoint_meta_keys if key in step},
+        }
         for step in steps
         if step["kind"] == "move"
     ]
@@ -1019,7 +1037,7 @@ def build_color_sorting_plan(
     candidates = filtering["candidates"]
     ignored = filtering["ignored"]
     warnings: list[str] = []
-    if not calibration_settings(config).get("tool_dimensions_validated", False):
+    if not active_tool_dimensions_validated(config):
         warnings.append("active tool dimensions are not validated for hardware")
     errors = list(filtering["errors"])
     ordered = order_sorting_candidates(config, candidates, settings)

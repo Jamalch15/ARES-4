@@ -7,7 +7,7 @@ import subprocess
 import shutil
 import tempfile
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from itertools import product
 from math import dist, isfinite
@@ -31,6 +31,7 @@ from .apriltag_calibration import (
 )
 from .cartesian_servo import CartesianServo, CartesianServoLimits
 from .cartesian_calibration import (
+    DEFAULT_CALIBRATION_MODEL,
     calibration_context as kinematics_calibration_context,
     calibration_settings as kinematics_calibration_settings,
     calibration_summary as kinematics_calibration_summary,
@@ -39,11 +40,13 @@ from .cartesian_calibration import (
     create_sample as create_kinematics_calibration_sample,
     fit_profile as fit_kinematics_calibration_profile,
     predict_physical_pose,
+    save_manual_radial_offsets,
     workspace_context as kinematics_workspace_context,
 )
 from .calibration_truth import model_truth_summary
 from .config import LinkConfig, RobotConfig, ensure_local_config, load_config, save_calibration_updates
 from .demo_settings import (
+    active_tool_dimensions_validated,
     camera_settings,
     calibration_settings,
     color_sorting_task_defaults,
@@ -272,6 +275,7 @@ live_task: asyncio.Task[None] | None = None
 task_task: asyncio.Task[None] | None = None
 task_selection_events: dict[str, asyncio.Event] = {}
 task_selection_choices: dict[str, str] = {}
+task_confirmation_events: dict[str, asyncio.Event] = {}
 simulation_vision_queue: list[dict[str, Any]] = []
 latest_vision_snapshot: dict[str, Any] = {}
 cartesian_jog_task: asyncio.Task[None] | None = None
@@ -328,6 +332,64 @@ def stable_payload_fingerprint(payload: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _fingerprint_number(value: Any, *, digits: int = 3) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(numeric):
+        return None
+    return round(numeric, digits)
+
+
+def _task_detection_signature(detection: Any, index: int) -> dict[str, Any]:
+    if not isinstance(detection, dict):
+        return {"index": index, "invalid": True, "type": type(detection).__name__}
+
+    robot = detection.get("robot") or detection.get("target") or {}
+    if not isinstance(robot, dict):
+        robot = {}
+    bbox = detection.get("bbox_px") or detection.get("bbox") or {}
+    if not isinstance(bbox, dict):
+        bbox = {}
+    area_px = detection.get("area_px")
+    if area_px is None and bbox:
+        width = _fingerprint_number(bbox.get("width"))
+        height = _fingerprint_number(bbox.get("height"))
+        area_px = width * height if width is not None and height is not None else None
+
+    detection_id = detection.get("id", detection.get("detection_id", detection.get("object_id")))
+    return {
+        "index": index,
+        "id": str(detection_id) if detection_id is not None else f"detection-{index + 1}",
+        "ok": bool(detection.get("ok", True)),
+        "color": str(detection.get("label", detection.get("color", ""))).strip().lower(),
+        "confidence": _fingerprint_number(detection.get("confidence", detection.get("quality", 1.0)), digits=4),
+        "area_px": _fingerprint_number(area_px, digits=2),
+        "drop_zone": str(detection.get("drop_zone") or ""),
+        "robot": {
+            "x_mm": _fingerprint_number(robot.get("x_mm", robot.get("x"))),
+            "y_mm": _fingerprint_number(robot.get("y_mm", robot.get("y"))),
+            "z_mm": _fingerprint_number(robot.get("z_mm", robot.get("z"))),
+        },
+    }
+
+
+def task_detection_fingerprint(detections: list[Any]) -> str:
+    """Fingerprint only the detection fields that can affect task planning.
+
+    The raw vision payload may contain volatile detector metadata or browser
+    round-trip representation differences. A task preview only needs to know
+    whether the object queue that drives filtering and motion targets changed.
+    """
+
+    signatures = [
+        _task_detection_signature(detection, index)
+        for index, detection in enumerate(detections)
+    ]
+    return stable_payload_fingerprint(signatures)
+
+
 def public_program_record(program: dict[str, Any]) -> dict[str, Any]:
     record = deepcopy(program)
     cached_plan = record.pop("cached_plan", None)
@@ -344,14 +406,53 @@ def public_program_record(program: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def task_mapping_fingerprint() -> str:
+def task_runtime_config(
+    base_config: RobotConfig,
+    task_settings: dict[str, Any] | None = None,
+) -> RobotConfig:
+    settings = task_settings if isinstance(task_settings, dict) else {}
+    raw = deepcopy(base_config.raw)
+    profile_overrides = settings.get("color_profile_overrides")
+    if isinstance(profile_overrides, dict):
+        profiles = deepcopy(raw.get("color_profiles", {}))
+        for name, profile in profile_overrides.items():
+            normalized = str(name).strip().lower()
+            if not normalized or not isinstance(profile, dict):
+                continue
+            merged = deepcopy(profiles.get(normalized, {}))
+            merged.update({key: deepcopy(value) for key, value in profile.items() if key != "draft"})
+            profiles[normalized] = merged
+        raw["color_profiles"] = profiles
+
+    destination_overrides = settings.get("task_destination_overrides")
+    if isinstance(destination_overrides, dict):
+        nested = destination_overrides.get("destinations")
+        source = nested if isinstance(nested, dict) else destination_overrides
+        destinations = {
+            str(name): deepcopy(destination)
+            for name, destination in source.items()
+            if name not in {"schema_version", "updated_at"} and isinstance(destination, dict)
+        }
+        raw["task_destinations"] = task_destination_payload(destinations)
+        draft_config = replace(base_config, raw=raw)
+        resolved = resolve_task_destinations(draft_config, named_positions(draft_config))
+        raw["drop_zones"] = legacy_drop_zones_from_task_destinations(resolved)
+
+    return replace(base_config, raw=raw)
+
+
+def task_mapping_fingerprint(task_settings: dict[str, Any] | None = None) -> str:
+    effective_config = task_runtime_config(config, task_settings)
     try:
-        destinations = drop_zones(config)
+        destinations = drop_zones(effective_config)
     except TaskDestinationError:
-        destinations = config.raw.get("task_destinations", config.raw.get("drop_zones", {}))
+        destinations = effective_config.raw.get(
+            "task_destinations",
+            effective_config.raw.get("drop_zones", {}),
+        )
     return stable_payload_fingerprint(
         {
-            "color_profiles": color_profiles(config),
+            "color_profiles": color_profiles(effective_config),
             "task_destinations": destinations,
         }
     )
@@ -365,6 +466,7 @@ def register_vision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "id": snapshot_id,
         "captured_at": captured_at,
         "fingerprint": stable_payload_fingerprint(detections),
+        "task_fingerprint": task_detection_fingerprint(detections),
         "provider": payload.get("provider"),
         "calibration_source": payload.get("calibration_source"),
     }
@@ -375,6 +477,7 @@ def register_vision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "captured_at": captured_at,
         "detection_snapshot_id": snapshot_id,
         "detection_fingerprint": snapshot["fingerprint"],
+        "detection_task_fingerprint": snapshot["task_fingerprint"],
     }
 
 
@@ -552,7 +655,7 @@ def task_preview_stale_reason(preview: dict[str, Any]) -> str | None:
     base_reason = preview_stale_reason(preview)
     if base_reason:
         return base_reason
-    if preview.get("destination_revision") != task_mapping_fingerprint():
+    if preview.get("destination_revision") != task_mapping_fingerprint(preview.get("task_settings")):
         return "task destinations or color mappings changed after preview; preview the task again"
     expected_contract = preview.get("task_settings_revision")
     actual_contract = task_contract_fingerprint(
@@ -567,9 +670,185 @@ def task_preview_stale_reason(preview: dict[str, Any]) -> str | None:
         snapshot_id = str(preview.get("detection_snapshot_id") or "")
         if not latest_vision_snapshot or snapshot_id != str(latest_vision_snapshot.get("id") or ""):
             return "detection snapshot changed after preview; refresh detections and preview the task again"
-        if preview.get("detection_fingerprint") != latest_vision_snapshot.get("fingerprint"):
+        preview_task_fingerprint = preview.get("detection_task_fingerprint")
+        latest_task_fingerprint = latest_vision_snapshot.get("task_fingerprint")
+        if preview_task_fingerprint and latest_task_fingerprint:
+            if preview_task_fingerprint != latest_task_fingerprint:
+                return "detection contents changed after preview; refresh detections and preview the task again"
+        elif preview.get("detection_fingerprint") != latest_vision_snapshot.get("fingerprint"):
             return "detection contents changed after preview; refresh detections and preview the task again"
     return None
+
+
+def _task_failed_waypoint_index(preview_result: dict[str, Any]) -> int | None:
+    trajectory = preview_result.get("trajectory")
+    if not isinstance(trajectory, dict):
+        preview = preview_result.get("preview")
+        trajectory = preview.get("trajectory") if isinstance(preview, dict) else None
+    if not isinstance(trajectory, dict):
+        return None
+    step_results = trajectory.get("step_results")
+    if not isinstance(step_results, list):
+        return None
+    for result in step_results:
+        if not isinstance(result, dict):
+            continue
+        status = str(result.get("status") or "").lower()
+        errors = result.get("errors")
+        if status == "invalid" or (isinstance(errors, list) and errors):
+            try:
+                return int(result.get("index"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _task_failed_object(preview_result: dict[str, Any], sequence: dict[str, Any]) -> dict[str, Any] | None:
+    waypoint_index = _task_failed_waypoint_index(preview_result)
+    waypoints = sequence.get("waypoints")
+    if waypoint_index is None or not isinstance(waypoints, list) or not 0 <= waypoint_index < len(waypoints):
+        return None
+    waypoint = waypoints[waypoint_index]
+    if not isinstance(waypoint, dict) or waypoint.get("object_index") is None:
+        return None
+    try:
+        object_index = int(waypoint["object_index"])
+    except (TypeError, ValueError):
+        return None
+    for item in sequence.get("objects", []):
+        if isinstance(item, dict) and int(item.get("index", -1)) == object_index:
+            return item
+    return {"index": object_index}
+
+
+def _task_motion_failure_message(preview_result: dict[str, Any]) -> str:
+    error = str(preview_result.get("error") or "").strip()
+    if error:
+        return error
+    trajectory = preview_result.get("trajectory")
+    if isinstance(trajectory, dict):
+        errors = trajectory.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(str(item) for item in errors)
+    return "object has no valid IK path"
+
+
+def _drop_task_object_for_motion_failure(
+    sequence: dict[str, Any],
+    failed_object: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    skipped_original_index = int(failed_object.get("index", -1))
+    updated = deepcopy(sequence)
+    updated["steps"] = [
+        step
+        for step in updated.get("steps", [])
+        if not isinstance(step, dict) or int(step.get("object_index", -1)) != skipped_original_index
+    ]
+    updated["waypoints"] = [
+        waypoint
+        for waypoint in updated.get("waypoints", [])
+        if not isinstance(waypoint, dict) or int(waypoint.get("object_index", -1)) != skipped_original_index
+    ]
+    remaining_objects = [
+        obj
+        for obj in updated.get("objects", [])
+        if isinstance(obj, dict) and int(obj.get("index", -1)) != skipped_original_index
+    ]
+    index_map = {
+        int(obj.get("index")): new_index
+        for new_index, obj in enumerate(remaining_objects, start=1)
+        if obj.get("index") is not None
+    }
+    for obj in remaining_objects:
+        old_index = int(obj.get("index", 0))
+        obj["index"] = index_map.get(old_index, old_index)
+    for collection_name in ("steps", "waypoints"):
+        for item in updated.get(collection_name, []):
+            if isinstance(item, dict) and item.get("object_index") is not None:
+                old_index = int(item.get("object_index"))
+                if old_index in index_map:
+                    item["object_index"] = index_map[old_index]
+    updated["objects"] = remaining_objects
+    updated["object_count"] = len(remaining_objects)
+
+    detection_id = str(failed_object.get("detection_id") or f"object-{skipped_original_index}")
+    skip_message = f"skipped {detection_id}: {reason}"
+    preview = updated.get("task_preview")
+    if isinstance(preview, dict):
+        preview["selected_objects"] = remaining_objects
+        preview["next_object"] = remaining_objects[0] if remaining_objects else None
+        warnings = list(preview.get("warnings") or [])
+        warnings.append(skip_message)
+        preview["warnings"] = warnings
+        ignored = list(preview.get("ignored_detections") or [])
+        ignored.append(
+            {
+                "detection_id": detection_id,
+                "color": failed_object.get("color"),
+                "ok": False,
+                "reason_code": "ik_unreachable",
+                "reason": reason,
+                "message": skip_message,
+            }
+        )
+        preview["ignored_detections"] = ignored
+        candidate_objects = preview.get("candidate_objects")
+        if isinstance(candidate_objects, list):
+            preview["candidate_objects"] = [
+                item
+                for item in candidate_objects
+                if not isinstance(item, dict) or str(item.get("detection_id")) != detection_id
+            ]
+        assigned_targets = preview.get("assigned_targets")
+        if isinstance(assigned_targets, list):
+            preview["assigned_targets"] = [
+                item
+                for item in assigned_targets
+                if not isinstance(item, dict) or str(item.get("detection_id")) != detection_id
+            ]
+    return updated
+
+
+def build_task_motion_preview_skipping_failed_objects(
+    sequence: dict[str, Any],
+    *,
+    links: LinkConfig,
+    settings: dict[str, Any],
+    branch: str,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    current_sequence = deepcopy(sequence)
+    skipped: list[dict[str, Any]] = []
+    skipped_indexes: set[int] = set()
+    while True:
+        preview_result = build_preview(
+            mode="program",
+            target=None,
+            waypoint_program=current_sequence.get("waypoints", []),
+            links=links,
+            settings=settings,
+            branch=branch,
+            source="task",
+        )
+        if preview_result.get("ok"):
+            return preview_result, current_sequence, skipped
+        failed_object = _task_failed_object(preview_result, current_sequence)
+        if failed_object is None:
+            return preview_result, current_sequence, skipped
+        failed_index = int(failed_object.get("index", -1))
+        if failed_index in skipped_indexes:
+            return preview_result, current_sequence, skipped
+        skipped_indexes.add(failed_index)
+        reason = _task_motion_failure_message(preview_result)
+        skipped.append({**deepcopy(failed_object), "reason": reason})
+        current_sequence = _drop_task_object_for_motion_failure(current_sequence, failed_object, reason)
+        if not current_sequence.get("objects") or not current_sequence.get("waypoints"):
+            failure = {
+                **preview_result,
+                "ok": False,
+                "error": "no task objects have a reachable IK path",
+            }
+            return failure, current_sequence, skipped
 
 
 app = FastAPI(title="4DOF Robot Arm Control Dashboard")
@@ -741,6 +1020,10 @@ class ToolsRequest(BaseModel):
     presets: dict[str, dict[str, Any]] | None = None
 
 
+class ToolDimensionsValidationRequest(BaseModel):
+    validated: bool = True
+
+
 class NamedPositionsRequest(BaseModel):
     positions: dict[str, dict[str, Any]]
 
@@ -779,7 +1062,7 @@ class WorkspaceCalibrationRequest(BaseModel):
 
 
 class WorkspaceCalibrationRunRequest(BaseModel):
-    max_frames: int = 36
+    max_frames: int = 120
     sample_interval_ms: int = 60
 
 
@@ -817,6 +1100,10 @@ class TaskSelectionRequest(BaseModel):
     detection_id: str
 
 
+class TaskContinueRequest(BaseModel):
+    run_id: str
+
+
 class KinematicsCalibrationTargetsRequest(BaseModel):
     count: int = 12
     z_mm: float = 45.0
@@ -843,9 +1130,16 @@ class KinematicsCalibrationSampleRequest(BaseModel):
 
 
 class KinematicsCalibrationFitRequest(BaseModel):
-    model_type: str = "affine_xy_z_offset"
+    model_type: str = DEFAULT_CALIBRATION_MODEL
     profile_key: str | None = None
     enable_after_fit: bool = False
+
+
+class KinematicsCalibrationManualOffsetsRequest(BaseModel):
+    reach_offset_mm: float = 0.0
+    z_offset_mm: float = 0.0
+    profile_key: str | None = None
+    enabled: bool = False
 
 
 class KinematicsCalibrationEnableRequest(BaseModel):
@@ -1126,6 +1420,43 @@ def validate_tools_payload(tools: dict[str, Any]) -> list[str]:
         except (TypeError, ValueError) as exc:
             errors.append(str(exc))
     return errors
+
+
+def _tool_dimensions_signature(preset: dict[str, Any] | None) -> str:
+    tool = preset if isinstance(preset, dict) else {}
+    return stable_payload_fingerprint(
+        {
+            "type": tool.get("type", "generic"),
+            "tcp_offset_mm": tool.get("tcp_offset_mm", {}),
+        }
+    )
+
+
+def _invalidate_changed_tool_validations(
+    previous_tools: dict[str, Any],
+    next_tools: dict[str, Any],
+) -> None:
+    previous_presets = previous_tools.get("presets") if isinstance(previous_tools.get("presets"), dict) else {}
+    next_presets = next_tools.get("presets") if isinstance(next_tools.get("presets"), dict) else {}
+    for name, preset in next_presets.items():
+        if not isinstance(preset, dict):
+            continue
+        previous = previous_presets.get(name) if isinstance(previous_presets.get(name), dict) else None
+        if previous is None or _tool_dimensions_signature(previous) != _tool_dimensions_signature(preset):
+            preset["dimensions_validated"] = False
+            preset.pop("dimensions_validated_at", None)
+
+
+def _active_tool_validation_from_payload(
+    tools: dict[str, Any],
+    fallback: bool = False,
+) -> bool:
+    active = str(tools.get("active", "gripper"))
+    presets = tools.get("presets") if isinstance(tools.get("presets"), dict) else {}
+    preset = presets.get(active) if isinstance(presets.get(active), dict) else {}
+    if "dimensions_validated" in preset:
+        return bool(preset.get("dimensions_validated"))
+    return bool(fallback)
 
 
 def active_tool_hardware_errors() -> list[str]:
@@ -1670,7 +2001,16 @@ def cancel_motion_tasks() -> None:
     active_motion_run_id = None
 
 
-ACTIVE_TASK_STATUSES = {"queued", "running", "capturing", "planning", "executing", "waiting_for_selection", "stopping"}
+ACTIVE_TASK_STATUSES = {
+    "queued",
+    "running",
+    "capturing",
+    "planning",
+    "executing",
+    "waiting_for_selection",
+    "waiting_for_confirmation",
+    "stopping",
+}
 TERMINAL_TASK_STATUSES = {"completed", "failed", "stopped"}
 UNCERTAIN_HOLD_STATES = {"possibly_held", "confirmed_held", "release_unconfirmed"}
 
@@ -1798,7 +2138,7 @@ def task_motion_gate_reason() -> str | None:
         tool_errors = active_tool_hardware_errors()
         if tool_errors:
             return "; ".join(tool_errors)
-        if not calibration_settings(config).get("tool_dimensions_validated", False):
+        if not active_tool_dimensions_validated(config):
             return "task execution requires validated active-tool dimensions"
     can_move = validate_can_move(state)
     if not can_move.ok:
@@ -3129,6 +3469,7 @@ async def execute_program_sequence(preview: dict[str, Any]) -> None:
     execution_steps = list(preview.get("trajectory", {}).get("execution_steps") or [])
     if not execution_steps:
         state.set_error("program preview has no executable steps")
+        finish_motion_diagnostics("failed", state.last_error)
         await broadcast_state()
         return
 
@@ -3136,6 +3477,8 @@ async def execute_program_sequence(preview: dict[str, Any]) -> None:
     try:
         for step_number, execution_step in enumerate(execution_steps, start=1):
             if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
+                finish_motion_diagnostics("stopped", state.motion_state.value)
+                await broadcast_state()
                 return
             label = str(execution_step.get("label") or f"Step {step_number}")
             if execution_step.get("kind") == "tool":
@@ -3181,6 +3524,7 @@ async def execute_program_sequence(preview: dict[str, Any]) -> None:
             trajectory = execution_step.get("trajectory")
             if not isinstance(trajectory, dict):
                 state.set_error(f"program step {step_number} is missing its planned trajectory")
+                finish_motion_diagnostics("failed", state.last_error)
                 await broadcast_state()
                 return
             step_preview = {
@@ -3205,6 +3549,12 @@ async def execute_program_sequence(preview: dict[str, Any]) -> None:
             finish_motion_diagnostics("stopped", "cancelled")
             await broadcast_state()
         raise
+    except Exception as exc:
+        message = f"program execution failed: {exc}"
+        state.set_error(message, fault=not state.simulation)
+        finish_motion_diagnostics("failed", message)
+        log_event("motion", "program execution failed", error=str(exc))
+        await broadcast_state()
 
 
 async def execute_task_sequence(
@@ -3303,7 +3653,9 @@ async def execute_task_sequence(
             preview["task_step_index"] = step_index
             preview["task_step_total"] = len(steps)
             trajectory_mode = str(preview.get("trajectory", {}).get("mode", preview.get("mode", ""))).lower()
-            if trajectory_mode == "joint":
+            if preview.get("mode") == "program" and preview.get("trajectory", {}).get("execution_steps"):
+                await execute_program_sequence(preview)
+            elif trajectory_mode == "joint":
                 await execute_joint_endpoint_move(preview)
             else:
                 await execute_waypoint_path(preview)
@@ -3333,6 +3685,15 @@ async def execute_task_sequence(
                     completed_count=completed,
                     remaining_count=max(0, total - completed),
                 )
+                if (
+                    next_object_index is not None
+                    and settings.get("cycle_confirmation") == "confirm_each_object"
+                ):
+                    run_id = str((state.task_execution or {}).get("run_id") or "")
+                    if not run_id:
+                        failed_reason = "task confirmation run ID is missing"
+                        break
+                    await wait_for_task_confirmation(run_id)
         return {
             "ok": failed_reason is None and not stopped and state.motion_state != MotionState.FAULT,
             "error": failed_reason or (state.motion_state.value if stopped else ""),
@@ -3443,9 +3804,25 @@ async def wait_for_manual_task_selection(run_id: str, candidates: list[dict[str,
         task_selection_events.pop(run_id, None)
 
 
+async def wait_for_task_confirmation(run_id: str) -> None:
+    event = asyncio.Event()
+    task_confirmation_events[run_id] = event
+    update_task_execution(
+        status="waiting_for_confirmation",
+        phase="waiting_for_confirmation",
+        current_step={"label": "waiting for operator", "kind": "operator"},
+    )
+    await broadcast_state()
+    try:
+        await event.wait()
+    finally:
+        task_confirmation_events.pop(run_id, None)
+
+
 async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
     run_id = str((state.task_execution or {}).get("run_id") or uuid4())
     task_settings = normalize_color_sorting_settings(config, preview.get("task_settings"))
+    runtime_config = task_runtime_config(config, task_settings)
     path_settings = preview.get("settings", {})
     branch = preview.get("branch", "auto")
     completed = 0
@@ -3510,9 +3887,9 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             )
             await broadcast_state()
             plan = build_color_sorting_plan(
-                config,
+                runtime_config,
                 capture.get("detections", []),
-                color_profiles(config),
+                color_profiles(runtime_config),
                 task_settings={
                     **task_settings,
                     "execution_strategy": "closed_loop",
@@ -3539,9 +3916,9 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                     await broadcast_state()
                     return
                 plan = build_color_sorting_plan(
-                    config,
+                    runtime_config,
                     capture.get("detections", []),
-                    color_profiles(config),
+                    color_profiles(runtime_config),
                     task_settings={
                         **task_settings,
                         "execution_strategy": "closed_loop",
@@ -3579,21 +3956,57 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
                 await broadcast_state()
                 return
 
-            preflight = build_preview(
-                mode="program",
-                target=None,
-                waypoint_program=plan.get("waypoints", []),
-                links=config.links,
-                settings=path_settings,
-                branch=branch,
-                source="task",
-            )
-            if not preflight.get("ok"):
-                reason = preflight.get("error", "closed-loop cycle preflight failed")
-                state.set_error(reason)
-                finish_task_execution("failed", reason)
+            skipped_preflight_ids: set[str] = set()
+            while True:
+                preflight, plan, skipped_objects = build_task_motion_preview_skipping_failed_objects(
+                    plan,
+                    links=runtime_config.links,
+                    settings=path_settings,
+                    branch=branch,
+                )
+                metadata = plan.get("task_preview", {})
+                for skipped in skipped_objects:
+                    if skipped.get("detection_id") is not None:
+                        skipped_preflight_ids.add(str(skipped["detection_id"]))
+                if preflight.get("ok"):
+                    break
+                candidate_ids = [
+                    str(item.get("detection_id"))
+                    for item in metadata.get("candidate_objects", [])
+                    if isinstance(item, dict)
+                    and item.get("detection_id") is not None
+                    and str(item.get("detection_id")) not in skipped_preflight_ids
+                ]
+                if not candidate_ids:
+                    reason = preflight.get("error", "closed-loop cycle preflight failed")
+                    if reason == "no task objects have a reachable IK path":
+                        terminal_reason = "no reachable task objects"
+                        finish_task_execution("completed", terminal_reason)
+                        await broadcast_state()
+                        return
+                    state.set_error(reason)
+                    finish_task_execution("failed", reason)
+                    await broadcast_state()
+                    return
+                plan = build_color_sorting_plan(
+                    runtime_config,
+                    capture.get("detections", []),
+                    color_profiles(runtime_config),
+                    task_settings={
+                        **task_settings,
+                        "execution_strategy": "closed_loop",
+                        "_initial_zone_counts": grid_zone_counts,
+                    },
+                    selected_detection_ids=[candidate_ids[0]],
+                )
+                metadata = plan.get("task_preview", {})
+                update_task_execution(
+                    ignored_objects=metadata.get("ignored_detections", []),
+                    candidate_objects=metadata.get("candidate_objects", []),
+                    warnings=metadata.get("warnings", []),
+                    current_object=metadata.get("next_object"),
+                )
                 await broadcast_state()
-                return
 
             update_task_execution(
                 status="executing",
@@ -3629,6 +4042,11 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
             )
             await broadcast_state()
             await asyncio.sleep(max(0.0, float(task_settings.get("tool_settle_ms", 0)) / 1000.0))
+            if (
+                completed < int(task_settings.get("max_objects", 1))
+                and task_settings.get("cycle_confirmation") == "confirm_each_object"
+            ):
+                await wait_for_task_confirmation(run_id)
 
         terminal_reason = "max_objects reached"
         finish_task_execution("completed", terminal_reason)
@@ -3640,6 +4058,7 @@ async def execute_closed_loop_sorting(preview: dict[str, Any]) -> None:
     finally:
         task_selection_events.pop(run_id, None)
         task_selection_choices.pop(run_id, None)
+        task_confirmation_events.pop(run_id, None)
 
 
 def reload_runtime_config(
@@ -4177,7 +4596,8 @@ async def get_tools() -> dict[str, Any]:
 
 @app.post("/api/tools")
 async def save_tools(request: ToolsRequest) -> dict[str, Any]:
-    tools = tools_settings(config)
+    previous_tools = tools_settings(config)
+    tools = deepcopy(previous_tools)
     tools["active"] = request.active
     if request.presets:
         presets = tools.setdefault("presets", {})
@@ -4185,6 +4605,7 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
             merged = presets.get(name, {})
             merged.update(preset)
             presets[name] = merged
+    _invalidate_changed_tool_validations(previous_tools, tools)
     errors = validate_tools_payload(tools)
     if errors:
         state.set_error("; ".join(errors))
@@ -4192,7 +4613,10 @@ async def save_tools(request: ToolsRequest) -> dict[str, Any]:
         return {"ok": False, "errors": errors, "error": state.last_error, "state": state.to_dict()}
     try:
         calibration = calibration_settings(config)
-        calibration["tool_dimensions_validated"] = False
+        calibration["tool_dimensions_validated"] = _active_tool_validation_from_payload(
+            tools,
+            bool(calibration.get("tool_dimensions_validated", False)),
+        )
         config_path = ensure_local_config()
         updates = {"tools": tools, "calibration": calibration}
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -5412,7 +5836,7 @@ async def save_kinematics_calibration_sample(
             {
                 "tool": profile_key,
                 "enabled": bool(profile.get("enabled", False)),
-                "model_type": str(profile.get("model_type") or settings.get("default_model") or "affine_xy_z_offset"),
+                "model_type": str(profile.get("model_type") or settings.get("default_model") or DEFAULT_CALIBRATION_MODEL),
                 "workspace": kinematics_workspace_context(config),
                 "context": kinematics_calibration_context(config, profile_key),
                 "samples": samples,
@@ -5468,6 +5892,39 @@ async def delete_kinematics_calibration_sample(sample_id: str) -> dict[str, Any]
     _persist_kinematics_calibration(settings)
     log_event("calibration", "TCP sample deleted", sample_id=sample_id)
     return {"ok": True, "config": public_config(), **kinematics_calibration_summary(config)}
+
+
+@app.post("/api/kinematics-calibration/manual-offsets")
+async def save_kinematics_calibration_manual_offsets(
+    request: KinematicsCalibrationManualOffsetsRequest,
+) -> dict[str, Any]:
+    if state.motion_state == MotionState.MOVING:
+        return {"ok": False, "error": "stop motion before saving manual calibration offsets"}
+    try:
+        settings, result = save_manual_radial_offsets(
+            kinematics_calibration_settings(config),
+            config,
+            profile_key=request.profile_key,
+            reach_offset_mm=request.reach_offset_mm,
+            z_offset_mm=request.z_offset_mm,
+            enabled=request.enabled,
+        )
+        _persist_kinematics_calibration(settings)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "diagnostic_category": "manual_offsets"}
+    log_event(
+        "calibration",
+        "manual reach/Z calibration offsets saved",
+        reach_offset_mm=request.reach_offset_mm,
+        z_offset_mm=request.z_offset_mm,
+        enabled=request.enabled,
+    )
+    return {
+        "ok": True,
+        "result": result,
+        "config": public_config(),
+        **kinematics_calibration_summary(config),
+    }
 
 
 @app.post("/api/kinematics-calibration/fit")
@@ -5657,6 +6114,66 @@ async def apply_kinematics_physical_model(
     }
 
 
+@app.post("/api/tools/validation")
+async def set_active_tool_dimensions_validation(
+    request: ToolDimensionsValidationRequest,
+) -> dict[str, Any]:
+    tools = tools_settings(config)
+    active = str(tools.get("active", "gripper"))
+    presets = tools.get("presets") if isinstance(tools.get("presets"), dict) else {}
+    preset = presets.get(active) if isinstance(presets.get(active), dict) else None
+    if preset is None:
+        state.set_error(f"active tool {active} is missing from presets")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    preset["dimensions_validated"] = bool(request.validated)
+    if request.validated:
+        preset["dimensions_validated_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        preset.pop("dimensions_validated_at", None)
+    calibration = calibration_settings(config)
+    calibration["tool_dimensions_validated"] = bool(request.validated)
+    calibration["last_validation"] = preset.get("dimensions_validated_at", "")
+    try:
+        config_path = ensure_local_config()
+        updates = {"tools": tools, "calibration": calibration}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            draft_path = Path(tmp_dir) / "robot.local.yaml"
+            shutil.copyfile(config_path, draft_path)
+            save_calibration_updates(draft_path, updates)
+            draft_config = load_config(draft_path)
+            change = classify_config_change(config, draft_config)
+            ready, reason = config_change_ready(change)
+            if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {"ok": False, "error": reason, "config_change": change, "state": state.to_dict()}
+        save_calibration_updates(config_path, updates)
+        reload_runtime_config(load_config(config_path), change)
+    except Exception as exc:
+        state.set_error(f"could not update tool-dimension validation: {exc}")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    state.last_command = "VALIDATE_TOOL_DIMENSIONS" if request.validated else "INVALIDATE_TOOL_DIMENSIONS"
+    state.clear_error()
+    log_event(
+        "calibration",
+        "active tool dimensions validation changed",
+        tool=active,
+        validated=bool(request.validated),
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "validated": active_tool_dimensions_validated(config),
+        "config": public_config(),
+        "config_change": state.config_change,
+        "state": state.to_dict(),
+    }
+
+
 @app.post("/api/ik/solve")
 async def solve_ik(request: IkSolveRequest) -> dict[str, Any]:
     links = links_from_override(request.links_mm)
@@ -5784,6 +6301,8 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
         return {"ok": False, "error": can_move.reason, "state": state.to_dict()}
 
     state.clear_error()
+    if state.motion_state == MotionState.STOPPED:
+        state.motion_state = MotionState.IDLE
     state.last_command = f"PATH_EXECUTE {request.preview_id}"
     preview["execution_started_at"] = time()
     preview["execution_start_pose_revision"] = int(state.pose_revision)
@@ -5791,6 +6310,21 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
     path_task_source = "path_execute"
     trajectory = preview.get("trajectory", {})
     trajectory_mode = str(trajectory.get("mode", preview.get("mode", ""))).lower()
+    waypoints = trajectory.get("waypoints") or []
+    final_target = (
+        [float(value) for value in waypoints[-1]]
+        if waypoints
+        else state.reported_angles_deg.copy()
+    )
+    execution_steps = list(trajectory.get("execution_steps") or [])
+    start_motion_diagnostics(
+        source="program" if preview.get("mode") == "program" else str(preview.get("source", "path")),
+        mode=trajectory_mode or str(preview.get("mode", "path")),
+        target_deg=final_target,
+        expected_duration_s=float(trajectory.get("duration_s", 0.0)),
+        waypoint_count=int(trajectory.get("waypoint_count", len(waypoints)) or 0),
+        step_total=len(execution_steps),
+    )
     if preview.get("mode") == "program" and trajectory.get("execution_steps"):
         path_task_source = "program_execute"
         path_task = asyncio.create_task(execute_program_sequence(preview))
@@ -5825,12 +6359,14 @@ async def go_path(request: PathGoRequest) -> dict[str, Any]:
 
 @app.post("/api/task/preview")
 async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
-    profiles = deepcopy(color_profiles(config))
     detection_snapshot_id: str | None = None
     detection_captured_at: float | None = None
     detection_fingerprint: str | None = None
+    detection_task_fingerprint: str | None = None
     detection_snapshot_server_bound = False
     task_settings_raw = request.task_settings or {}
+    runtime_config = config
+    profiles: dict[str, dict[str, Any]] = {}
     profile_overrides = None
     if isinstance(task_settings_raw, dict):
         profile_overrides = (
@@ -5838,20 +6374,23 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             or task_settings_raw.get("draft_color_profiles")
             or task_settings_raw.get("color_profiles")
         )
-    if isinstance(profile_overrides, dict):
-        for name, profile in profile_overrides.items():
-            normalized_name = str(name).strip().lower()
-            if normalized_name and isinstance(profile, dict):
-                merged = deepcopy(profiles.get(normalized_name, {}))
-                merged.update(deepcopy(profile))
-                profiles[normalized_name] = merged
     try:
+        runtime_config = task_runtime_config(config, task_settings_raw)
+        profiles = deepcopy(color_profiles(runtime_config))
+        if isinstance(profile_overrides, dict):
+            for name, profile in profile_overrides.items():
+                normalized_name = str(name).strip().lower()
+                if normalized_name and isinstance(profile, dict):
+                    merged = deepcopy(profiles.get(normalized_name, {}))
+                    merged.update(deepcopy(profile))
+                    profiles[normalized_name] = merged
         path_settings = validated_task_path_settings(request.settings)
         if request.task in {"sorting", "color_sorting"}:
             detections = request.detections or ([request.detection] if request.detection else [])
             if not detections:
                 raise TaskSettingsError("refresh detections before previewing a color-sorting task")
             detection_fingerprint = stable_payload_fingerprint(detections)
+            detection_task_fingerprint = task_detection_fingerprint(detections)
             if request.detection_snapshot_id:
                 detection_snapshot_id = str(request.detection_snapshot_id)
                 if latest_vision_snapshot:
@@ -5859,7 +6398,12 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
                         raise TaskSettingsError(
                             "detection snapshot is stale; refresh detections before previewing the task"
                         )
-                    if detection_fingerprint != latest_vision_snapshot.get("fingerprint"):
+                    latest_task_fingerprint = latest_vision_snapshot.get("task_fingerprint")
+                    if latest_task_fingerprint:
+                        contents_match = detection_task_fingerprint == latest_task_fingerprint
+                    else:
+                        contents_match = detection_fingerprint == latest_vision_snapshot.get("fingerprint")
+                    if not contents_match:
                         raise TaskSettingsError(
                             "detection snapshot contents do not match the latest capture"
                         )
@@ -5871,7 +6415,7 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
                 detection_snapshot_id = f"client-{detection_fingerprint}"
                 detection_captured_at = float(request.detection_captured_at or time())
             sequence = build_color_sorting_plan(
-                config,
+                runtime_config,
                 detections,
                 profiles,
                 task_settings=request.task_settings,
@@ -5882,10 +6426,10 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             if not target:
                 raise TaskSettingsError("pick-and-place preview requires an object target")
             task_settings = normalize_color_sorting_settings(
-                config,
+                runtime_config,
                 {"execution_strategy": "batch_once", **(request.task_settings or {})},
             )
-            sequence = build_pick_and_place_sequence(config, target, request.drop_zone, task_settings=task_settings)
+            sequence = build_pick_and_place_sequence(runtime_config, target, request.drop_zone, task_settings=task_settings)
             sequence["task_preview"] = {
                 "strategy": "batch_once",
                 "normalized_settings": task_settings,
@@ -5911,7 +6455,7 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
                 "warnings": [],
                 "estimated_duration_s": 0.0,
             }
-    except TaskSettingsError as exc:
+    except (TaskSettingsError, TaskDestinationError, ValueError) as exc:
         state.set_error(str(exc))
         await broadcast_state()
         return {
@@ -5929,11 +6473,12 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
         branch=request.branch,
         selected_detection_ids=request.selected_detection_ids,
     )
-    destination_revision = task_mapping_fingerprint()
+    destination_revision = task_mapping_fingerprint(normalized_task_settings)
     bindings = {
         "detection_snapshot_id": detection_snapshot_id,
         "detection_captured_at": detection_captured_at,
         "detection_fingerprint": detection_fingerprint,
+        "detection_task_fingerprint": detection_task_fingerprint,
         "pose_revision": int(state.pose_revision),
         "config_id": RUNNING_CONFIG_ID,
         "model_fingerprint": robot_model_fingerprint(),
@@ -5956,15 +6501,76 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
             "state": state.to_dict(),
         }
 
-    preview_result = build_preview(
-        mode="program",
-        target=None,
-        waypoint_program=sequence["waypoints"],
-        links=config.links,
-        settings=path_settings,
-        branch=request.branch,
-        source="task",
-    )
+    skipped_preview_records: list[dict[str, Any]] = []
+    skipped_preview_ids: set[str] = set()
+    while True:
+        preview_result, sequence, skipped_objects = build_task_motion_preview_skipping_failed_objects(
+            sequence,
+            links=runtime_config.links,
+            settings=path_settings,
+            branch=request.branch,
+        )
+        for skipped in skipped_objects:
+            skipped_preview_records.append(skipped)
+            if skipped.get("detection_id") is not None:
+                skipped_preview_ids.add(str(skipped["detection_id"]))
+        if preview_result.get("ok"):
+            break
+        if (
+            request.task in {"sorting", "color_sorting"}
+            and normalized_task_settings.get("execution_strategy") == "closed_loop"
+            and not request.selected_detection_ids
+            and preview_result.get("error") == "no task objects have a reachable IK path"
+        ):
+            metadata = sequence.get("task_preview", {})
+            candidate_ids = [
+                str(item.get("detection_id"))
+                for item in metadata.get("candidate_objects", [])
+                if isinstance(item, dict)
+                and item.get("detection_id") is not None
+                and str(item.get("detection_id")) not in skipped_preview_ids
+            ]
+            if candidate_ids:
+                sequence = build_color_sorting_plan(
+                    runtime_config,
+                    detections,
+                    profiles,
+                    task_settings=request.task_settings,
+                    selected_detection_ids=[candidate_ids[0]],
+                )
+                continue
+        break
+    task_preview = dict(sequence.get("task_preview", task_preview))
+    if skipped_preview_records:
+        warnings = list(task_preview.get("warnings") or [])
+        ignored = list(task_preview.get("ignored_detections") or [])
+        existing_ignored = {str(item.get("detection_id")) for item in ignored if isinstance(item, dict)}
+        for skipped in skipped_preview_records:
+            detection_id = str(skipped.get("detection_id") or "")
+            reason = str(skipped.get("reason") or "object has no valid IK path")
+            message = f"skipped {detection_id or skipped.get('index', 'object')}: {reason}"
+            if message not in warnings:
+                warnings.append(message)
+            if detection_id:
+                replacement = {
+                    "detection_id": detection_id,
+                    "color": skipped.get("color"),
+                    "ok": False,
+                    "reason_code": "ik_unreachable",
+                    "reason": reason,
+                    "message": message,
+                }
+                if detection_id in existing_ignored:
+                    for index, item in enumerate(ignored):
+                        if isinstance(item, dict) and str(item.get("detection_id")) == detection_id:
+                            ignored[index] = {**item, **replacement}
+                else:
+                    ignored.append(replacement)
+                    existing_ignored.add(detection_id)
+        task_preview["warnings"] = warnings
+        task_preview["ignored_detections"] = ignored
+    task_preview["bindings"] = bindings
+    sequence["task_preview"] = task_preview
     if not preview_result["ok"]:
         state.set_error(preview_result.get("error", "task motion preview failed"))
         await broadcast_state()
@@ -5997,6 +6603,7 @@ async def preview_task(request: TaskPreviewRequest) -> dict[str, Any]:
         "detection_snapshot_id": detection_snapshot_id,
         "detection_captured_at": detection_captured_at,
         "detection_fingerprint": detection_fingerprint,
+        "detection_task_fingerprint": detection_task_fingerprint,
         "detection_snapshot_server_bound": detection_snapshot_server_bound,
         "task_settings_revision": settings_revision,
         "destination_revision": destination_revision,
@@ -6058,10 +6665,6 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
 
     strategy = str(preview.get("strategy") or preview.get("task_preview", {}).get("strategy") or "batch_once")
     task_settings = preview.get("task_settings", {})
-    if isinstance(task_settings, dict) and task_settings.get("_has_unsaved_color_profiles"):
-        state.set_error("save draft color profiles and task destination mappings before starting the task")
-        await broadcast_state()
-        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if strategy == "closed_loop" and state.simulation and not simulation_vision_queue:
         state.set_error("closed-loop simulation requires queued synthetic vision frames")
         await broadcast_state()
@@ -6098,6 +6701,7 @@ async def execute_task(request: TaskExecuteRequest) -> dict[str, Any]:
                 {
                     **preview.get("settings", {}),
                     "tool_action_delay_ms": preview.get("task_settings", {}).get("tool_action_delay_ms", 150),
+                    "cycle_confirmation": preview.get("task_settings", {}).get("cycle_confirmation", "automatic"),
                 },
                 preview.get("branch", "auto"),
             )
@@ -6128,6 +6732,32 @@ async def select_task_detection(request: TaskSelectionRequest) -> dict[str, Any]
     update_task_execution(
         phase="selection_received",
         current_step={"label": "selection received", "kind": "operator"},
+    )
+    event.set()
+    await broadcast_state()
+    return {"ok": True, "state": state.to_dict()}
+
+
+@app.post("/api/task/continue")
+async def continue_task(request: TaskContinueRequest) -> dict[str, Any]:
+    execution = state.task_execution or {}
+    if execution.get("run_id") != request.run_id:
+        state.set_error("task continuation run ID does not match the active task")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if execution.get("status") != "waiting_for_confirmation":
+        state.set_error("task is not waiting for operator confirmation")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    event = task_confirmation_events.get(request.run_id)
+    if event is None:
+        state.set_error("task confirmation waiter is not available")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    update_task_execution(
+        status="running",
+        phase="confirmation_received",
+        current_step={"label": "continuing", "kind": "operator"},
     )
     event.set()
     await broadcast_state()
@@ -6635,8 +7265,15 @@ async def save_calibration(request: CalibrationRequest) -> dict[str, Any]:
             state.set_error("; ".join(tool_errors))
             await broadcast_state()
             return {"ok": False, "errors": tool_errors, "error": state.last_error, "state": state.to_dict()}
+        _invalidate_changed_tool_validations(tools_settings(config), updates["tools"])
         calibration = calibration_settings(config)
-        calibration["tool_dimensions_validated"] = False
+        requested_calibration = updates.get("calibration")
+        if isinstance(requested_calibration, dict):
+            calibration.update(deepcopy(requested_calibration))
+        calibration["tool_dimensions_validated"] = _active_tool_validation_from_payload(
+            updates["tools"],
+            bool(calibration.get("tool_dimensions_validated", False)),
+        )
         updates["calibration"] = calibration
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:

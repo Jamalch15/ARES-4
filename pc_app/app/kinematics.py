@@ -139,6 +139,31 @@ def _dh_step_with_side_offset(
     return final, after_d, after_side, after_a
 
 
+def _compact_dh_matrix(
+    theta_deg: float,
+    d_mm: float,
+    a_mm: float,
+    alpha_deg: float,
+    side_offset_mm: float = 0.0,
+) -> np.ndarray:
+    """Build one DH row directly for calculation-only inner loops."""
+    theta = radians(theta_deg)
+    alpha = radians(alpha_deg)
+    ct = cos(theta)
+    st = sin(theta)
+    ca = cos(alpha)
+    sa = sin(alpha)
+    return np.array(
+        [
+            [ct, -st * ca, st * sa, ct * a_mm - st * side_offset_mm],
+            [st, ct * ca, -ct * sa, st * a_mm + ct * side_offset_mm],
+            [0.0, sa, ca, d_mm],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
 def _robot_point_from_dh(vector: np.ndarray) -> dict[str, float]:
     return {"x_mm": float(vector[1]), "y_mm": float(-vector[0]), "z_mm": float(vector[2])}
 
@@ -368,6 +393,39 @@ def forward_kinematics(joint_angles_deg: list[float], links: LinkConfig) -> dict
     return tcp
 
 
+def _task_vector(joint_angles_deg: list[float], links: LinkConfig) -> np.ndarray:
+    """Return only the Cartesian values needed by iterative IK.
+
+    Full forward kinematics also builds visualization segments, frame axes,
+    and metadata. Endpoint and differential IK evaluate FK many times per
+    solve, so keeping that presentation work out of the inner loop avoids
+    repeated calculations without changing the kinematic model.
+    """
+    if len(joint_angles_deg) != 4:
+        raise ValueError("DH kinematics expects four joint angles")
+    final_transform = np.identity(4)
+    for row_index, row in enumerate(_rows(links)):
+        side_offset = links.base_side_offset_mm if row_index == 0 else 0.0
+        final_transform = final_transform @ _compact_dh_matrix(
+            _row_theta(row, joint_angles_deg),
+            row.d_mm,
+            row.a_mm,
+            row.alpha_deg,
+            side_offset,
+        )
+    tcp_vector = final_transform @ _tool_tcp_offset_vector(links)
+    tcp = _robot_point_from_dh(tcp_vector[:3])
+    return np.array(
+        [
+            tcp["x_mm"],
+            tcp["y_mm"],
+            tcp["z_mm"],
+            _tool_phi_from_angles(joint_angles_deg, links),
+        ],
+        dtype=float,
+    )
+
+
 def geometric_task_jacobian(joint_angles_deg: list[float], links: LinkConfig) -> np.ndarray:
     """Return the TCP task Jacobian in project units.
 
@@ -423,42 +481,37 @@ def _joint_limit_reasons(joints: list[JointConfig], angles_deg: list[float]) -> 
 
 
 def _task_error(target: dict[str, float], angles_deg: list[float], links: LinkConfig) -> np.ndarray:
-    fk = forward_kinematics(angles_deg, links)
-    return np.array(
+    current = _task_vector(angles_deg, links)
+    error = np.array(
         [
-            float(target["x_mm"]) - fk["x_mm"],
-            float(target["y_mm"]) - fk["y_mm"],
-            float(target["z_mm"]) - fk["z_mm"],
-            _signed_angle_error_deg(float(target["phi_deg"]), fk["tool_phi_deg"]),
+            float(target["x_mm"]) - current[0],
+            float(target["y_mm"]) - current[1],
+            float(target["z_mm"]) - current[2],
+            float(target["phi_deg"]) - current[3],
         ],
         dtype=float,
     )
+    error[3] = _signed_angle_error_deg(float(target["phi_deg"]), float(current[3]))
+    return error
 
 
-def _numeric_jacobian(target: dict[str, float], angles_deg: list[float], links: LinkConfig) -> np.ndarray:
+def _numeric_jacobian(
+    target: dict[str, float],
+    angles_deg: list[float],
+    links: LinkConfig,
+    base_vector: np.ndarray | None = None,
+) -> np.ndarray:
     del target
-    base_fk = forward_kinematics(angles_deg, links)
-    base_vector = np.array(
-        [base_fk["x_mm"], base_fk["y_mm"], base_fk["z_mm"], base_fk["tool_phi_deg"]],
-        dtype=float,
-    )
+    if base_vector is None:
+        base_vector = _task_vector(angles_deg, links)
     jacobian = np.zeros((4, len(angles_deg)), dtype=float)
     eps = 0.05
     for index in range(len(angles_deg)):
         shifted = angles_deg.copy()
         shifted[index] += eps
-        shifted_fk = forward_kinematics(shifted, links)
-        shifted_vector = np.array(
-            [
-                shifted_fk["x_mm"],
-                shifted_fk["y_mm"],
-                shifted_fk["z_mm"],
-                shifted_fk["tool_phi_deg"],
-            ],
-            dtype=float,
-        )
+        shifted_vector = _task_vector(shifted, links)
         diff = shifted_vector - base_vector
-        diff[3] = _normalize_deg(shifted_fk["tool_phi_deg"] - base_fk["tool_phi_deg"])
+        diff[3] = _normalize_deg(float(shifted_vector[3] - base_vector[3]))
         jacobian[:, index] = diff / eps
     return jacobian
 
@@ -658,13 +711,22 @@ def _solve_from_seed(
     singular = False
 
     for iterations in range(1, max_iterations + 1):
-        error = _task_error(target, angles, links)
+        task_vector = _task_vector(angles, links)
+        error = np.array(
+            [
+                float(target["x_mm"]) - task_vector[0],
+                float(target["y_mm"]) - task_vector[1],
+                float(target["z_mm"]) - task_vector[2],
+                _signed_angle_error_deg(float(target["phi_deg"]), float(task_vector[3])),
+            ],
+            dtype=float,
+        )
         position_error = float(np.linalg.norm(error[:3]))
         orientation_error = abs(float(error[3]))
         if position_error <= position_tolerance_mm and orientation_error <= orientation_tolerance_deg:
             break
 
-        jacobian = _numeric_jacobian(target, angles, links)
+        jacobian = _numeric_jacobian(target, angles, links, base_vector=task_vector)
         condition = np.linalg.cond(jacobian @ jacobian.T + np.identity(4) * 1e-9)
         singular = singular or bool(condition > 1e8)
         lhs = jacobian @ jacobian.T + (damping**2) * np.identity(4)
@@ -753,11 +815,20 @@ def _analytic_seed_candidates(
         return [], ["analytic seed skipped: DH rows do not match the planar prototype shape"]
 
     d1 = float(rows[0].d_mm)
-    lateral_mm = float(links.base_side_offset_mm) - sum(float(row.d_mm) for row in rows[1:])
+    tool_offset = _tool_tcp_offset_vector(links)
+    # Collapse the fixed offsets after the base into the same radial/lateral
+    # decomposition used by the planar two-link solve. The configured tool
+    # offset can have side or vertical components, not just forward length.
+    final_x_offset_mm = float(rows[3].a_mm) + float(tool_offset[0])
+    final_y_offset_mm = float(tool_offset[1])
+    final_z_offset_mm = float(tool_offset[2])
+    lateral_mm = (
+        float(links.base_side_offset_mm)
+        - sum(float(row.d_mm) for row in rows[1:])
+        - final_z_offset_mm
+    )
     a2 = float(rows[1].a_mm)
     a3 = float(rows[2].a_mm)
-    tool_offset = _tool_tcp_offset_vector(links)
-    a4 = float(rows[3].a_mm) + float(tool_offset[0])
     phi = radians(float(target["phi_deg"]))
 
     dh_x = -float(target["y_mm"])
@@ -775,8 +846,13 @@ def _analytic_seed_candidates(
     for radial_sign in radial_signs:
         radial_mm = radial_abs * radial_sign
         base_theta = degrees(atan2(dh_y, dh_x) - atan2(lateral_mm, radial_mm))
-        wrist_r = radial_mm - a4 * cos(phi)
-        wrist_z = float(target["z_mm"]) - d1 - a4 * sin(phi)
+        wrist_r = radial_mm - final_x_offset_mm * cos(phi) + final_y_offset_mm * sin(phi)
+        wrist_z = (
+            float(target["z_mm"])
+            - d1
+            - final_x_offset_mm * sin(phi)
+            - final_y_offset_mm * cos(phi)
+        )
         denom = 2.0 * a2 * a3
         if abs(denom) <= 1e-9:
             notes.append("analytic seed skipped: upper-arm or forearm length is zero")
@@ -915,8 +991,14 @@ def _auto_phi_values(current_phi_deg: float, preferred_phi_deg: float | None = N
 
 
 def _candidate_continuity_error(candidate: dict[str, Any], current: list[float]) -> float:
+    # Joint targets are commanded as bounded numeric joint angles, not as
+    # continuous modulo-360 axes. Scoring with circular angle distance can make
+    # +135 -> -135 look like a 90 deg move even though the controller must
+    # travel 270 deg through the configured joint range. Score the actual
+    # commanded delta so IK branch selection prefers the physically shorter
+    # move.
     return sum(
-        angle_distance_deg(angle, current[index])
+        abs(float(angle) - float(current[index]))
         for index, angle in enumerate(candidate["angles_deg"])
     )
 
