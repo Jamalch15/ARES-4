@@ -3548,8 +3548,6 @@ async def verify_shoulder_after_motion(
         correction_skip_reason = "hardware must stay armed for post-move correction"
     elif state.motion_state != MotionState.IDLE:
         correction_skip_reason = "robot must be idle before post-move correction"
-    elif task_active():
-        correction_skip_reason = "task execution is active; correction is verification-only"
     elif cartesian_jog_runtime.get("active"):
         correction_skip_reason = "Cartesian jog is active; correction is verification-only"
 

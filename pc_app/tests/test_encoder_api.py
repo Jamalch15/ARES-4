@@ -880,6 +880,78 @@ def test_post_move_correction_uses_deadband_not_warning_threshold(monkeypatch):
     assert main.state.encoder_mismatch["error_deg"] == pytest.approx(0.2)
 
 
+@pytest.mark.parametrize("source", ["task", "program"])
+def test_task_motion_can_run_bounded_shoulder_correction_while_task_active(monkeypatch, source):
+    raw = deepcopy(main.config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+            "mounting_location": "joint_output",
+        }
+    )
+    raw["encoders"]["verification"].update(
+        {
+            "policy": "warning",
+            "warning_tolerance_deg": 2.0,
+            "fault_tolerance_deg": 5.0,
+        }
+    )
+    raw["encoders"]["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": "validated",
+            "deadband_deg": 0.75,
+            "max_delta_deg": 8.0,
+            "allowed_sources": [source],
+        }
+    )
+    config = type(main.config)(**{**main.config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", config)
+    measurements = iter([91.7, 90.2])
+    sent: list[str] = []
+
+    async def stable(_required_samples):
+        return next(measurements), "stable"
+
+    async def no_sleep(_seconds):
+        return None
+
+    def send_correctj(command):
+        sent.append(command)
+        return "OK command=CORRECTJ joint=2 delta=-1.700000 steps=-100 attempt=1 id=test"
+
+    monkeypatch.setattr(main, "_stable_shoulder_measurement", stable)
+    monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(main, "send_correctj_and_read_response", send_correctj)
+    monkeypatch.setattr(main, "refresh_serial_status", lambda: None)
+    main.state.hardware_armed = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.hardware_axis_states = ["hardware"] * len(config.joints)
+    main.state.task_execution = {"status": "executing"}
+    main.state.update_reported_pose(
+        [0.0, 90.0, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_pose=True,
+        force_revision=True,
+    )
+
+    ok, message = asyncio.run(
+        main.verify_shoulder_after_motion(
+            source,
+            [0.0, 90.0, 20.0, 0.0],
+        )
+    )
+
+    assert ok is True
+    assert message == "corrected"
+    assert sent
+    assert "CORRECTJ joint=2 delta=-1.700000" in sent[0]
+    assert main.state.encoder_mismatch["correction_status"] == "completed"
+
+
 def test_correction_timeout_scales_with_correction_distance():
     small = main.correction_motion_timeout_s(0.5, 2.0, 10.0)
     large = main.correction_motion_timeout_s(5.5, 2.0, 10.0)

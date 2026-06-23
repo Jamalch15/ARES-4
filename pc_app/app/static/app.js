@@ -4213,10 +4213,10 @@ async function previewTask() {
     return;
   }
   if (payload.ok) {
-    renderPreview(payload.preview);
     state.taskPreviewId = payload.preview_id;
     state.taskPreviewCreatedAt = Date.now() / 1000;
     state.taskLocalStatusAt = state.taskPreviewCreatedAt;
+    renderPreview(payload.preview, { preserveTaskPreview: true });
     state.lastTaskPreview = payload.task_preview || payload.sequence?.task_preview || null;
     renderTaskSummary(payload.sequence, payload.preview);
     renderTaskPlanPreview(state.lastTaskPreview, payload.sequence);
@@ -5724,14 +5724,15 @@ function syncEncoderTrackedShoulderUi(robotState = state.robotState) {
   const staleDraft = shoulderDeltaFromReported(state.draftAngles, robotState) > tolerance;
   const stalePending = shoulderDeltaFromReported(state.pendingAngles, robotState) > tolerance;
   const staleCommanded = shoulderDeltaFromReported(state.commandedAngles, robotState) > tolerance;
-  const stalePreviewEndpoint = shoulderDeltaFromReported(state.previewAngles, robotState) > tolerance;
   const previewStart = normalizeJointAngles(state.latestPreview?.start_reported_angles_deg);
   const stalePreviewStart = shoulderDeltaFromReported(previewStart, robotState) > tolerance;
   const shouldResetJointIntent = staleDraft || stalePending || staleCommanded;
   if (shouldResetJointIntent) {
     releaseJointControlIntent();
   }
-  if (stalePreviewEndpoint || stalePreviewStart) {
+  // Preview endpoints are expected to differ from the current pose. Only the
+  // recorded preview start pose can make the preview stale.
+  if (stalePreviewStart) {
     clearViewPreview();
     if (state.activeTab === "ik" && elements.previewStatus) {
       elements.previewStatus.textContent = "Shoulder encoder updated the start pose. Preview from the current shoulder before executing.";
@@ -6454,9 +6455,9 @@ function renderState(robotState) {
   if (!state.settingsDirtyScopes.size) updateSettingsSaveBar();
 }
 
-function renderPreview(preview) {
+function renderPreview(preview, options = {}) {
   releaseJointControlIntent();
-  state.taskPreviewId = null;
+  if (!options.preserveTaskPreview) state.taskPreviewId = null;
   state.previewId = preview.id;
   state.latestPreview = preview;
   state.previewAngles = previewEndpointAngles(preview);

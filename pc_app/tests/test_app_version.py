@@ -272,3 +272,24 @@ def test_frontend_contains_program_library_workflow_and_demo_hooks():
     )[0]
     assert "const preserveRequestedIkTarget = state.ikUserEdited;" in render_state
     assert "state.ikUserEdited = preserveRequestedIkTarget;" in render_state
+
+
+def test_task_preview_state_survives_encoder_tracked_pose_sync():
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    preview_task = app_js.split("async function previewTask()", 1)[1].split(
+        "async function executeTask()",
+        1,
+    )[0]
+    render_preview = app_js.split("function renderPreview(preview", 1)[1].split(
+        "function renderPreviewFailure(",
+        1,
+    )[0]
+    encoder_sync = app_js.split("function syncEncoderTrackedShoulderUi", 1)[1].split(
+        "function releaseJointControlIntent",
+        1,
+    )[0]
+
+    assert "renderPreview(payload.preview, { preserveTaskPreview: true });" in preview_task
+    assert "if (!options.preserveTaskPreview) state.taskPreviewId = null;" in render_preview
+    assert "stalePreviewEndpoint" not in encoder_sync
+    assert "if (stalePreviewStart)" in encoder_sync

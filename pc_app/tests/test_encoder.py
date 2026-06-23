@@ -117,7 +117,7 @@ def test_disabled_encoder_bus_removes_bounded_correction_authority():
     assert settings["correction"]["enabled"] is False
 
 
-def test_normalized_encoder_settings_include_manual_shoulder_align_source():
+def test_normalized_encoder_settings_include_bounded_correction_motion_sources():
     settings = normalize_encoder_settings(
         {
             "schema_version": 2,
@@ -130,7 +130,8 @@ def test_normalized_encoder_settings_include_manual_shoulder_align_source():
         }
     )
 
-    assert "encoder_shoulder_align" in settings["correction"]["allowed_sources"]
+    for source in ("path", "program", "task", "encoder_shoulder_align"):
+        assert source in settings["correction"]["allowed_sources"]
 
 
 def test_disabled_correction_does_not_block_save_with_stale_limits():
