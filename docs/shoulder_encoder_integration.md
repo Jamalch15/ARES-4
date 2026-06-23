@@ -129,7 +129,7 @@ Sensor loss faults only when `require_encoder` and fault policy are both enabled
 
 ### 6. Optional bounded correction
 
-Correction is disabled in tracked defaults and after guided calibration. Enabling it requires a local validation record, joint-output mounting, valid calibration, known planning pose, fresh stable evidence, idle armed hardware, an allow-listed manual endpoint source, and bounded angle/speed/acceleration/attempt limits.
+Correction is disabled in tracked defaults and after guided calibration. Enabling it requires a local validation record, joint-output mounting, valid calibration, known planning pose, fresh stable evidence, idle armed hardware, an allow-listed motion source, and bounded angle/speed/acceleration/attempt limits.
 
 `CORRECTJ` moves only the shoulder by a relative pulse transaction after normal known-pose motion. Firmware maintains a runtime correction bias between logical and physical step positions; commanded and estimated logical angles are not rebased to the encoder. Every transaction is also checked against an explicit joint-limit margin using the fresh measured shoulder angle plus the requested delta.
 
@@ -139,7 +139,7 @@ Go Home remains a planned move to the configured home pose, not physical homing.
 
 The correction transaction reports ID, requested delta, emitted steps, attempts, state, and bias. Failure, timeout, excessive error, or non-convergence latches the mismatch fault.
 
-Correction is not enabled for tasks, programs, live jog, calibration capture, active trajectories, unknown poses, Stop, ESTOP, or Fault. It can run after eligible manual joint endpoint moves and Go Home, because Go Home is still a normal planned move to the configured home pose. It is not physical homing and does not discover absolute pose by itself.
+Automatic post-move correction can run after eligible joint endpoint, path, program, task, and Go Home moves when the source is allow-listed. It remains disabled for live jog, calibration capture, active trajectories, unknown poses, Stop, ESTOP, or Fault. Go Home is still a normal planned move to the configured home pose, not physical homing, and does not discover absolute pose by itself.
 
 The Settings page exposes correction through **Validate + enable bounded correction**, not a raw checkbox. Any later edit to encoder runtime settings, verification thresholds, calibration fields, or correction limits disables correction and requires a fresh validation record.
 

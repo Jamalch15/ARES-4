@@ -3177,6 +3177,19 @@ def correction_motion_timeout_s(delta_deg: float, speed_deg_s: float, accel_deg_
     return min(30.0, max(3.0, duration * 2.0 + 2.0))
 
 
+def should_hold_pose_tracking_after_correction(delta_deg: float, min_delta_deg: float) -> bool:
+    correction = encoder_settings(config).get("correction", {})
+    if not isinstance(correction, dict) or not bool(correction.get("enabled")):
+        return False
+    if str(state.correction_state.get("state") or "").strip().lower() != "completed":
+        return False
+    try:
+        correction_deadband = max(0.0, float(correction.get("deadband_deg", 0.75)))
+    except (TypeError, ValueError):
+        correction_deadband = 0.75
+    return abs(float(delta_deg)) <= max(float(min_delta_deg), correction_deadband)
+
+
 def _shoulder_alignment_target_deg() -> float | None:
     reference = state.target_angles_deg if len(state.target_angles_deg) > 1 else state.reported_angles_deg
     if len(reference) <= 1:
@@ -3292,6 +3305,21 @@ def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> boo
     current = float(state.reported_angles_deg[1])
     delta = measured_deg - current
     min_delta = max(0.0, float(tracking.get("min_update_delta_deg", 0.10)))
+    if should_hold_pose_tracking_after_correction(delta, min_delta):
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "pose_tracking_status": "held_after_correction",
+            "pose_tracking_skip_reason": (
+                f"post-correction shoulder residual {delta:+.2f} deg is inside the correction deadband"
+            ),
+            "pose_tracking_measured_deg": measured_deg,
+            "pose_tracking_previous_deg": current,
+            "pose_tracking_delta_deg": delta,
+            "tracked_at": time(),
+        }
+        if shoulder_controller_rebase_applicable():
+            update_controller_rebase_state(required=False)
+        return False
     if abs(delta) < min_delta:
         if shoulder_controller_rebase_applicable() and abs(delta) <= max(min_delta, CONTROLLER_REBASE_TOLERANCE_DEG):
             update_controller_rebase_state(required=False)
@@ -6762,6 +6790,14 @@ def apply_controller_status(status_line: str) -> None:
     if not state.encoder_fault:
         state.last_error = "" if status.fault == "OK" else status.fault
     update_encoder_evidence(status)
+    state.correction_state = {
+        "state": status.correction_state,
+        "transaction_id": status.correction_transaction_id,
+        "requested_delta_deg": status.correction_requested_delta_deg,
+        "emitted_steps": status.correction_emitted_steps,
+        "attempts": status.correction_attempts,
+        "bias_deg": status.correction_bias_deg or [None] * len(config.joints),
+    }
     pose_tracked_from_encoder = apply_shoulder_encoder_pose_tracking(status.state)
     if (
         not pose_tracked_from_encoder
@@ -6772,14 +6808,6 @@ def apply_controller_status(status_line: str) -> None:
         and abs(float(state.reported_angles_deg[1]) - float(reported_angles[1])) <= CONTROLLER_REBASE_TOLERANCE_DEG
     ):
         update_controller_rebase_state(required=False)
-    state.correction_state = {
-        "state": status.correction_state,
-        "transaction_id": status.correction_transaction_id,
-        "requested_delta_deg": status.correction_requested_delta_deg,
-        "emitted_steps": status.correction_emitted_steps,
-        "attempts": status.correction_attempts,
-        "bias_deg": status.correction_bias_deg or [None] * len(config.joints),
-    }
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
     record_motion_sample(active_motion_run_id)
     maybe_finish_reached_motion()
