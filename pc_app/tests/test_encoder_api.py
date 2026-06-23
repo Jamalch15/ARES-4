@@ -880,6 +880,70 @@ def test_post_move_correction_uses_deadband_not_warning_threshold(monkeypatch):
     assert main.state.encoder_mismatch["error_deg"] == pytest.approx(0.2)
 
 
+def test_manual_shoulder_align_runs_bounded_correction_to_current_target(monkeypatch):
+    raw = deepcopy(main.config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+            "mounting_location": "joint_output",
+        }
+    )
+    raw["encoders"]["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": "validated",
+            "deadband_deg": 0.75,
+            "max_delta_deg": 8.0,
+            "allowed_sources": ["encoder_shoulder_align"],
+        }
+    )
+    config = type(main.config)(**{**main.config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", config)
+    monkeypatch.setattr(main, "serial_client", FakeSerial([]))
+    measurements = iter([94.0, 90.2])
+    sent: list[str] = []
+
+    async def stable(_required_samples):
+        return next(measurements), "stable"
+
+    async def no_sleep(_seconds):
+        return None
+
+    def send_correctj(command):
+        sent.append(command)
+        return "OK command=CORRECTJ joint=2 delta=-4.000000 steps=-200 attempt=1 id=test"
+
+    monkeypatch.setattr(main, "_stable_shoulder_measurement", stable)
+    monkeypatch.setattr(main.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(main, "send_correctj_and_read_response", send_correctj)
+    monkeypatch.setattr(main, "refresh_serial_status", lambda: None)
+    main.state.config_sync_status = "synced"
+    main.state.controller_capabilities = {"protocol": 4, "encoder_config": True}
+    main.state.hardware_armed = True
+    main.state.motion_state = MotionState.IDLE
+    main.state.hardware_axis_states = ["hardware"] * len(config.joints)
+    main.state.update_reported_pose(
+        [0.0, 90.0, 20.0, 0.0],
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 90.0, 20.0, 0.0]
+    client = TestClient(main.app)
+
+    response = client.post("/api/encoder/shoulder/align", json={}).json()
+
+    assert response["ok"]
+    assert response["verification"] == "corrected"
+    assert sent
+    assert "CORRECTJ joint=2 delta=-4.000000" in sent[0]
+    assert response["mismatch"]["status"] == "corrected"
+    assert response["mismatch"]["error_deg"] == pytest.approx(0.2)
+
+
 def test_motion_diagnostics_wait_for_encoder_verification(monkeypatch):
     raw = deepcopy(main.config.raw)
     raw["encoders"]["enabled"] = True

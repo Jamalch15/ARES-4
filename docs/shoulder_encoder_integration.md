@@ -114,6 +114,8 @@ Correction is disabled in tracked defaults and after guided calibration. Enablin
 
 Correction has two separate thresholds: `deadband_deg` and `max_delta_deg`. The deadband is the small-error zone where the robot deliberately does nothing to avoid chasing noise. The max delta is the hard safety cap; if the measured shoulder error is larger than this, the system reports why correction was skipped instead of moving.
 
+Go Home remains a planned move to the configured home pose, not physical homing. After that planned move settles, source `home` uses the same shoulder verification/correction service. The operator-facing **Align Shoulder** action is a separate idle-only request that compares the calibrated shoulder encoder against the current planning/target shoulder angle and, if all correction gates pass, sends one bounded `CORRECTJ` nudge. It does not rebase the software pose and does not infer the other joints.
+
 The correction transaction reports ID, requested delta, emitted steps, attempts, state, and bias. Failure, timeout, excessive error, or non-convergence latches the mismatch fault.
 
 Correction is not enabled for tasks, programs, live jog, calibration capture, active trajectories, unknown poses, Stop, ESTOP, or Fault. It can run after eligible manual joint endpoint moves and Go Home, because Go Home is still a normal planned move to the configured home pose. It is not physical homing and does not discover absolute pose by itself.

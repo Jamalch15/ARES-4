@@ -172,6 +172,8 @@ def test_frontend_places_encoder_controls_in_hardware_settings():
     assert "Raw shoulder sensor" in app_js
     assert "Correction gate" in app_js
     assert "Latest shoulder encoder readback" in app_js
+    assert 'id="alignShoulderBtn"' in index_html
+    assert 'postJson("/api/encoder/shoulder/align", {})' in app_js
     sweep_handler = app_js.split("async function runAssistedEncoderSweep()", 1)[1].split(
         "async function cancelAssistedEncoderSweep()",
         1,

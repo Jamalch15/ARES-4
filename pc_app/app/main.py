@@ -8129,6 +8129,100 @@ async def set_encoder_correction_policy(request: EncoderCorrectionPolicyRequest)
     }
 
 
+@app.post("/api/encoder/shoulder/align")
+async def align_shoulder_to_planning() -> dict[str, Any]:
+    """Explicit idle shoulder-only alignment using the bounded correction path."""
+    settings, shoulder, reason = _encoder_runtime_ready()
+    if reason:
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if shoulder is None or settings is None:
+        state.set_error("shoulder encoder runtime is not configured")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.simulation:
+        state.set_error("shoulder encoder alignment requires connected hardware, not simulation")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not serial_client.is_connected or not state.connected:
+        state.set_error("connect the controller before shoulder encoder alignment")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.encoder_fault:
+        state.set_error("clear the encoder fault and Set Pose before shoulder encoder alignment")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.known_pose:
+        state.set_error("Set Pose first; shoulder alignment needs a known planning pose")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if not state.hardware_armed:
+        state.set_error("arm hardware before shoulder encoder alignment")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.motion_state != MotionState.IDLE:
+        state.set_error(f"robot must be idle before shoulder encoder alignment (current: {state.motion_state.value})")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
+        state.set_error("stop live motion, tasks, and Cartesian jog before shoulder encoder alignment")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if any(task is not None and not task.done() for task in [path_task, live_task, task_task]):
+        state.set_error("wait for active motion or task execution to finish")
+        await broadcast_state()
+        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+
+    target = [float(value) for value in state.target_angles_deg]
+    if len(target) < len(config.joints):
+        target = [float(value) for value in state.reported_angles_deg]
+    state.last_command = "ALIGN_SHOULDER_TO_PLANNING"
+    verified, verification_message = await verify_shoulder_after_motion(
+        "encoder_shoulder_align",
+        target,
+        allow_correction=True,
+    )
+    mismatch = state.encoder_mismatch or {}
+    correction_status = str(mismatch.get("correction_status") or "")
+    if not verified:
+        state.set_error(verification_message, fault=state.motion_state == MotionState.FAULT)
+        await broadcast_state()
+        return {
+            "ok": False,
+            "error": verification_message,
+            "verification": verification_message,
+            "mismatch": mismatch,
+            "state": state.to_dict(),
+        }
+    if correction_status == "skipped":
+        reason = str(mismatch.get("correction_skip_reason") or verification_message or "shoulder correction skipped")
+        state.set_error(reason)
+        await broadcast_state()
+        return {
+            "ok": False,
+            "error": reason,
+            "verification": verification_message,
+            "mismatch": mismatch,
+            "state": state.to_dict(),
+        }
+    state.clear_error()
+    log_event(
+        "encoder",
+        "shoulder alignment requested",
+        target_shoulder_deg=target[1] if len(target) > 1 else None,
+        verification=verification_message,
+        correction_status=correction_status or mismatch.get("status"),
+    )
+    await broadcast_state()
+    return {
+        "ok": True,
+        "verification": verification_message,
+        "mismatch": mismatch,
+        "state": state.to_dict(),
+    }
+
+
 @app.get("/api/kinematics/dh")
 async def get_dh_table() -> dict[str, Any]:
     return {"ok": True, "kinematics": asdict(config.kinematics), "fk": state.fk}

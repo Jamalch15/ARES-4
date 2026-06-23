@@ -228,6 +228,7 @@ const elements = {
   connectSerialBtn: $("#connectSerialBtn"),
   disconnectBtn: $("#disconnectBtn"),
   homeBtn: $("#homeBtn"),
+  alignShoulderBtn: $("#alignShoulderBtn"),
   setPoseBtn: $("#setPoseBtn"),
   stopBtn: $("#stopBtn"),
   diagnosticsBtn: $("#diagnosticsBtn"),
@@ -6126,6 +6127,14 @@ function updateDisabledState() {
   elements.applyJointPreviewBtn.disabled = !enabled || !state.draftAngles;
   elements.resetJointPreviewBtn.disabled = !state.draftAngles && !state.commandedAngles;
   elements.homeBtn.disabled = !enabled;
+  if (elements.alignShoulderBtn) {
+    const encoderEvidence = state.robotState?.encoder_evidence?.[1] || {};
+    elements.alignShoulderBtn.disabled = !enabled
+      || Boolean(state.robotState?.simulation)
+      || !state.robotState?.hardware_armed
+      || state.robotState?.motion_state !== "idle"
+      || (encoderEvidence.measured_angle_deg == null && encoderEvidence.raw_angle_deg == null);
+  }
   elements.setPoseBtn.disabled =
     !state.robotState ||
     (!state.robotState.connected && !state.robotState.simulation) ||
@@ -8640,6 +8649,16 @@ function bindActions() {
       releaseJointControlIntent();
       clearViewPreview();
       state.ikUserEdited = false;
+    }
+    if (payload.state) renderState(payload.state);
+  });
+  elements.alignShoulderBtn?.addEventListener("click", async () => {
+    const payload = await postJson("/api/encoder/shoulder/align", {});
+    if (payload.ok) {
+      releaseJointControlIntent();
+      state.encoderCalibrationMessage = payload.verification || "shoulder alignment checked";
+    } else {
+      showLocalError(payload.error || "Shoulder alignment did not run");
     }
     if (payload.state) renderState(payload.state);
   });

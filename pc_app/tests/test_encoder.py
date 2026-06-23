@@ -117,6 +117,22 @@ def test_disabled_encoder_bus_removes_bounded_correction_authority():
     assert settings["correction"]["enabled"] is False
 
 
+def test_normalized_encoder_settings_include_manual_shoulder_align_source():
+    settings = normalize_encoder_settings(
+        {
+            "schema_version": 2,
+            "enabled": True,
+            "axes": [{"joint": 2, "enabled": True, "cs_pin": 15}],
+            "correction": {
+                "enabled": False,
+                "allowed_sources": ["set_joint_target", "home"],
+            },
+        }
+    )
+
+    assert "encoder_shoulder_align" in settings["correction"]["allowed_sources"]
+
+
 def test_disabled_correction_does_not_block_save_with_stale_limits():
     config = load_config(EXAMPLE_CONFIG_PATH)
     settings = default_encoder_settings()
