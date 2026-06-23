@@ -74,6 +74,7 @@ Working assumptions:
 - Partial hardware is allowed and reported as `hw=mixed`.
 - Motion is open-loop. Runtime-configured shoulder AS5048A feedback is separate calibrated evidence used for diagnostics and settled verification.
 - Optional `CORRECTJ` is a disabled-by-default bounded post-move transaction. It maintains a runtime physical-step bias and never rebases the logical pose.
+- Optional `ALIGNJ` is a shoulder-only startup/idle alignment transaction advertised with `alignj=1`. It can use calibrated shoulder encoder evidence before full Set Pose, but it does not make the whole robot pose known or unlock normal motion.
 - `SETPOSE` is an explicit operator assertion used after manual positioning or pose-invalidating actuator configuration changes to establish the open-loop pose. It does not perform physical homing.
 - Go Home is a normal move from a known pose. Physical homing remains deferred until switches/index hardware and safe directions are defined.
 - `ESTOP` disarms and blocks motion until the controller is reset.

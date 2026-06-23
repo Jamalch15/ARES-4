@@ -166,14 +166,23 @@ def test_frontend_places_encoder_controls_in_hardware_settings():
     assert "data-encoder-correction-field" in app_js
     assert "settings.correction.enabled = false;" in app_js
     assert "Encoder hardware, calibration, or policy settings changed" in app_js
-    assert "Fault threshold only controls when mismatch becomes a fault" in app_js
+    assert "Fault threshold deg (fault only)" in app_js
     assert "Correction max delta deg (movement cap)" in app_js
+    assert "Align max total deg" in app_js
+    assert "Align cap" in app_js
+    assert "Use encoder as shoulder pose while idle" in app_js
+    assert "data-encoder-pose-field" in app_js
+    assert "Pose tracking" in app_js
+    assert "robotStateUsesEncoderTrackedShoulder" in app_js
+    assert "syncEncoderTrackedShoulderUi" in app_js
+    assert "Shoulder encoder updated the start pose" in app_js
     assert "Measured shoulder live" in app_js
     assert "Raw shoulder sensor" in app_js
     assert "Correction gate" in app_js
     assert "Latest shoulder encoder readback" in app_js
     assert 'id="alignShoulderBtn"' in index_html
-    assert 'postJson("/api/encoder/shoulder/align", {})' in app_js
+    assert 'postJson("/api/encoder/shoulder/align", { settings: pathSettings() })' in app_js
+    assert '["idle", "stopped"].includes(state.robotState?.motion_state)' in app_js
     sweep_handler = app_js.split("async function runAssistedEncoderSweep()", 1)[1].split(
         "async function cancelAssistedEncoderSweep()",
         1,

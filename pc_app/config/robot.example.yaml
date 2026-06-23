@@ -518,11 +518,24 @@ encoders:
     fault_tolerance_deg: 5.0
     hysteresis_deg: 0.25
     require_encoder: false
+  pose_tracking:
+    # PC-side only: when readback is calibrated/fresh/stable and motion is idle,
+    # the shoulder planning/estimated angle may follow the encoder. This does not
+    # mark base/elbow/wrist as measured.
+    enabled: true
+    mode: idle
+    min_update_delta_deg: 0.10
+    max_jump_deg: 180.0
+    # A preview is not considered stale if only the encoder-tracked shoulder
+    # moves less than this amount between preview and execute.
+    preview_stale_tolerance_deg: 2.0
+    set_shoulder_known: true
   correction:
     enabled: false
     validation_id: ""
     deadband_deg: 0.75
     max_delta_deg: 8.0
+    align_max_delta_deg: 60.0
     joint_limit_margin_deg: 2.0
     speed_deg_s: 2.0
     accel_deg_s2: 10.0

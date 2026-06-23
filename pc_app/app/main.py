@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from itertools import product
-from math import dist, isfinite
+from math import dist, isfinite, sqrt
 from pathlib import Path
 from time import monotonic, time
 from typing import Any
@@ -116,6 +116,7 @@ from .task_destinations import (
 )
 from .protocol import (
     format_arm,
+    format_alignj,
     format_config_lines,
     format_correctj,
     format_estop,
@@ -299,6 +300,7 @@ simulation_trajectory_active = False
 MAX_TRAJECTORY_UPLOAD_POINTS = 220
 TASK_PREVIEW_TTL_S = 600.0
 PREVIEW_START_TOLERANCE_DEG = 0.1
+CONTROLLER_REBASE_TOLERANCE_DEG = 0.25
 CARTESIAN_JOG_STALE_S = 0.35
 cartesian_servo = CartesianServo(config.links, config.joints, state.reported_angles_deg)
 cartesian_jog_runtime: dict[str, Any] = {
@@ -524,6 +526,41 @@ def pose_snapshot_fields(*, planning_links: LinkConfig | None = None) -> dict[st
     }
 
 
+def encoder_tracking_preview_tolerance_deg() -> float:
+    tracking = encoder_settings(config).get("pose_tracking", {})
+    if not isinstance(tracking, dict) or not bool(tracking.get("enabled")):
+        return PREVIEW_START_TOLERANCE_DEG
+    try:
+        return max(
+            PREVIEW_START_TOLERANCE_DEG,
+            float(tracking.get("preview_stale_tolerance_deg", 2.0)),
+        )
+    except (TypeError, ValueError):
+        return max(PREVIEW_START_TOLERANCE_DEG, 2.0)
+
+
+def preview_start_allowed_deltas() -> list[float]:
+    allowed = [PREVIEW_START_TOLERANCE_DEG] * len(state.reported_angles_deg)
+    tracking_applied = (
+        state.pose_source == "encoder_shoulder_tracking"
+        and state.encoder_mismatch.get("pose_tracking_status") == "applied"
+    )
+    shoulder_authority = state.joint_authority[1] if len(state.joint_authority) > 1 else ""
+    shoulder_measured = state.measured_angles_deg[1] if len(state.measured_angles_deg) > 1 else None
+    shoulder_encoder_tracked = (
+        tracking_applied
+        or state.pose_source == "encoder_shoulder_tracking"
+        or (
+            shoulder_authority == "measured"
+            and shoulder_measured is not None
+            and encoder_settings(config).get("pose_tracking", {}).get("enabled")
+        )
+    )
+    if shoulder_encoder_tracked and len(allowed) > 1:
+        allowed[1] = encoder_tracking_preview_tolerance_deg()
+    return allowed
+
+
 def preview_stale_reason(preview: dict[str, Any]) -> str | None:
     if "start_pose_revision" not in preview or "start_reported_angles_deg" not in preview:
         return "preview is missing an authoritative start pose; preview again"
@@ -539,17 +576,70 @@ def preview_stale_reason(preview: dict[str, Any]) -> str | None:
         abs(float(current) - float(start))
         for current, start in zip(state.reported_angles_deg, start_angles, strict=True)
     ]
-    max_delta = max(deltas, default=0.0)
-    if max_delta > PREVIEW_START_TOLERANCE_DEG:
+    allowed_deltas = preview_start_allowed_deltas()
+    stale_indices = [
+        index
+        for index, delta in enumerate(deltas)
+        if delta > allowed_deltas[index] + 1e-9
+    ]
+    if stale_indices:
+        max_delta = max(deltas, default=0.0)
+        max_allowed = max(allowed_deltas, default=PREVIEW_START_TOLERANCE_DEG)
         return (
             "preview start pose is stale: "
             f"planned at revision {preview.get('start_pose_revision')} from "
             f"{[round(float(value), 3) for value in start_angles]}, "
             f"current revision {state.pose_revision} is "
             f"{[round(float(value), 3) for value in state.reported_angles_deg]} "
-            f"(max delta {max_delta:.3f} deg); preview again"
+            f"(max delta {max_delta:.3f} deg, allowed {max_allowed:.3f} deg); preview again"
         )
     return None
+
+
+def rebase_preview_start_to_current_if_encoder_tracked(preview: dict[str, Any]) -> bool:
+    start_angles = preview.get("start_reported_angles_deg")
+    trajectory = preview.get("trajectory")
+    if (
+        not isinstance(start_angles, list)
+        or len(start_angles) != len(state.reported_angles_deg)
+        or not isinstance(trajectory, dict)
+    ):
+        return False
+    waypoints = trajectory.get("waypoints")
+    if not isinstance(waypoints, list) or not waypoints:
+        return False
+    first = waypoints[0]
+    if not isinstance(first, list) or len(first) != len(state.reported_angles_deg):
+        return False
+    allowed = preview_start_allowed_deltas()
+    deltas = [
+        abs(float(current) - float(start))
+        for current, start in zip(state.reported_angles_deg, start_angles, strict=True)
+    ]
+    if any(delta > allowed[index] + 1e-9 for index, delta in enumerate(deltas)):
+        return False
+    shoulder_drift = deltas[1] if len(deltas) > 1 else 0.0
+    if shoulder_drift <= PREVIEW_START_TOLERANCE_DEG:
+        return False
+    current_start = [float(value) for value in state.reported_angles_deg]
+    trajectory["waypoints"] = [current_start, *waypoints[1:]]
+    preview["start_pose_revision"] = int(state.pose_revision)
+    preview["start_reported_angles_deg"] = current_start
+    preview["start_reported_at"] = float(state.reported_at)
+    preview["start_pose_source"] = state.pose_source
+    trajectory["encoder_tracking_start_rebase"] = {
+        "rebased_at": time(),
+        "shoulder_drift_deg": float(state.reported_angles_deg[1]) - float(start_angles[1]),
+        "previous_start_deg": [float(value) for value in start_angles],
+        "current_start_deg": current_start,
+    }
+    log_event(
+        "motion",
+        "preview start rebased to encoder-tracked shoulder",
+        preview_id=preview.get("id", ""),
+        shoulder_drift_deg=trajectory["encoder_tracking_start_rebase"]["shoulder_drift_deg"],
+    )
+    return True
 
 
 def cache_program_preview(
@@ -1092,6 +1182,10 @@ class EncoderBacklashCheckRequest(BaseModel):
 class EncoderCorrectionPolicyRequest(BaseModel):
     enabled: bool
     confirm: bool = False
+
+
+class EncoderShoulderAlignRequest(BaseModel):
+    settings: PathSettingsRequest | dict[str, Any] | None = None
 
 
 class ToolRequest(BaseModel):
@@ -2345,6 +2439,9 @@ def task_motion_gate_reason() -> str | None:
         ready, reason = hardware_ready_for_motion()
         if not ready:
             return reason
+        reason = hardware_trajectory_start_blocking_reason()
+        if reason:
+            return reason
         tool_errors = active_tool_hardware_errors()
         if tool_errors:
             return "; ".join(tool_errors)
@@ -2497,6 +2594,22 @@ def joint_errors_deg(target_deg: list[float], reported_deg: list[float]) -> list
         float(reported) - float(target)
         for target, reported in zip(target_deg, reported_deg, strict=True)
     ]
+
+
+def controller_estimated_angles_from_last_status(max_age_s: float | None = None) -> list[float] | None:
+    raw = state.encoder_mismatch.get("last_controller_estimated_deg")
+    if isinstance(raw, list) and len(raw) == len(state.reported_angles_deg):
+        try:
+            if max_age_s is not None:
+                updated_at = state.encoder_mismatch.get("last_controller_estimated_at")
+                if updated_at is None or time() - float(updated_at) > float(max_age_s):
+                    return None
+            return [float(value) for value in raw]
+        except (TypeError, ValueError):
+            pass
+    if max_age_s is not None:
+        return None
+    return [float(value) for value in state.reported_angles_deg]
 
 
 def tcp_sample_from_state() -> dict[str, float]:
@@ -2768,6 +2881,26 @@ def send_correctj_and_read_response(command: str) -> str:
     return response
 
 
+def send_alignj_and_read_response(command: str) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(command)
+    response = read_serial_until_any(("OK command=ALIGNJ", "ERR"), timeout_s=1.0)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
+def send_setpose_and_read_response(angles_deg: list[float]) -> str:
+    serial_client.clear_input()
+    serial_client.send_line(format_setpose([float(value) for value in angles_deg]))
+    response = read_serial_until_any(("OK command=SETPOSE", "ERR"), timeout_s=1.0)
+    state.last_controller_response = response
+    if response.startswith("ERR"):
+        raise SerialClientError(response)
+    return response
+
+
 def _trajectory_times_s(trajectory: dict[str, Any], waypoint_count: int) -> list[float]:
     raw_times = trajectory.get("time_from_start_s")
     if isinstance(raw_times, list) and len(raw_times) == waypoint_count:
@@ -2887,7 +3020,8 @@ async def wait_for_hardware_target(
     poll_interval_s: float = 0.08,
 ) -> tuple[bool, str]:
     deadline = monotonic() + max(timeout_s, poll_interval_s)
-    last_error: list[float] = []
+    last_controller_error: list[float] = []
+    last_planning_error: list[float] = []
     while monotonic() < deadline:
         if state.motion_state in {MotionState.ESTOP, MotionState.FAULT, MotionState.STOPPED}:
             return False, f"motion stopped while waiting for hardware ({state.motion_state.value})"
@@ -2895,12 +3029,30 @@ async def wait_for_hardware_target(
             refresh_serial_status()
         except SerialClientError as exc:
             return False, str(exc)
-        last_error = joint_errors_deg(target_deg, state.reported_angles_deg)
-        if state.motion_state == MotionState.IDLE and all(abs(error) <= tolerance_deg for error in last_error):
-            return True, "target reached"
+        controller_estimate = controller_estimated_angles_from_last_status(max_age_s=2.0)
+        if controller_estimate is None:
+            return False, "controller status did not include fresh estimated joint angles"
+        last_controller_error = joint_errors_deg(target_deg, controller_estimate)
+        last_planning_error = joint_errors_deg(target_deg, state.reported_angles_deg)
+        if state.motion_state == MotionState.IDLE and all(abs(error) <= tolerance_deg for error in last_controller_error):
+            planning_error_text = ", ".join(f"{value:.2f}" for value in last_planning_error)
+            return True, f"controller target reached; planning/encoder residual deg=[{planning_error_text}]"
         await asyncio.sleep(poll_interval_s)
-    error_text = ", ".join(f"{value:.2f}" for value in last_error) if last_error else "unknown"
-    return False, f"hardware target timeout after {timeout_s:.2f}s; joint errors deg=[{error_text}]"
+    controller_error_text = (
+        ", ".join(f"{value:.2f}" for value in last_controller_error)
+        if last_controller_error
+        else "unknown"
+    )
+    planning_error_text = (
+        ", ".join(f"{value:.2f}" for value in last_planning_error)
+        if last_planning_error
+        else "unknown"
+    )
+    return (
+        False,
+        f"hardware target timeout after {timeout_s:.2f}s; "
+        f"controller errors deg=[{controller_error_text}], planning/encoder errors deg=[{planning_error_text}]",
+    )
 
 
 def _shoulder_evidence() -> dict[str, Any]:
@@ -2937,6 +3089,277 @@ def latch_encoder_mismatch_fault(message: str, error_deg: float | None) -> None:
         except Exception as exc:
             log_event("encoder", "could not send STOP after encoder fault", error=str(exc))
     log_event("encoder", message, error_deg=error_deg, severity="fault")
+
+
+def shoulder_controller_rebase_applicable() -> bool:
+    if state.simulation or len(config.joints) < 2:
+        return False
+    shoulder = config.joints[1]
+    return bool(
+        shoulder.actuator == "stepper"
+        and shoulder.hardware.stepper
+        and shoulder.hardware.stepper.enabled
+    )
+
+
+def update_controller_rebase_state(
+    *,
+    required: bool,
+    controller_deg: float | None = None,
+    tracked_deg: float | None = None,
+    delta_deg: float | None = None,
+    reason: str = "",
+) -> None:
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "controller_pose_rebase_required": bool(required),
+        "controller_pose_rebase_reason": reason if required else "",
+        "controller_pose_rebase_controller_shoulder_deg": controller_deg,
+        "controller_pose_rebase_tracked_shoulder_deg": tracked_deg,
+        "controller_pose_rebase_delta_deg": delta_deg,
+        "controller_pose_rebase_checked_at": time(),
+    }
+
+
+def controller_pose_rebase_blocking_reason() -> str | None:
+    if not state.encoder_mismatch.get("controller_pose_rebase_required"):
+        return None
+    delta = state.encoder_mismatch.get("controller_pose_rebase_delta_deg")
+    delta_text = ""
+    try:
+        delta_text = f" ({float(delta):+.2f} deg)"
+    except (TypeError, ValueError):
+        pass
+    return (
+        "shoulder encoder updated the planning pose but the controller step position is not synced"
+        f"{delta_text}; disarm and arm again to rebase the controller before moving"
+    )
+
+
+def sync_controller_pose_to_encoder_tracked_pose_if_needed() -> tuple[bool, str]:
+    if not state.encoder_mismatch.get("controller_pose_rebase_required"):
+        return True, ""
+    if not shoulder_controller_rebase_applicable():
+        update_controller_rebase_state(required=False)
+        return True, ""
+    if state.hardware_armed:
+        return False, controller_pose_rebase_blocking_reason() or "controller pose rebase requires disarmed hardware"
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        return False, "controller pose rebase requires idle/stopped hardware"
+    result = validate_joint_targets(config, state.reported_angles_deg)
+    if not result.ok:
+        return False, f"cannot rebase controller pose: {result.reason}"
+    send_setpose_and_read_response(state.reported_angles_deg)
+    refresh_serial_status()
+    align_target_to_reported()
+    update_controller_rebase_state(required=False)
+    log_event(
+        "encoder",
+        "controller pose rebased to encoder-tracked shoulder",
+        angles_deg=state.reported_angles_deg,
+    )
+    return True, ""
+
+
+def correction_motion_timeout_s(delta_deg: float, speed_deg_s: float, accel_deg_s2: float) -> float:
+    """Estimate a safe PC-side wait for firmware CORRECTJ to finish."""
+    distance = abs(float(delta_deg))
+    speed = max(0.001, abs(float(speed_deg_s)))
+    accel = max(0.001, abs(float(accel_deg_s2)))
+    if distance <= 0.0001:
+        duration = 0.0
+    else:
+        ramp_distance = (speed * speed) / (2.0 * accel)
+        if distance <= 2.0 * ramp_distance:
+            duration = 2.0 * sqrt(distance / accel)
+        else:
+            duration = 2.0 * speed / accel + (distance - 2.0 * ramp_distance) / speed
+    return min(30.0, max(3.0, duration * 2.0 + 2.0))
+
+
+def _shoulder_alignment_target_deg() -> float | None:
+    reference = state.target_angles_deg if len(state.target_angles_deg) > 1 else state.reported_angles_deg
+    if len(reference) <= 1:
+        return None
+    try:
+        return float(reference[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def shoulder_alignment_motion_blocking_reason() -> str | None:
+    if state.simulation:
+        return None
+    settings = encoder_settings(config)
+    tracking = settings.get("pose_tracking") if isinstance(settings.get("pose_tracking"), dict) else {}
+    if bool(tracking.get("enabled")) and state.encoder_mismatch.get("pose_tracking_status") == "skipped":
+        return str(
+            state.encoder_mismatch.get("pose_tracking_skip_reason")
+            or "shoulder encoder pose tracking was skipped; verify calibration before moving"
+        )
+    shoulder = encoder_axis(settings)
+    if not settings.get("enabled") or not shoulder or not shoulder.get("enabled"):
+        return None
+    if not shoulder.get("calibration_validated"):
+        return None
+    if str(shoulder.get("mounting_location", "")) != "joint_output":
+        return None
+    correction = settings.get("correction", {}) if isinstance(settings.get("correction"), dict) else {}
+    verification = settings.get("verification", {}) if isinstance(settings.get("verification"), dict) else {}
+    policy = str(verification.get("policy", settings.get("mode", "diagnostic"))).strip().lower()
+    correction_enabled = bool(correction.get("enabled"))
+    if not correction_enabled and policy not in {"warning", "fault"}:
+        return None
+    evidence = _shoulder_evidence()
+    measured = evidence.get("measured_angle_deg")
+    noise = evidence.get("noise_deg")
+    if not evidence.get("fresh") or measured is None:
+        return None
+    try:
+        measured_deg = float(measured)
+        noise_deg = float(noise) if noise is not None else 0.0
+        target_deg = _shoulder_alignment_target_deg()
+    except (TypeError, ValueError):
+        return None
+    if target_deg is None:
+        return None
+    max_noise = float(shoulder.get("max_noise_deg", 0.5))
+    if noise_deg > max_noise:
+        return None
+    deadband = float(correction.get("deadband_deg", 0.75))
+    warn = float(verification.get("warning_tolerance_deg", verification.get("warn_tolerance_deg", 2.0)))
+    threshold = max(0.1, max(deadband, warn))
+    error = measured_deg - target_deg
+    if abs(error) <= threshold:
+        return None
+    align_limit = max(
+        float(correction.get("max_delta_deg", 8.0)),
+        float(correction.get("align_max_delta_deg", correction.get("max_delta_deg", 8.0))),
+    )
+    if correction_enabled and "encoder_shoulder_align" in {str(value) for value in correction.get("allowed_sources", [])}:
+        if abs(error) <= align_limit:
+            return (
+                f"shoulder is {error:+.2f} deg from the planning target; press Align before normal hardware moves"
+            )
+        return (
+            f"shoulder is {error:+.2f} deg from the planning target, beyond the Align cap "
+            f"{align_limit:.2f} deg; check calibration/mechanics before moving"
+        )
+    return (
+        f"shoulder encoder disagrees with the planning target by {error:+.2f} deg; "
+        "normal hardware motion is blocked by the encoder verification policy"
+    )
+
+
+def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> bool:
+    if state.simulation or state.encoder_fault:
+        return False
+    settings = encoder_settings(config)
+    tracking = settings.get("pose_tracking") if isinstance(settings.get("pose_tracking"), dict) else {}
+    if not bool(tracking.get("enabled")):
+        return False
+    shoulder = encoder_axis(settings)
+    if (
+        not settings.get("enabled")
+        or not shoulder
+        or not shoulder.get("enabled")
+        or not shoulder.get("calibration_validated")
+        or str(shoulder.get("mounting_location")) != "joint_output"
+    ):
+        return False
+    normalized_state = str(status_state or state.motion_state.value).strip().lower()
+    if normalized_state not in {"idle", "stopped"}:
+        return False
+    if str(tracking.get("mode") or "idle") == "disarmed_idle" and state.hardware_armed:
+        return False
+    evidence = _shoulder_evidence()
+    measured = evidence.get("measured_angle_deg")
+    noise = evidence.get("noise_deg")
+    if not evidence.get("fresh") or measured is None:
+        return False
+    try:
+        measured_deg = float(measured)
+        noise_deg = float(noise) if noise is not None else 0.0
+    except (TypeError, ValueError):
+        return False
+    if not isfinite(measured_deg) or not isfinite(noise_deg):
+        return False
+    if noise_deg > float(shoulder.get("max_noise_deg", 0.5)):
+        return False
+    shoulder_joint = config.joints[1]
+    if not shoulder_joint.min_deg <= measured_deg <= shoulder_joint.max_deg:
+        return False
+    current = float(state.reported_angles_deg[1])
+    delta = measured_deg - current
+    min_delta = max(0.0, float(tracking.get("min_update_delta_deg", 0.10)))
+    if abs(delta) < min_delta:
+        if shoulder_controller_rebase_applicable() and abs(delta) <= max(min_delta, CONTROLLER_REBASE_TOLERANCE_DEG):
+            update_controller_rebase_state(required=False)
+        return False
+    max_jump = max(min_delta, float(tracking.get("max_jump_deg", 180.0)))
+    if abs(delta) > max_jump:
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "pose_tracking_status": "skipped",
+            "pose_tracking_skip_reason": (
+                f"shoulder encoder jump {delta:+.2f} deg exceeds pose tracking max jump {max_jump:.2f} deg"
+            ),
+            "pose_tracking_measured_deg": measured_deg,
+            "pose_tracking_previous_deg": current,
+            "checked_at": time(),
+        }
+        return False
+
+    tracked = [float(value) for value in state.reported_angles_deg]
+    tracked[1] = measured_deg
+    known_mask = state.pose_known_mask.ljust(len(config.joints), "0")
+    if bool(tracking.get("set_shoulder_known", True)) and len(known_mask) >= 2:
+        known_mask = f"{known_mask[0]}1{known_mask[2:]}"
+    revised = state.update_reported_pose(
+        tracked,
+        source="encoder_shoulder_tracking",
+        known_mask=known_mask,
+        force_revision=True,
+        tolerance_deg=min_delta,
+    )
+    if len(state.joint_authority) > 1:
+        state.joint_authority[1] = "measured"
+    if len(state.encoder_evidence) > 1:
+        state.encoder_evidence[1]["mismatch_deg"] = 0.0
+    if len(state.encoder_errors_deg) > 1:
+        state.encoder_errors_deg[1] = 0.0
+    target = [float(value) for value in state.target_angles_deg]
+    if len(target) > 1:
+        target[1] = measured_deg
+        state.target_angles_deg = target
+        limiter.current_deg = tracked.copy()
+        limiter.set_target(target)
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "pose_tracking_status": "applied",
+        "pose_tracking_measured_deg": measured_deg,
+        "pose_tracking_previous_deg": current,
+        "pose_tracking_delta_deg": delta,
+        "pose_tracking_revised": revised,
+        "tracked_at": time(),
+    }
+    if shoulder_controller_rebase_applicable():
+        rebase_required = abs(delta) > max(min_delta, CONTROLLER_REBASE_TOLERANCE_DEG)
+        update_controller_rebase_state(
+            required=rebase_required,
+            controller_deg=current,
+            tracked_deg=measured_deg,
+            delta_deg=delta,
+            reason="encoder_tracked_shoulder_differs_from_controller_step_position",
+        )
+    log_event(
+        "encoder",
+        "shoulder pose tracked from encoder",
+        previous_deg=current,
+        measured_deg=measured_deg,
+        delta_deg=delta,
+    )
+    return True
 
 
 async def _stable_shoulder_measurement(required_samples: int) -> tuple[float | None, str]:
@@ -3160,11 +3583,7 @@ async def verify_shoulder_after_motion(
     transaction_id = str(uuid4())
     for attempt in range(1, max_attempts + 1):
         delta = -error
-        current_bias = 0.0
-        reported_bias = state.correction_state.get("bias_deg")
-        if isinstance(reported_bias, list) and len(reported_bias) > 1 and reported_bias[1] is not None:
-            current_bias = float(reported_bias[1])
-        candidate_angle = commanded_reference + current_bias + delta
+        candidate_angle = float(measured) + delta
         if not (
             shoulder_joint.min_deg + limit_margin
             <= candidate_angle
@@ -3173,11 +3592,14 @@ async def verify_shoulder_after_motion(
             message = "shoulder correction would cross the configured joint-limit margin"
             latch_encoder_mismatch_fault(message, error)
             return False, message
+        correction_speed = float(correction.get("speed_deg_s", 2.0))
+        correction_accel = float(correction.get("accel_deg_s2", 10.0))
+        correction_timeout_s = correction_motion_timeout_s(delta, correction_speed, correction_accel)
         command = format_correctj(
             2,
             delta,
-            float(correction.get("speed_deg_s", 2.0)),
-            float(correction.get("accel_deg_s2", 10.0)),
+            correction_speed,
+            correction_accel,
             transaction_id,
         )
         state.correction_state = {
@@ -3185,6 +3607,9 @@ async def verify_shoulder_after_motion(
             "transaction_id": transaction_id,
             "attempt": attempt,
             "requested_delta_deg": delta,
+            "speed_deg_s": correction_speed,
+            "accel_deg_s2": correction_accel,
+            "timeout_s": correction_timeout_s,
             "source": source,
         }
         state.last_command = command
@@ -3195,7 +3620,7 @@ async def verify_shoulder_after_motion(
             latch_encoder_mismatch_fault(message, error)
             return False, message
 
-        deadline = monotonic() + 3.0
+        deadline = monotonic() + correction_timeout_s
         while monotonic() < deadline:
             await asyncio.sleep(0.08)
             try:
@@ -3204,10 +3629,17 @@ async def verify_shoulder_after_motion(
                 message = f"shoulder correction status failed: {exc}"
                 latch_encoder_mismatch_fault(message, error)
                 return False, message
-            if state.motion_state == MotionState.IDLE:
+            if state.motion_state in {MotionState.IDLE, MotionState.STOPPED}:
                 break
+            if state.motion_state in {MotionState.FAULT, MotionState.ESTOP}:
+                message = f"shoulder correction interrupted: {state.motion_state.value}"
+                latch_encoder_mismatch_fault(message, error)
+                return False, message
         else:
-            message = "shoulder correction timed out"
+            message = (
+                f"shoulder correction timed out after {correction_timeout_s:.1f}s "
+                f"for {delta:.2f} deg at {correction_speed:.2f} deg/s"
+            )
             latch_encoder_mismatch_fault(message, error)
             return False, message
 
@@ -4840,6 +5272,14 @@ def set_targets(
         if not ready:
             state.set_error(reason)
             return {"ok": False, "error": reason, "state": state.to_dict()}
+        reason = controller_pose_rebase_blocking_reason()
+        if reason:
+            state.set_error(reason)
+            return {"ok": False, "error": reason, "state": state.to_dict()}
+        reason = shoulder_alignment_motion_blocking_reason()
+        if reason:
+            state.set_error(reason)
+            return {"ok": False, "error": reason, "state": state.to_dict()}
     can_move = validate_can_move(state)
     if not can_move.ok:
         state.set_error(can_move.reason)
@@ -6276,6 +6716,11 @@ def apply_controller_status(status_line: str) -> None:
     status = parse_status(status_line)
     state.homed = status.homed
     reported_angles = [float(value) for value in status.joints_deg]
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "last_controller_estimated_deg": reported_angles.copy(),
+        "last_controller_estimated_at": time(),
+    }
     known_pose = status.known_pose
     pose_source = status.pose_source
     legacy_encoder_authority = (
@@ -6319,6 +6764,16 @@ def apply_controller_status(status_line: str) -> None:
     if not state.encoder_fault:
         state.last_error = "" if status.fault == "OK" else status.fault
     update_encoder_evidence(status)
+    pose_tracked_from_encoder = apply_shoulder_encoder_pose_tracking(status.state)
+    if (
+        not pose_tracked_from_encoder
+        and state.encoder_mismatch.get("controller_pose_rebase_required")
+        and shoulder_controller_rebase_applicable()
+        and len(reported_angles) > 1
+        and len(state.reported_angles_deg) > 1
+        and abs(float(state.reported_angles_deg[1]) - float(reported_angles[1])) <= CONTROLLER_REBASE_TOLERANCE_DEG
+    ):
+        update_controller_rebase_state(required=False)
     state.correction_state = {
         "state": status.correction_state,
         "transaction_id": status.correction_transaction_id,
@@ -6348,6 +6803,18 @@ def refresh_serial_status() -> None:
     apply_controller_status(status_line)
 
 
+def refresh_idle_planning_pose_from_hardware() -> str | None:
+    if state.simulation or not serial_client.is_connected:
+        return None
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        return None
+    try:
+        refresh_serial_status()
+    except SerialClientError as exc:
+        return str(exc)
+    return None
+
+
 def hardware_trajectory_start_blocking_reason(preview: dict[str, Any] | None = None) -> str | None:
     if state.simulation or not serial_client.is_connected:
         return None
@@ -6357,8 +6824,17 @@ def hardware_trajectory_start_blocking_reason(preview: dict[str, Any] | None = N
         return str(exc)
     if state.motion_state == MotionState.MOVING:
         return "controller is still moving; wait for STATUS state=idle or press Stop before starting a trajectory"
+    rebase_reason = controller_pose_rebase_blocking_reason()
+    if rebase_reason:
+        return rebase_reason
     if preview is not None and "start_pose_revision" in preview:
-        return preview_stale_reason(preview)
+        rebase_preview_start_to_current_if_encoder_tracked(preview)
+        stale_reason = preview_stale_reason(preview)
+        if stale_reason:
+            return stale_reason
+    alignment_reason = shoulder_alignment_motion_blocking_reason()
+    if alignment_reason:
+        return alignment_reason
     return None
 
 
@@ -7466,6 +7942,26 @@ async def project_external_vision(request: VisionProjectRequest) -> dict[str, An
 @app.post("/api/hardware-arm")
 async def set_hardware_arm(request: ArmRequest) -> dict[str, Any]:
     requested = bool(request.armed)
+    if (
+        requested
+        and not state.simulation
+        and serial_client.is_connected
+        and state.config_sync_status == "synced"
+        and shoulder_controller_rebase_applicable()
+    ):
+        try:
+            refresh_serial_status()
+            synced, sync_reason = sync_controller_pose_to_encoder_tracked_pose_if_needed()
+            if not synced:
+                state.hardware_armed = False
+                state.set_error(sync_reason)
+                await broadcast_state()
+                return {"ok": False, "error": sync_reason, "state": state.to_dict()}
+        except SerialClientError as exc:
+            state.hardware_armed = False
+            state.set_error(str(exc), fault=True)
+            await broadcast_state()
+            return {"ok": False, "error": str(exc), "state": state.to_dict()}
     if requested and not state.simulation:
         ready, reason = hardware_ready_for_motion()
         if not ready:
@@ -8130,7 +8626,7 @@ async def set_encoder_correction_policy(request: EncoderCorrectionPolicyRequest)
 
 
 @app.post("/api/encoder/shoulder/align")
-async def align_shoulder_to_planning() -> dict[str, Any]:
+async def align_shoulder_to_planning(request: EncoderShoulderAlignRequest | None = None) -> dict[str, Any]:
     """Explicit idle shoulder-only alignment using the bounded correction path."""
     settings, shoulder, reason = _encoder_runtime_ready()
     if reason:
@@ -8153,16 +8649,23 @@ async def align_shoulder_to_planning() -> dict[str, Any]:
         state.set_error("clear the encoder fault and Set Pose before shoulder encoder alignment")
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if not state.known_pose:
-        state.set_error("Set Pose first; shoulder alignment needs a known planning pose")
-        await broadcast_state()
-        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if not state.hardware_armed:
-        state.set_error("arm hardware before shoulder encoder alignment")
-        await broadcast_state()
-        return {"ok": False, "error": state.last_error, "state": state.to_dict()}
-    if state.motion_state != MotionState.IDLE:
-        state.set_error(f"robot must be idle before shoulder encoder alignment (current: {state.motion_state.value})")
+    alignj_supported = bool(state.controller_capabilities.get("alignj"))
+    if not alignj_supported:
+        if not state.known_pose:
+            state.set_error(
+                "startup Align needs firmware with ALIGNJ support; flash/sync the controller, or Set Pose first "
+                "to use the older armed correction path"
+            )
+            await broadcast_state()
+            return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+        if not state.hardware_armed:
+            state.set_error("arm hardware before shoulder encoder alignment with this firmware")
+            await broadcast_state()
+            return {"ok": False, "error": state.last_error, "state": state.to_dict()}
+    if state.motion_state not in {MotionState.IDLE, MotionState.STOPPED}:
+        state.set_error(
+            f"robot must be idle or stopped before shoulder encoder alignment (current: {state.motion_state.value})"
+        )
         await broadcast_state()
         return {"ok": False, "error": state.last_error, "state": state.to_dict()}
     if state.live_motion_enabled or task_active() or cartesian_jog_runtime.get("active"):
@@ -8178,47 +8681,327 @@ async def align_shoulder_to_planning() -> dict[str, Any]:
     if len(target) < len(config.joints):
         target = [float(value) for value in state.reported_angles_deg]
     state.last_command = "ALIGN_SHOULDER_TO_PLANNING"
-    verified, verification_message = await verify_shoulder_after_motion(
-        "encoder_shoulder_align",
-        target,
-        allow_correction=True,
-    )
-    mismatch = state.encoder_mismatch or {}
-    correction_status = str(mismatch.get("correction_status") or "")
-    if not verified:
-        state.set_error(verification_message, fault=state.motion_state == MotionState.FAULT)
-        await broadcast_state()
-        return {
-            "ok": False,
-            "error": verification_message,
-            "verification": verification_message,
-            "mismatch": mismatch,
-            "state": state.to_dict(),
-        }
-    if correction_status == "skipped":
-        reason = str(mismatch.get("correction_skip_reason") or verification_message or "shoulder correction skipped")
+    correction = settings.get("correction", {}) if isinstance(settings.get("correction"), dict) else {}
+    if not bool(correction.get("enabled")):
+        reason = "bounded shoulder correction is disabled"
         state.set_error(reason)
         await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    allowed_sources = {str(value) for value in correction.get("allowed_sources", [])}
+    if "encoder_shoulder_align" not in allowed_sources:
+        reason = "encoder_shoulder_align is not allowed by the correction source policy"
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    if len(state.hardware_axis_states) <= 1 or state.hardware_axis_states[1] != "hardware":
+        reason = "bounded shoulder alignment requires the shoulder axis to be hardware-enabled"
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+
+    verification = settings.get("verification", {}) if isinstance(settings.get("verification"), dict) else {}
+    required_samples = max(1, int(verification.get("required_stable_samples", 3)))
+    correction_deadband = max(0.0, float(correction.get("deadband_deg", 0.75)))
+    chunk_limit = max(0.001, float(correction.get("max_delta_deg", 8.0)))
+    total_limit = max(chunk_limit, float(correction.get("align_max_delta_deg", 60.0)))
+    correction_speed = float(correction.get("speed_deg_s", 2.0))
+    correction_accel = float(correction.get("accel_deg_s2", 10.0))
+    align_path_settings = request_settings(request.settings if request else None)
+    align_speed_limits, align_accel_limits = _joint_limits_from_settings(align_path_settings)
+    first_speed = float(align_speed_limits[1]) if len(align_speed_limits) > 1 else config.joints[1].max_speed_deg_s
+    first_accel = float(align_accel_limits[1]) if len(align_accel_limits) > 1 else config.joints[1].max_accel_deg_s2
+    if not alignj_supported:
+        first_speed = min(first_speed, correction_speed)
+        first_accel = min(first_accel, correction_accel)
+    limit_margin = max(0.0, float(correction.get("joint_limit_margin_deg", 2.0)))
+    target_shoulder = float(target[1])
+    shoulder_joint = config.joints[1]
+    measured, measurement_reason = await _stable_shoulder_measurement(required_samples)
+    if measured is None:
+        reason = f"shoulder encoder is not stable enough for alignment: {measurement_reason}"
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "state": state.to_dict()}
+    initial_error = float(measured) - target_shoulder
+    if abs(initial_error) <= correction_deadband:
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "aligned",
+            "source": "encoder_shoulder_align",
+            "commanded_deg": target_shoulder,
+            "measured_deg": measured,
+            "error_deg": initial_error,
+            "correction_status": "not_needed",
+            "correction_skip_reason": (
+                f"shoulder error {abs(initial_error):.2f} deg is within correction deadband "
+                f"{correction_deadband:.2f} deg"
+            ),
+            "checked_at": time(),
+        }
+        state.clear_error()
+        await broadcast_state()
         return {
-            "ok": False,
-            "error": reason,
-            "verification": verification_message,
-            "mismatch": mismatch,
+            "ok": True,
+            "verification": "already aligned",
+            "mismatch": state.encoder_mismatch,
             "state": state.to_dict(),
         }
+    if abs(initial_error) > total_limit:
+        reason = (
+            f"shoulder alignment error {abs(initial_error):.2f} deg exceeds Align Shoulder total cap "
+            f"{total_limit:.2f} deg"
+        )
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "align_blocked",
+            "source": "encoder_shoulder_align",
+            "commanded_deg": target_shoulder,
+            "measured_deg": measured,
+            "error_deg": initial_error,
+            "correction_status": "skipped",
+            "correction_skip_reason": reason,
+            "correction_max_delta_deg": chunk_limit,
+            "align_max_delta_deg": total_limit,
+            "checked_at": time(),
+        }
+        state.set_error(reason)
+        await broadcast_state()
+        return {"ok": False, "error": reason, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+    total_requested = 0.0
+    chunk_records: list[dict[str, Any]] = []
+    error = initial_error
+    max_chunks = max(2, min(30, int(abs(initial_error) / chunk_limit) + 4))
+    for chunk_index in range(1, max_chunks + 1):
+        if abs(error) <= correction_deadband:
+            break
+        if chunk_index == 1:
+            delta = max(-total_limit, min(total_limit, -error))
+        else:
+            delta = max(-chunk_limit, min(chunk_limit, -error))
+        if abs(total_requested + delta) > total_limit + 1e-6:
+            reason = "shoulder alignment would exceed the configured Align Shoulder total cap"
+            state.encoder_mismatch = {
+                **state.encoder_mismatch,
+                "status": "align_blocked",
+                "source": "encoder_shoulder_align",
+                "commanded_deg": target_shoulder,
+                "measured_deg": measured,
+                "error_deg": error,
+                "correction_status": "skipped",
+                "correction_skip_reason": reason,
+                "correction_chunks": chunk_records,
+                "align_total_requested_deg": total_requested,
+                "align_max_delta_deg": total_limit,
+            }
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+        candidate_pulse_angle = float(measured) + delta
+        if not (
+            shoulder_joint.min_deg + limit_margin
+            <= candidate_pulse_angle
+            <= shoulder_joint.max_deg - limit_margin
+        ):
+            reason = "shoulder alignment would cross the configured joint-limit margin"
+            state.encoder_mismatch = {
+                **state.encoder_mismatch,
+                "status": "align_blocked",
+                "source": "encoder_shoulder_align",
+                "commanded_deg": target_shoulder,
+                "measured_deg": measured,
+                "error_deg": error,
+                "correction_status": "skipped",
+                "correction_skip_reason": reason,
+                "correction_chunks": chunk_records,
+                "align_total_requested_deg": total_requested,
+            }
+            state.set_error(reason)
+            await broadcast_state()
+            return {"ok": False, "error": reason, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+        transaction_id = str(uuid4())
+        command_speed = first_speed if chunk_index == 1 else correction_speed
+        command_accel = first_accel if chunk_index == 1 else correction_accel
+        command_kind = "ALIGNJ" if alignj_supported else "CORRECTJ"
+        correction_timeout_s = correction_motion_timeout_s(delta, command_speed, command_accel)
+        command = (
+            format_alignj(2, delta, command_speed, command_accel, transaction_id)
+            if alignj_supported
+            else format_correctj(2, delta, command_speed, command_accel, transaction_id)
+        )
+        state.correction_state = {
+            "state": "executing",
+            "transaction_id": transaction_id,
+            "attempt": chunk_index,
+            "requested_delta_deg": delta,
+            "speed_deg_s": command_speed,
+            "accel_deg_s2": command_accel,
+            "timeout_s": correction_timeout_s,
+            "source": "encoder_shoulder_align",
+            "command": command_kind,
+        }
+        state.last_command = command
+        state.encoder_mismatch = {
+            **state.encoder_mismatch,
+            "status": "aligning",
+            "source": "encoder_shoulder_align",
+            "commanded_deg": target_shoulder,
+            "measured_deg": measured,
+            "error_deg": error,
+            "correction_status": "executing",
+            "correction_attempt": chunk_index,
+            "correction_would_delta_deg": delta,
+            "correction_max_delta_deg": chunk_limit,
+            "align_max_delta_deg": total_limit,
+            "align_total_requested_deg": total_requested + delta,
+            "correction_chunks": chunk_records,
+            "align_chunk_mode": "initial_full_error" if chunk_index == 1 else "residual_cleanup",
+            "align_command": command_kind,
+            "align_speed_deg_s": command_speed,
+            "align_accel_deg_s2": command_accel,
+        }
+        await broadcast_state()
+        try:
+            if alignj_supported:
+                send_alignj_and_read_response(command)
+            else:
+                send_correctj_and_read_response(command)
+        except SerialClientError as exc:
+            command_error = str(exc)
+            if "delta_out_of_range" in command_error.lower() and abs(delta) > chunk_limit + 1e-6:
+                fallback_reason = (
+                    "firmware rejected the large Align delta; retrying this step with the "
+                    f"{chunk_limit:.2f} deg automatic correction cap. Save/sync hardware so "
+                    "future Align operations can use the larger Align cap."
+                )
+                delta = max(-chunk_limit, min(chunk_limit, delta))
+                transaction_id = str(uuid4())
+                correction_timeout_s = correction_motion_timeout_s(delta, command_speed, command_accel)
+                command = (
+                    format_alignj(2, delta, command_speed, command_accel, transaction_id)
+                    if alignj_supported
+                    else format_correctj(2, delta, command_speed, command_accel, transaction_id)
+                )
+                state.correction_state = {
+                    "state": "executing",
+                    "transaction_id": transaction_id,
+                    "attempt": chunk_index,
+                    "requested_delta_deg": delta,
+                    "speed_deg_s": command_speed,
+                    "accel_deg_s2": command_accel,
+                    "timeout_s": correction_timeout_s,
+                    "source": "encoder_shoulder_align",
+                    "command": command_kind,
+                    "fallback_reason": fallback_reason,
+                }
+                state.last_command = command
+                state.encoder_mismatch = {
+                    **state.encoder_mismatch,
+                    "correction_would_delta_deg": delta,
+                    "correction_skip_reason": fallback_reason,
+                    "align_chunk_mode": "firmware_delta_fallback",
+                    "align_total_requested_deg": total_requested + delta,
+                }
+                await broadcast_state()
+                try:
+                    if alignj_supported:
+                        send_alignj_and_read_response(command)
+                    else:
+                        send_correctj_and_read_response(command)
+                except SerialClientError as fallback_exc:
+                    message = f"shoulder alignment correction command failed after fallback: {fallback_exc}"
+                    latch_encoder_mismatch_fault(message, error)
+                    await broadcast_state()
+                    return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+            else:
+                message = f"shoulder alignment correction command failed: {exc}"
+                latch_encoder_mismatch_fault(message, error)
+                await broadcast_state()
+                return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+        deadline = monotonic() + correction_timeout_s
+        while monotonic() < deadline:
+            await asyncio.sleep(0.08)
+            try:
+                refresh_serial_status()
+            except SerialClientError as exc:
+                message = f"shoulder alignment correction status failed: {exc}"
+                latch_encoder_mismatch_fault(message, error)
+                await broadcast_state()
+                return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+            if state.motion_state in {MotionState.IDLE, MotionState.STOPPED}:
+                break
+            if state.motion_state in {MotionState.FAULT, MotionState.ESTOP}:
+                message = f"shoulder alignment interrupted: {state.motion_state.value}"
+                latch_encoder_mismatch_fault(message, error)
+                await broadcast_state()
+                return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+        else:
+            message = (
+                f"shoulder alignment correction timed out after {correction_timeout_s:.1f}s "
+                f"for {delta:.2f} deg at {command_speed:.2f} deg/s"
+            )
+            latch_encoder_mismatch_fault(message, error)
+            await broadcast_state()
+            return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+        total_requested += delta
+        await asyncio.sleep(max(0.0, float(verification.get("settle_delay_ms", 300)) / 1000.0))
+        measured, measurement_reason = await _stable_shoulder_measurement(required_samples)
+        if measured is None:
+            message = f"shoulder alignment lost encoder authority: {measurement_reason}"
+            latch_encoder_mismatch_fault(message, None)
+            await broadcast_state()
+            return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+        error = float(measured) - target_shoulder
+        chunk_records.append(
+            {
+                "chunk": chunk_index,
+                "requested_delta_deg": delta,
+                "command": command_kind,
+                "speed_deg_s": command_speed,
+                "accel_deg_s2": command_accel,
+                "measured_deg": measured,
+                "error_deg": error,
+            }
+        )
+
+    if abs(error) > correction_deadband:
+        message = f"shoulder alignment did not converge; final error {error:.2f} deg"
+        latch_encoder_mismatch_fault(message, error)
+        await broadcast_state()
+        return {"ok": False, "error": message, "mismatch": state.encoder_mismatch, "state": state.to_dict()}
+
+    state.encoder_mismatch = {
+        **state.encoder_mismatch,
+        "status": "aligned",
+        "source": "encoder_shoulder_align",
+        "commanded_deg": target_shoulder,
+        "measured_deg": measured,
+        "error_deg": error,
+        "correction_status": "completed",
+        "correction_skip_reason": "",
+        "correction_chunks": chunk_records,
+        "align_total_requested_deg": total_requested,
+        "align_max_delta_deg": total_limit,
+        "corrected_at": time(),
+    }
     state.clear_error()
     log_event(
         "encoder",
         "shoulder alignment requested",
         target_shoulder_deg=target[1] if len(target) > 1 else None,
-        verification=verification_message,
-        correction_status=correction_status or mismatch.get("status"),
+        final_error_deg=error,
+        chunks=len(chunk_records),
+        total_requested_deg=total_requested,
     )
     await broadcast_state()
     return {
         "ok": True,
-        "verification": verification_message,
-        "mismatch": mismatch,
+        "verification": "aligned",
+        "mismatch": state.encoder_mismatch,
         "state": state.to_dict(),
     }
 
@@ -9019,6 +9802,11 @@ async def solve_ik(request: IkSolveRequest) -> dict[str, Any]:
 
 @app.post("/api/path/preview")
 async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
+    refresh_error = refresh_idle_planning_pose_from_hardware()
+    if refresh_error:
+        state.set_error(refresh_error)
+        await broadcast_state()
+        return {"ok": False, "error": refresh_error, "state": state.to_dict()}
     links = links_from_override(request.links_mm)
     purpose = str(request.purpose or "path")
     calibration_move = purpose in {
@@ -9060,6 +9848,11 @@ async def preview_path(request: PathPreviewRequest) -> dict[str, Any]:
 
 @app.post("/api/programs/preview-step")
 async def preview_program_step(request: ProgramStepPreviewRequest) -> dict[str, Any]:
+    refresh_error = refresh_idle_planning_pose_from_hardware()
+    if refresh_error:
+        state.set_error(refresh_error)
+        await broadcast_state()
+        return {"ok": False, "error": refresh_error, "state": state.to_dict()}
     if request.step_index < 0 or request.step_index >= len(request.waypoints):
         return {"ok": False, "error": "program step index is outside the sequence"}
     selected = request.waypoints[request.step_index]
@@ -9120,6 +9913,7 @@ async def execute_path(request: PathExecuteRequest) -> dict[str, Any]:
         )
         await broadcast_state()
         return {"ok": False, "error": stale_reason, "state": state.to_dict()}
+    rebase_preview_start_to_current_if_encoder_tracked(preview)
     if path_task is not None and not path_task.done():
         state.set_error("a path is already executing")
         await broadcast_state()
@@ -9664,6 +10458,11 @@ async def set_live_motion(request: LiveMotionRequest) -> dict[str, Any]:
         if not state.simulation:
             ready, reason = hardware_ready_for_motion()
             if not ready:
+                state.set_error(reason)
+                await broadcast_state()
+                return {"ok": False, "error": reason, "state": state.to_dict()}
+            reason = hardware_trajectory_start_blocking_reason()
+            if reason:
                 state.set_error(reason)
                 await broadcast_state()
                 return {"ok": False, "error": reason, "state": state.to_dict()}

@@ -36,11 +36,20 @@ def default_encoder_settings() -> dict[str, Any]:
             "hysteresis_deg": 0.25,
             "require_encoder": False,
         },
+        "pose_tracking": {
+            "enabled": True,
+            "mode": "idle",
+            "min_update_delta_deg": 0.10,
+            "max_jump_deg": 180.0,
+            "preview_stale_tolerance_deg": 2.0,
+            "set_shoulder_known": True,
+        },
         "correction": {
             "enabled": False,
             "validation_id": "",
             "deadband_deg": 0.75,
             "max_delta_deg": 8.0,
+            "align_max_delta_deg": 60.0,
             "joint_limit_margin_deg": 2.0,
             "speed_deg_s": 2.0,
             "accel_deg_s2": 10.0,
@@ -130,6 +139,12 @@ def normalize_encoder_settings(config_or_raw: RobotConfig | dict[str, Any] | Non
         verification["warning_tolerance_deg"] = raw["settle_tolerance_deg"]
 
     correction = settings.setdefault("correction", {})
+    pose_tracking = settings.setdefault("pose_tracking", {})
+    default_pose_tracking = default_encoder_settings()["pose_tracking"]
+    for key, value in default_pose_tracking.items():
+        pose_tracking.setdefault(key, value)
+    if str(pose_tracking.get("mode") or "idle") not in {"idle", "disarmed_idle"}:
+        pose_tracking["mode"] = "idle"
     if raw.get("max_correction_attempts") is not None:
         correction["max_attempts"] = raw["max_correction_attempts"]
     default_sources = default_encoder_settings()["correction"]["allowed_sources"]
@@ -154,6 +169,8 @@ def normalize_encoder_settings(config_or_raw: RobotConfig | dict[str, Any] | Non
         correction["enabled"] = False
         if settings["mode"] == "bounded_correction" or raw.get("closed_loop_mode") == "settle_correction":
             settings["mode"] = "diagnostic"
+    if legacy:
+        pose_tracking["enabled"] = False
 
     for obsolete in [
         "closed_loop_mode",
@@ -388,10 +405,29 @@ def validate_encoder_settings(config: RobotConfig, settings: dict[str, Any]) -> 
         errors.append("encoder verification thresholds must be numeric")
 
     correction = settings.get("correction") if isinstance(settings.get("correction"), dict) else {}
+    pose_tracking = settings.get("pose_tracking") if isinstance(settings.get("pose_tracking"), dict) else {}
+    pose_tracking_enabled = bool(pose_tracking.get("enabled"))
+    try:
+        min_update = float(pose_tracking.get("min_update_delta_deg", 0.10))
+        max_jump = float(pose_tracking.get("max_jump_deg", 90.0))
+        preview_tolerance = float(pose_tracking.get("preview_stale_tolerance_deg", 2.0))
+        if pose_tracking_enabled and (min_update < 0 or max_jump <= 0 or preview_tolerance <= 0):
+            errors.append(
+                "encoder pose tracking min update must be non-negative and max jump/preview tolerance must be positive"
+            )
+    except (TypeError, ValueError):
+        if pose_tracking_enabled:
+            errors.append("encoder pose tracking limits must be numeric")
+    if pose_tracking_enabled:
+        mode = str(pose_tracking.get("mode") or "idle")
+        if mode not in {"idle", "disarmed_idle"}:
+            errors.append("encoders.pose_tracking.mode must be idle or disarmed_idle")
+
     correction_enabled = bool(correction.get("enabled"))
     try:
         deadband = float(correction.get("deadband_deg", 0.75))
         max_delta = float(correction.get("max_delta_deg", 0.0))
+        align_max_delta = float(correction.get("align_max_delta_deg", 60.0))
         limit_margin = float(correction.get("joint_limit_margin_deg", -1.0))
         speed = float(correction.get("speed_deg_s", 0.0))
         accel = float(correction.get("accel_deg_s2", 0.0))
@@ -402,6 +438,8 @@ def validate_encoder_settings(config: RobotConfig, settings: dict[str, Any]) -> 
             errors.append("encoders.correction.deadband_deg must be non-negative")
         if correction_enabled and max_delta <= deadband:
             errors.append("encoder correction max delta must be greater than the correction deadband")
+        if correction_enabled and align_max_delta <= 0:
+            errors.append("encoders.correction.align_max_delta_deg must be positive")
         if correction_enabled and limit_margin < 0:
             errors.append("encoders.correction.joint_limit_margin_deg must be non-negative")
         if correction_enabled and attempts < 1:

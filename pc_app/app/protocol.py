@@ -46,6 +46,7 @@ def parse_hello_capabilities(line: str) -> dict[str, Any]:
         "config": values.get("config", "0") in {"1", "true", "True"},
         "encoder": encoder,
         "encoder_config": protocol >= 4 and encoder,
+        "alignj": values.get("alignj", "0") in {"1", "true", "True"},
         "raw": line,
     }
 
@@ -151,6 +152,28 @@ def format_correctj(joint: int, delta_deg: float, speed: float, accel: float, tr
         f"CORRECTJ joint={joint} delta={float(delta_deg):.6f} "
         f"speed={float(speed):.6f} accel={float(accel):.6f} "
         f"id={_safe_token(transaction_id)}"
+    )
+
+
+def format_alignj(
+    joint: int,
+    delta_deg: float,
+    speed: float,
+    accel: float,
+    transaction_id: str,
+    *,
+    hold: bool = True,
+) -> str:
+    if joint != 2:
+        raise ValueError("ALIGNJ currently supports only joint 2")
+    if speed <= 0 or accel <= 0:
+        raise ValueError("ALIGNJ requires positive speed and acceleration")
+    if not transaction_id.strip():
+        raise ValueError("ALIGNJ requires a transaction ID")
+    return (
+        f"ALIGNJ joint={joint} delta={float(delta_deg):.6f} "
+        f"speed={float(speed):.6f} accel={float(accel):.6f} "
+        f"id={_safe_token(transaction_id)} hold={1 if hold else 0}"
     )
 
 
@@ -271,6 +294,9 @@ def _encoder_config_lines(encoders: dict[str, Any] | None) -> list[str]:
         )
     verification = encoders.get("verification") if isinstance(encoders.get("verification"), dict) else {}
     correction = encoders.get("correction") if isinstance(encoders.get("correction"), dict) else {}
+    auto_max_delta = _safe_float(correction.get("max_delta_deg", 1.0), 1.0)
+    align_max_delta = _safe_float(correction.get("align_max_delta_deg", auto_max_delta), auto_max_delta)
+    firmware_max_delta = max(auto_max_delta, align_max_delta)
     lines.append(
         "CONFIG ENCODER_POLICY "
         f"mode={_safe_token(encoders.get('mode'), 'diagnostic')} "
@@ -283,7 +309,7 @@ def _encoder_config_lines(encoders: dict[str, Any] | None) -> list[str]:
         f"require={1 if bool(verification.get('require_encoder')) else 0} "
         f"correction={1 if bool(correction.get('enabled')) else 0} "
         f"validation_id={_safe_token(correction.get('validation_id'))} "
-        f"max_delta={_safe_float(correction.get('max_delta_deg', 1.0), 1.0):.6f} "
+        f"max_delta={firmware_max_delta:.6f} "
         f"limit_margin={_safe_float(correction.get('joint_limit_margin_deg', 2.0), 2.0):.6f} "
         f"correction_speed={_safe_float(correction.get('speed_deg_s', 2.0), 2.0):.6f} "
         f"correction_accel={_safe_float(correction.get('accel_deg_s2', 10.0), 10.0):.6f} "

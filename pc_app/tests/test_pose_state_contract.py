@@ -118,6 +118,7 @@ def test_encoder_telemetry_is_separate_from_planning_pose(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     raw = deepcopy(config.raw)
     raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {"enabled": False}
     raw["encoders"]["axes"][0].update(
         {
             "enabled": True,
@@ -155,6 +156,424 @@ def test_encoder_telemetry_is_separate_from_planning_pose(monkeypatch):
     assert main.state.measurement_valid_mask == "0100"
     assert main.state.pose_revision == pose_revision
     assert main.state.encoder_telemetry_revision > telemetry_revision
+
+
+def test_encoder_pose_tracking_can_update_idle_shoulder_planning_pose(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "min_update_delta_deg": 0.05,
+        "max_jump_deg": 180.0,
+        "set_shoulder_known": True,
+    }
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 12,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.motion_state = MotionState.IDLE
+    main.state.motion_diagnostics = {}
+    main.state.pending_motion = {}
+    main.state.update_reported_pose(
+        [0.0, 20.0, 20.0, 0.0],
+        source="unknown",
+        known_mask="0000",
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 20.0, 20.0, 0.0]
+    pose_revision = main.state.pose_revision
+
+    main.apply_controller_status(
+        "STATUS state=idle homed=0 known=0 known_mask=0000 pose_source=unknown "
+        "armed=0 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=1365 ea2=30.0 em2=30.0 eage2=20 enoise2=0.05 ef2=OK "
+        "j1=0 j2=20 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+
+    assert main.state.reported_angles_deg == pytest.approx([0.0, 30.0, 20.0, 0.0])
+    assert main.state.estimated_angles_deg == pytest.approx([0.0, 30.0, 20.0, 0.0])
+    assert main.state.target_angles_deg[1] == pytest.approx(30.0)
+    assert main.state.pose_known_mask == "0100"
+    assert main.state.known_pose is False
+    assert main.state.joint_authority[1] == "measured"
+    assert main.state.pose_revision > pose_revision
+    assert main.state.encoder_mismatch["pose_tracking_status"] == "applied"
+
+
+def test_encoder_pose_tracking_does_not_update_while_controller_reports_moving(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {"enabled": True, "mode": "idle"}
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 12,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.update_reported_pose(
+        [0.0, 20.0, 20.0, 0.0],
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 20.0, 20.0, 0.0]
+    main.state.motion_diagnostics = {"result": "executing"}
+    pose_revision = main.state.pose_revision
+
+    main.apply_controller_status(
+        "STATUS state=moving homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
+        "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=1365 ea2=30.0 em2=30.0 eage2=20 enoise2=0.05 ef2=OK "
+        "j1=0 j2=20 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+
+    assert main.state.reported_angles_deg[1] == pytest.approx(20.0)
+    assert main.state.measured_angles_deg[1] == pytest.approx(30.0)
+
+
+def test_encoder_pose_tracking_updates_idle_status_even_with_pending_motion_diagnostics(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {"enabled": True, "mode": "idle"}
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 12,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.update_reported_pose(
+        [0.0, 20.0, 20.0, 0.0],
+        source="setpose",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 20.0, 20.0, 0.0]
+    main.state.motion_diagnostics = {"result": "executing"}
+    main.state.pending_motion = {"status": "queued"}
+
+    main.apply_controller_status(
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
+        "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=1365 ea2=30.0 em2=30.0 eage2=20 enoise2=0.05 ef2=OK "
+        "j1=0 j2=20 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+
+    assert main.state.reported_angles_deg[1] == pytest.approx(30.0)
+    assert main.state.target_angles_deg[1] == pytest.approx(30.0)
+    assert main.state.pose_source == "encoder_shoulder_tracking"
+
+
+def test_hardware_joint_move_blocks_when_encoder_tracked_pose_not_rebased_to_controller(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "min_update_delta_deg": 0.05,
+        "max_jump_deg": 180.0,
+        "set_shoulder_known": True,
+    }
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 15,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-planning-refresh-test")
+    status = (
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
+        "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=4789 ea2=105.264 em2=105.264 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
+        "j1=0 j2=93.78 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+    fake = FakeSerial(repeated_status=status)
+    monkeypatch.setattr(main, "serial_client", fake)
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.hardware_armed = True
+    main.state.config_sync_status = "synced"
+    main.state.motion_state = MotionState.IDLE
+    main.state.motion_diagnostics = {}
+    main.state.pending_motion = {}
+    main.state.update_reported_pose(
+        [0.0, 93.78, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 93.78, 20.0, 0.0]
+    main.path_previews.clear()
+    main.path_task = None
+    main.path_task_source = None
+
+    async def scenario():
+        response = await main.start_joint_target_trajectory(
+            [0.0, 100.0, 20.0, 0.0],
+            "set_all_joint_targets",
+            main.PathSettingsRequest(global_speed_deg_s=20.0, global_accel_deg_s2=40.0),
+        )
+        if response.get("ok") and main.path_task is not None:
+            await asyncio.wait_for(main.path_task, timeout=1.0)
+        return response
+
+    response = asyncio.run(scenario())
+
+    assert response["ok"] is False
+    assert "controller step position is not synced" in response["error"]
+    assert main.path_task is None or main.path_task.done()
+    assert not any(line.startswith(("TRAJ", "MOVEJ")) for line in fake.sent)
+    assert main.state.reported_angles_deg[1] == pytest.approx(105.264)
+    assert main.state.pose_source == "encoder_shoulder_tracking"
+    assert main.state.encoder_mismatch["controller_pose_rebase_required"] is True
+
+
+def test_hardware_arm_rebases_encoder_tracked_shoulder_before_enabling(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "min_update_delta_deg": 0.05,
+        "max_jump_deg": 180.0,
+        "set_shoulder_known": True,
+    }
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 15,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-arm-rebase-test")
+    stale_status = (
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
+        "armed=0 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=4789 ea2=105.264 em2=105.264 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
+        "j1=0 j2=93.78 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+    rebased_status = (
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=setpose "
+        "armed=0 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "er2=4789 ea2=105.264 em2=105.264 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
+        "j1=0 j2=105.264 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+    armed_status = rebased_status.replace("armed=0", "armed=1")
+    fake = FakeSerial(
+        responses=[
+            stale_status,
+            "OK command=SETPOSE",
+            rebased_status,
+            "OK command=ARM armed=1",
+            armed_status,
+        ]
+    )
+    monkeypatch.setattr(main, "serial_client", fake)
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.hardware_armed = False
+    main.state.config_sync_status = "synced"
+    main.state.motion_state = MotionState.IDLE
+    main.state.motion_diagnostics = {}
+    main.state.pending_motion = {}
+    main.state.update_reported_pose(
+        [0.0, 93.78, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 93.78, 20.0, 0.0]
+
+    response = asyncio.run(main.set_hardware_arm(main.ArmRequest(armed=True)))
+
+    assert response["ok"] is True
+    assert any(line.startswith("SETPOSE 0.000 105.264 20.000 0.000") for line in fake.sent)
+    assert fake.sent.index(next(line for line in fake.sent if line.startswith("SETPOSE"))) < fake.sent.index("ARM 1")
+    assert main.state.hardware_armed is True
+    assert main.state.reported_angles_deg[1] == pytest.approx(105.264)
+    assert main.state.encoder_mismatch["controller_pose_rebase_required"] is False
+
+
+def test_encoder_pose_tracking_drift_does_not_make_preview_stale(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "preview_stale_tolerance_deg": 2.0,
+    }
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-preview-test")
+    start = [0.0, 136.209, 20.0, 0.0]
+    current = [0.0, 135.264, 20.0, 0.0]
+    target = [0.0, 120.0, 20.0, 0.0]
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.update_reported_pose(
+        start,
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    main.state.encoder_mismatch = {"pose_tracking_status": "applied"}
+    preview = {
+        "id": "encoder-drift-preview",
+        "trajectory": {"waypoints": [start.copy(), target.copy()]},
+        **main.pose_snapshot_fields(),
+    }
+
+    main.state.update_reported_pose(
+        current,
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    main.state.encoder_mismatch = {"pose_tracking_status": "applied"}
+
+    assert main.preview_stale_reason(preview) is None
+    assert main.rebase_preview_start_to_current_if_encoder_tracked(preview) is True
+    assert preview["start_reported_angles_deg"] == pytest.approx(current)
+    assert preview["trajectory"]["waypoints"][0] == pytest.approx(current)
+    assert preview["trajectory"]["waypoints"][-1] == pytest.approx(target)
+
+
+def test_encoder_tracked_shoulder_preview_tolerance_does_not_depend_on_last_mismatch_status(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "preview_stale_tolerance_deg": 2.0,
+    }
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-preview-test")
+    start = [0.0, 136.209, 20.0, 0.0]
+    current = [0.0, 135.264, 20.0, 0.0]
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.update_reported_pose(
+        start,
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    preview = {
+        "id": "encoder-drift-preview",
+        "trajectory": {"waypoints": [start.copy(), [0.0, 120.0, 20.0, 0.0]]},
+        **main.pose_snapshot_fields(),
+    }
+    main.state.update_reported_pose(
+        current,
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    main.state.joint_authority[1] = "measured"
+    main.state.measured_angles_deg[1] = current[1]
+    main.state.encoder_mismatch = {"status": "diagnostic"}
+
+    assert main.preview_stale_reason(preview) is None
+
+
+def test_encoder_pose_tracking_large_drift_still_makes_preview_stale(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "preview_stale_tolerance_deg": 2.0,
+    }
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-preview-test")
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.update_reported_pose(
+        [0.0, 136.209, 20.0, 0.0],
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    main.state.encoder_mismatch = {"pose_tracking_status": "applied"}
+    preview = {
+        "id": "encoder-large-drift-preview",
+        "trajectory": {"waypoints": [[0.0, 136.209, 20.0, 0.0], [0.0, 120.0, 20.0, 0.0]]},
+        **main.pose_snapshot_fields(),
+    }
+
+    main.state.update_reported_pose(
+        [0.0, 133.5, 20.0, 0.0],
+        source="encoder_shoulder_tracking",
+        known_mask="0100",
+        force_revision=True,
+    )
+    main.state.encoder_mismatch = {"pose_tracking_status": "applied"}
+
+    reason = main.preview_stale_reason(preview)
+    assert reason is not None
+    assert "preview start pose is stale" in reason
 
 
 def test_legacy_encoder_status_cannot_establish_whole_pose_authority(monkeypatch):

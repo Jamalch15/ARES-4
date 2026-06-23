@@ -164,6 +164,10 @@ const ENCODER_STANDARD_LIMITS = {
   hysteresis_deg: 0.25,
   correction_deadband_deg: 0.75,
   correction_max_delta_deg: 8.0,
+  align_max_delta_deg: 60.0,
+  pose_tracking_min_update_delta_deg: 0.10,
+  pose_tracking_max_jump_deg: 180.0,
+  pose_tracking_preview_stale_tolerance_deg: 2.0,
 };
 
 const ENCODER_BACKLASH_PRELOAD_DEG = 8.0;
@@ -1964,7 +1968,7 @@ function renderEncoderStatus(robotState = state.robotState) {
 function markEncoderDraftDirty(event = {}) {
   if (
     event.target?.matches?.(
-      "[data-encoder-field], [data-encoder-bus-field], [data-encoder-axis-field], [data-encoder-verification-field], [data-encoder-correction-field], #encoderReferenceDescription"
+      "[data-encoder-field], [data-encoder-bus-field], [data-encoder-axis-field], [data-encoder-verification-field], [data-encoder-correction-field], [data-encoder-pose-field], #encoderReferenceDescription"
     )
   ) {
     markSettingsDirty(
@@ -1980,6 +1984,7 @@ function readEncoderPayload() {
   settings.bus ||= {};
   settings.verification ||= {};
   settings.correction ||= { enabled: false };
+  settings.pose_tracking ||= {};
   const savedBus = clonePlain(settings.bus || {});
   const savedVerification = clonePlain(settings.verification || {});
   const savedCorrection = clonePlain(settings.correction || {});
@@ -2007,6 +2012,14 @@ function readEncoderPayload() {
       : input.tagName === "SELECT"
         ? input.value
         : readNumber(input, settings.correction[field] ?? 0);
+  });
+  elements.encoderCalibration?.querySelectorAll("[data-encoder-pose-field]").forEach((input) => {
+    const field = input.dataset.encoderPoseField;
+    settings.pose_tracking[field] = input.type === "checkbox"
+      ? input.checked
+      : input.tagName === "SELECT"
+        ? input.value
+        : readNumber(input, settings.pose_tracking[field] ?? 0);
   });
   elements.encoderCalibration?.querySelectorAll("[data-encoder-axis-field]").forEach((input) => {
     const field = input.dataset.encoderAxisField;
@@ -2057,6 +2070,7 @@ function readEncoderPayload() {
   const correctionLimitsChanged = [
     "deadband_deg",
     "max_delta_deg",
+    "align_max_delta_deg",
     "joint_limit_margin_deg",
     "speed_deg_s",
     "accel_deg_s2",
@@ -2073,6 +2087,7 @@ function readEncoderPayload() {
   }
   if (!settings.enabled || !axis.enabled) {
     settings.correction.enabled = false;
+    settings.pose_tracking.enabled = false;
   }
   settings.axes = [axis];
   settings.mode = settings.correction.enabled
@@ -2450,6 +2465,7 @@ async function handleEncoderUiAction(action) {
       "[data-encoder-verification-field='hysteresis_deg']": ENCODER_STANDARD_LIMITS.hysteresis_deg,
       "[data-encoder-correction-field='deadband_deg']": ENCODER_STANDARD_LIMITS.correction_deadband_deg,
       "[data-encoder-correction-field='max_delta_deg']": ENCODER_STANDARD_LIMITS.correction_max_delta_deg,
+      "[data-encoder-correction-field='align_max_delta_deg']": ENCODER_STANDARD_LIMITS.align_max_delta_deg,
     };
     Object.entries(values).forEach(([selector, value]) => {
       const input = elements.encoderCalibration?.querySelector(selector);
@@ -2639,6 +2655,7 @@ function buildCalibrationEditors() {
     const bus = encoders.bus || {};
     const verification = encoders.verification || {};
     const correction = encoders.correction || {};
+    const poseTracking = encoders.pose_tracking || {};
     const axis = (encoders.axes || []).find((item) => Number(item.joint) === 2) || {};
     const shoulderJoint = state.config.joints?.[1] || {};
     const shoulderMin = Number.isFinite(Number(shoulderJoint.min_deg)) ? Number(shoulderJoint.min_deg) : 0;
@@ -2679,6 +2696,10 @@ function buildCalibrationEditors() {
           <label class="toggle-label compact-toggle">
             <input data-encoder-axis-field="enabled" type="checkbox" ${axis.enabled ? "checked" : ""} />
             <span>Use shoulder AS5048A</span>
+          </label>
+          <label class="toggle-label compact-toggle">
+            <input data-encoder-pose-field="enabled" type="checkbox" ${poseTracking.enabled !== false ? "checked" : ""} />
+            <span>Use encoder as shoulder pose while idle</span>
           </label>
           <label>SPI SCK GPIO
             <input data-encoder-bus-field="sck_pin" type="number" step="1" value="${bus.sck_pin ?? ENCODER_RECOMMENDED_PINS.sck_pin}" />
@@ -2811,14 +2832,16 @@ function buildCalibrationEditors() {
       </details>
       <div class="path-summary encoder-correction-guide">
         <strong>Use encoder after moves</strong>
-        <p>Best-value mode for this robot: normal open-loop move, settle, read output encoder, then apply one slow bounded shoulder correction if the error is above the deadband and below the max delta. Fault threshold only controls when mismatch becomes a fault; it does not increase correction range.</p>
+        <p>Best-value mode for this robot: while idle, use the calibrated shoulder encoder as the shoulder planning/estimated angle. During actual moves, motion stays open-loop; after motion settles, optional bounded correction can still clean up residual shoulder error.</p>
         <div class="button-row encoder-action-strip">
           <button type="button" class="primary" data-encoder-ui-action="enable-correction">Validate + enable post-move correction</button>
           <button type="button" class="danger ghost" data-encoder-ui-action="disable-correction">Disable correction</button>
         </div>
+        <div class="log-line"><span>Pose tracking</span><code>${poseTracking.enabled !== false ? "idle shoulder estimate follows fresh calibrated encoder" : "disabled"}</code></div>
         <div class="log-line"><span>Correction</span><code>${escapeHtml(correctionStatus)}</code></div>
         <div class="log-line"><span>Applies to</span><code>manual endpoint joint moves and Go Home after motion settles</code></div>
-        <div class="log-line"><span>Correction trigger</span><code>above ${format(correction.deadband_deg ?? ENCODER_STANDARD_LIMITS.correction_deadband_deg, 2)} deg, up to ${format(correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg, 2)} deg</code></div>
+        <div class="log-line"><span>Auto correction trigger</span><code>above ${format(correction.deadband_deg ?? ENCODER_STANDARD_LIMITS.correction_deadband_deg, 2)} deg, up to ${format(correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg, 2)} deg</code></div>
+        <div class="log-line"><span>Align cap</span><code>first move up to ${format(correction.align_max_delta_deg ?? ENCODER_STANDARD_LIMITS.align_max_delta_deg, 2)} deg, then cleanup up to ${format(correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg, 2)} deg</code></div>
       </div>
       <details class="advanced-block encoder-advanced-block">
         <summary>
@@ -2854,6 +2877,22 @@ function buildCalibrationEditors() {
             <label>Hysteresis deg
               <input data-encoder-verification-field="hysteresis_deg" type="number" min="0" step="0.05" value="${verification.hysteresis_deg ?? ENCODER_STANDARD_LIMITS.hysteresis_deg}" />
             </label>
+            <label>Pose tracking mode
+              <select data-encoder-pose-field="mode">
+                <option value="idle" ${(poseTracking.mode || "idle") === "idle" ? "selected" : ""}>Idle or stopped</option>
+                <option value="disarmed_idle" ${poseTracking.mode === "disarmed_idle" ? "selected" : ""}>Disarmed idle only</option>
+              </select>
+            </label>
+            <label>Pose tracking min update deg
+              <input data-encoder-pose-field="min_update_delta_deg" type="number" min="0" step="0.01" value="${poseTracking.min_update_delta_deg ?? ENCODER_STANDARD_LIMITS.pose_tracking_min_update_delta_deg}" />
+            </label>
+            <label>Pose tracking max jump deg
+              <input data-encoder-pose-field="max_jump_deg" type="number" min="0.01" step="1" value="${poseTracking.max_jump_deg ?? ENCODER_STANDARD_LIMITS.pose_tracking_max_jump_deg}" />
+            </label>
+            <label class="toggle-label compact-toggle">
+              <input data-encoder-pose-field="set_shoulder_known" type="checkbox" ${poseTracking.set_shoulder_known !== false ? "checked" : ""} />
+              <span>Measured shoulder counts as known shoulder</span>
+            </label>
             <label>Reference raw deg
               <input data-encoder-axis-field="reference_raw_deg" type="number" step="0.001" value="${axis.reference_raw_deg ?? 0}" />
             </label>
@@ -2878,6 +2917,9 @@ function buildCalibrationEditors() {
             </label>
             <label>Correction max delta deg (movement cap)
               <input data-encoder-correction-field="max_delta_deg" type="number" min="0.01" step="0.05" value="${correction.max_delta_deg ?? ENCODER_STANDARD_LIMITS.correction_max_delta_deg}" />
+            </label>
+            <label>Align max total deg
+              <input data-encoder-correction-field="align_max_delta_deg" type="number" min="0.01" step="0.5" value="${correction.align_max_delta_deg ?? ENCODER_STANDARD_LIMITS.align_max_delta_deg}" />
             </label>
             <label>Correction speed deg/s
               <input data-encoder-correction-field="speed_deg_s" type="number" min="0.1" step="0.1" value="${correction.speed_deg_s ?? 2}" />
@@ -5609,7 +5651,55 @@ function previewEndpointAngles(preview = state.latestPreview) {
   return normalizeJointAngles(lastWaypoint) || normalizeJointAngles(preview?.ik?.selected?.angles_deg);
 }
 
+function robotStateUsesEncoderTrackedShoulder(robotState = state.robotState) {
+  if (!robotState) return false;
+  const tracking = state.config?.encoders?.pose_tracking || {};
+  const measuredShoulder = robotState.measured_angles_deg?.[1] ?? robotState.encoder_evidence?.[1]?.measured_angle_deg;
+  return Boolean(
+    tracking.enabled !== false &&
+    (
+      robotState.pose_source === "encoder_shoulder_tracking" ||
+      robotState.joint_authority?.[1] === "measured" ||
+      robotState.encoder_mismatch?.pose_tracking_status === "applied"
+    ) &&
+    Number.isFinite(Number(measuredShoulder))
+  );
+}
+
+function activeShoulderJointInput() {
+  return Boolean(
+    document.activeElement?.matches?.(
+      '.joint-slider[data-index="1"], .angle-input[data-index="1"]'
+    )
+  );
+}
+
+function shoulderDeltaFromReported(angles, robotState = state.robotState) {
+  const normalized = normalizeJointAngles(angles);
+  const reported = normalizeJointAngles(robotState?.reported_angles_deg);
+  if (!normalized || !reported) return 0;
+  return Math.abs(Number(normalized[1]) - Number(reported[1]));
+}
+
+function encoderTrackedShoulderToleranceDeg() {
+  return Math.max(
+    0.1,
+    Number(state.config?.encoders?.pose_tracking?.min_update_delta_deg ?? ENCODER_STANDARD_LIMITS.pose_tracking_min_update_delta_deg),
+    0.25
+  );
+}
+
 function jointControlAngles(robotState = state.robotState) {
+  const reported = normalizeJointAngles(robotState?.reported_angles_deg);
+  if (
+    robotStateUsesEncoderTrackedShoulder(robotState) &&
+    !state.draftAngles &&
+    !state.pendingAngles &&
+    !state.commandedAngles &&
+    reported
+  ) {
+    return reported;
+  }
   return (
     normalizeJointAngles(state.draftAngles) ||
     normalizeJointAngles(state.pendingAngles) ||
@@ -5626,6 +5716,27 @@ function syncJointControls(robotState = state.robotState) {
   if (!targets) return;
   const reported = normalizeJointAngles(robotState?.reported_angles_deg) || targets;
   syncJointInputs(targets, reported, robotState);
+}
+
+function syncEncoderTrackedShoulderUi(robotState = state.robotState) {
+  if (!robotStateUsesEncoderTrackedShoulder(robotState) || activeShoulderJointInput()) return;
+  const tolerance = encoderTrackedShoulderToleranceDeg();
+  const staleDraft = shoulderDeltaFromReported(state.draftAngles, robotState) > tolerance;
+  const stalePending = shoulderDeltaFromReported(state.pendingAngles, robotState) > tolerance;
+  const staleCommanded = shoulderDeltaFromReported(state.commandedAngles, robotState) > tolerance;
+  const stalePreviewEndpoint = shoulderDeltaFromReported(state.previewAngles, robotState) > tolerance;
+  const previewStart = normalizeJointAngles(state.latestPreview?.start_reported_angles_deg);
+  const stalePreviewStart = shoulderDeltaFromReported(previewStart, robotState) > tolerance;
+  const shouldResetJointIntent = staleDraft || stalePending || staleCommanded;
+  if (shouldResetJointIntent) {
+    releaseJointControlIntent();
+  }
+  if (stalePreviewEndpoint || stalePreviewStart) {
+    clearViewPreview();
+    if (state.activeTab === "ik" && elements.previewStatus) {
+      elements.previewStatus.textContent = "Shoulder encoder updated the start pose. Preview from the current shoulder before executing.";
+    }
+  }
 }
 
 function releaseJointControlIntent() {
@@ -6129,11 +6240,25 @@ function updateDisabledState() {
   elements.homeBtn.disabled = !enabled;
   if (elements.alignShoulderBtn) {
     const encoderEvidence = state.robotState?.encoder_evidence?.[1] || {};
+    const measured = Number(encoderEvidence.measured_angle_deg);
+    const target = Number(state.robotState?.target_angles_deg?.[1]);
+    const correction = state.config?.encoders?.correction || {};
+    const verification = state.config?.encoders?.verification || {};
+    const alignThreshold = Math.max(
+      Number(correction.deadband_deg ?? ENCODER_STANDARD_LIMITS.correction_deadband_deg),
+      Number(verification.warning_tolerance_deg ?? ENCODER_STANDARD_LIMITS.warning_tolerance_deg),
+      0.1
+    );
+    const alignError = Number.isFinite(measured) && Number.isFinite(target) ? measured - target : null;
+    const needsAlign = Boolean(encoderEvidence.fresh) && alignError != null && Math.abs(alignError) > alignThreshold;
     elements.alignShoulderBtn.disabled = !enabled
       || Boolean(state.robotState?.simulation)
-      || !state.robotState?.hardware_armed
-      || state.robotState?.motion_state !== "idle"
+      || !["idle", "stopped"].includes(state.robotState?.motion_state)
       || (encoderEvidence.measured_angle_deg == null && encoderEvidence.raw_angle_deg == null);
+    elements.alignShoulderBtn.classList.toggle("attention", needsAlign);
+    elements.alignShoulderBtn.title = needsAlign
+      ? `Shoulder is ${format(alignError, 2)} deg from the planning target. Press Align before normal hardware moves.`
+      : "Move shoulder toward the current planning/target angle using encoder alignment";
   }
   elements.setPoseBtn.disabled =
     !state.robotState ||
@@ -6206,6 +6331,32 @@ function updateDisabledState() {
   }
 }
 
+function encoderPoseTrackingPreviewToleranceDeg() {
+  const tracking = state.config?.encoders?.pose_tracking || {};
+  if (tracking.enabled === false) return 0.1;
+  const value = Number(
+    tracking.preview_stale_tolerance_deg ??
+    ENCODER_STANDARD_LIMITS.pose_tracking_preview_stale_tolerance_deg
+  );
+  return Math.max(
+    0.1,
+    Number.isFinite(value) ? value : ENCODER_STANDARD_LIMITS.pose_tracking_preview_stale_tolerance_deg
+  );
+}
+
+function previewStartPoseIsStaleForCurrentState(robotState) {
+  const previewStart = normalizeJointAngles(state.latestPreview?.start_reported_angles_deg);
+  const reported = normalizeJointAngles(robotState?.reported_angles_deg);
+  if (!state.latestPreview || !previewStart || !reported) return false;
+  const trackingApplied = robotStateUsesEncoderTrackedShoulder(robotState);
+  return reported.some((value, index) => {
+    const allowed = trackingApplied && index === 1
+      ? encoderPoseTrackingPreviewToleranceDeg()
+      : 0.1;
+    return Math.abs(value - previewStart[index]) > allowed;
+  });
+}
+
 function renderState(robotState) {
   const incomingUpdatedAt = Number(robotState?.updated_at || 0);
   if (incomingUpdatedAt && incomingUpdatedAt < state.lastRobotStateUpdatedAt) return;
@@ -6214,15 +6365,10 @@ function renderState(robotState) {
   state.lastRobotStateUpdatedAt = Math.max(state.lastRobotStateUpdatedAt, incomingUpdatedAt);
   state.robotState = robotState;
   const poseRevisionChanged = incomingPoseRevision !== previousPoseRevision;
-  const previewStart = normalizeJointAngles(state.latestPreview?.start_reported_angles_deg);
-  const reported = normalizeJointAngles(robotState.reported_angles_deg);
-  const previewPoseDelta = previewStart && reported
-    ? Math.max(...reported.map((value, index) => Math.abs(value - previewStart[index])))
-    : 0;
+  syncEncoderTrackedShoulderUi(robotState);
   const previewIsStale = Boolean(
     state.latestPreview &&
-    poseRevisionChanged &&
-    previewPoseDelta > 0.1
+    previewStartPoseIsStaleForCurrentState(robotState)
   );
   const localIntentIsStale = Boolean(
     !state.latestPreview &&
@@ -8653,7 +8799,7 @@ function bindActions() {
     if (payload.state) renderState(payload.state);
   });
   elements.alignShoulderBtn?.addEventListener("click", async () => {
-    const payload = await postJson("/api/encoder/shoulder/align", {});
+    const payload = await postJson("/api/encoder/shoulder/align", { settings: pathSettings() });
     if (payload.ok) {
       releaseJointControlIntent();
       state.encoderCalibrationMessage = payload.verification || "shoulder alignment checked";

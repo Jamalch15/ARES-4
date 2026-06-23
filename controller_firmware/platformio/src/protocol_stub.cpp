@@ -117,7 +117,7 @@ void clearJogMotion(bool freezeTarget = false) {
 }
 
 void printHello() {
-  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=4 encoder=1");
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=protocol_stub protocol=4 encoder=1 alignj=1");
 }
 
 void printStatus() {
@@ -125,7 +125,7 @@ void printStatus() {
       "STATUS state=%s homed=%d known=%d known_mask=%s pose_source=%s armed=%d hw=simulated enabled=0000 "
       "enc=0000 enc_valid=0000 j1=%.2f j2=%.2f j3=%.2f j4=%.2f closed_loop=off correction=idle "
       "evalidn2=0 correction_id=none correction_delta=0 correction_steps=0 correction_attempts=0 "
-      "cb1=0 cb2=0 cb3=0 cb4=0 tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
+      "cb1=0 cb2=0 cb3=0 cb4=0 align_hold=0 tool_type=generic tool=%s tool_value=%.3f fault=%s\r\n",
       stateName(), homed ? 1 : 0, knownPose ? 1 : 0, knownPose ? "1111" : "0000", poseSourceText,
       armed ? 1 : 0, currentJointsDeg[0],
       currentJointsDeg[1], currentJointsDeg[2], currentJointsDeg[3], toolState, toolValue, faultText);
@@ -629,6 +629,8 @@ void handleCommand(String rawCommand) {
     handleSetPose(buffer);
   } else if (strcasecmp(command, "CORRECTJ") == 0) {
     printError("CORRECTION", "not_supported_by_protocol_stub");
+  } else if (strcasecmp(command, "ALIGNJ") == 0) {
+    ARM_SERIAL.println("OK command=ALIGNJ joint=2 delta=0.000000 steps=0 id=stub hold=0");
   } else if (strcasecmp(command, "STOP") == 0) {
     handleStop();
   } else if (strcasecmp(command, "ESTOP") == 0) {

@@ -84,6 +84,12 @@ button.ghost {
   background: transparent;
 }
 
+button.attention:not(:disabled) {
+  color: #0b0f16;
+  border-color: rgba(242, 180, 91, 0.9);
+  background: var(--warn);
+}
+
 button.warn {
   color: var(--warn);
   border-color: rgba(242, 180, 91, 0.45);

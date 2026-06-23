@@ -273,6 +273,8 @@ long correctionStartSteps = 0;
 long lastCorrectionEmittedSteps = 0;
 float lastCorrectionRequestedDeltaDeg = 0.0f;
 unsigned long correctionStartUs = 0;
+bool startupAlignmentActive = false;
+bool startupAlignmentHold = false;
 String commandLine;
 uint32_t lastStatusMs = 0;
 bool encoderSpiStarted = false;
@@ -888,6 +890,7 @@ void configureToolPins() {
 }
 
 void disableHardwareOutputs() {
+  startupAlignmentHold = false;
   for (int i = 0; i < kJointCount; i++) {
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
       writeStepperEnable(i, false);
@@ -1138,6 +1141,7 @@ bool validateJointLimits(const float requested[kJointCount]) {
 }
 
 void finalizeCorrection(const char* stateText) {
+  const bool wasStartupAlignment = startupAlignmentActive;
   if (correctionJointIndex >= 0 && correctionJointIndex < kJointCount) {
     const float scale = stepperStepsPerDegree(correctionJointIndex);
     if (scale > 0.0f) {
@@ -1149,15 +1153,23 @@ void finalizeCorrection(const char* stateText) {
       correctionBiasDeg[correctionJointIndex] += physicalDelta;
     }
     stepperRuntime[correctionJointIndex].targetSteps = stepperRuntime[correctionJointIndex].currentSteps;
+    if (wasStartupAlignment && !startupAlignmentHold && !armed) {
+      writeStepperEnable(correctionJointIndex, false);
+    }
   }
   correctionActive = false;
   correctionJointIndex = -1;
   pendingCorrectionBiasDeltaDeg = 0.0f;
   correctionStartUs = 0;
+  startupAlignmentActive = false;
   strlcpy(correctionState, stateText, sizeof(correctionState));
 }
 
-void clearCorrectionBias() {
+void clearCorrectionBias(bool preserveStartupHold = false) {
+  const bool keepStartupHold = preserveStartupHold && startupAlignmentHold && !armed;
+  if (startupAlignmentHold && !keepStartupHold && !armed) {
+    writeStepperEnable(1, false);
+  }
   correctionActive = false;
   correctionJointIndex = -1;
   pendingCorrectionBiasDeltaDeg = 0.0f;
@@ -1166,6 +1178,8 @@ void clearCorrectionBias() {
   lastCorrectionRequestedDeltaDeg = 0.0f;
   correctionStartUs = 0;
   correctionAttempts = 0;
+  startupAlignmentActive = false;
+  startupAlignmentHold = keepStartupHold;
   for (int i = 0; i < kJointCount; i++) {
     correctionBiasDeg[i] = 0.0f;
   }
@@ -1520,7 +1534,7 @@ void updateJogWatchdog(uint32_t nowMs) {
 }
 
 void printHello() {
-  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1");
+  ARM_SERIAL.println("HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1 alignj=1");
 }
 
 void printStatus() {
@@ -1535,7 +1549,8 @@ void printStatus() {
       "evalidn2=%d ef2=%s "
       "j1=%.3f j2=%.3f j3=%.3f j4=%.3f closed_loop=%s correction=%s correction_id=%s "
       "correction_delta=%.6f correction_steps=%ld correction_attempts=%d "
-      "cb1=%.4f cb2=%.4f cb3=%.4f cb4=%.4f tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
+      "cb1=%.4f cb2=%.4f cb3=%.4f cb4=%.4f align_hold=%d "
+      "tool_type=%s tool=%s tool_value=%.3f fault=%s\r\n",
       stateName(), homed ? 1 : 0, statusKnownPose ? 1 : 0, statusKnownPose ? "1111" : "0000",
       poseSourceName(), armed ? 1 : 0, hardwareMode().c_str(), enabledBits().c_str(), encoderBits().c_str(),
       encoderValidBits().c_str(), encoderRuntime[1].measuredJointDeg, encoderRuntime[1].rawCount,
@@ -1545,6 +1560,7 @@ void printStatus() {
       currentJointsDeg[2], currentJointsDeg[3], closedLoopModeName(), correctionState,
       correctionTransactionId, lastCorrectionRequestedDeltaDeg, lastCorrectionEmittedSteps, correctionAttempts,
       correctionBiasDeg[0], correctionBiasDeg[1], correctionBiasDeg[2], correctionBiasDeg[3],
+      startupAlignmentHold ? 1 : 0,
       toolTypeName(activeTool.type), toolState, toolValue, faultText);
 }
 
@@ -1825,6 +1841,7 @@ void handleArm(const String& rawCommand) {
       return;
     }
     armed = true;
+    startupAlignmentHold = false;
     for (int i = 0; i < kJointCount; i++) {
       if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
         writeStepperEnable(i, true);
@@ -2199,7 +2216,7 @@ void handleSetPose(const char* buffer) {
   if (!validateJointLimits(requested)) {
     return;
   }
-  clearCorrectionBias();
+  clearCorrectionBias(true);
   for (int i = 0; i < kJointCount; i++) {
     currentJointsDeg[i] = requested[i];
     targetJointsDeg[i] = requested[i];
@@ -2329,7 +2346,7 @@ void handleCorrectJ(const String& rawCommand) {
     printError("CORRECTION", "attempt_limit_reached");
     return;
   }
-  const float correctedPhysicalAngle = currentJointsDeg[jointIndex] + correctionBiasDeg[jointIndex] + deltaDeg;
+  const float correctedPhysicalAngle = encoderRuntime[jointIndex].measuredJointDeg + deltaDeg;
   const float limitMargin = encoderPolicy.correctionJointLimitMarginDeg;
   if (correctedPhysicalAngle < joints[jointIndex].minDeg + limitMargin ||
       correctedPhysicalAngle > joints[jointIndex].maxDeg - limitMargin) {
@@ -2364,6 +2381,114 @@ void handleCorrectJ(const String& rawCommand) {
       stepDelta,
       correctionAttempts,
       correctionTransactionId);
+}
+
+void handleAlignJ(const String& rawCommand) {
+  const int jointIndex = tokenInt(rawCommand, "joint", 0) - 1;
+  const float deltaDeg = tokenFloat(rawCommand, "delta", NAN);
+  const float speedDegS = tokenFloat(rawCommand, "speed", 0.0f);
+  const float accelDegS2 = tokenFloat(rawCommand, "accel", 0.0f);
+  const int holdAfter = tokenInt(rawCommand, "hold", 1);
+  const String transactionId = tokenString(rawCommand, "id", "none");
+  if (jointIndex != 1) {
+    printError("ALIGN", "only_shoulder_supported");
+    return;
+  }
+  if (controllerState == ControllerState::Estop) {
+    printError("ESTOP", "reset_required");
+    return;
+  }
+  if (controllerState != ControllerState::Idle && controllerState != ControllerState::Stopped) {
+    printError("STATE", "align_requires_idle_or_stopped");
+    return;
+  }
+  if (trajectoryRuntime.active || trajectoryRuntime.receiving || positionStreamRuntime.active || jogActive) {
+    printError("STATE", "align_requires_no_active_motion");
+    return;
+  }
+  if (configHasInvalidAxis()) {
+    printError("CONFIG", "hardware_config_invalid");
+    return;
+  }
+  if (!encoderPolicy.correctionEnabled || !encoderBus.enabled || !encoderConfigs[jointIndex].enabled ||
+      !encoderConfigs[jointIndex].calibrationValidated ||
+      strcmp(encoderConfigs[jointIndex].mounting, "joint_output") != 0 ||
+      joints[jointIndex].actuator != ActuatorType::Stepper ||
+      joints[jointIndex].axisState != AxisState::Hardware) {
+    printError("ALIGN", "align_not_validated");
+    return;
+  }
+  const uint32_t nowMs = millis();
+  const bool fresh =
+      encoderRuntime[jointIndex].valid &&
+      encoderRuntime[jointIndex].lastValidMs > 0 &&
+      nowMs - encoderRuntime[jointIndex].lastValidMs <= encoderConfigs[jointIndex].freshnessTimeoutMs;
+  if (!fresh || encoderRuntime[jointIndex].noiseDeg > encoderConfigs[jointIndex].maxNoiseDeg) {
+    printError("ENCODER", "shoulder_measurement_not_fresh_stable");
+    return;
+  }
+  if (!isfinite(deltaDeg) || fabsf(deltaDeg) <= 0.0001f ||
+      fabsf(deltaDeg) > encoderPolicy.maxCorrectionDeltaDeg) {
+    printError("ALIGN", "delta_out_of_range");
+    return;
+  }
+  if (speedDegS <= 0.0f || speedDegS > joints[jointIndex].maxSpeedDegS ||
+      accelDegS2 <= 0.0f || accelDegS2 > joints[jointIndex].maxAccelDegS2) {
+    printError("ALIGN", "speed_or_accel_out_of_range");
+    return;
+  }
+  if (transactionId.length() == 0 || transactionId == "none") {
+    printError("ALIGN", "transaction_id_required");
+    return;
+  }
+
+  const float targetMeasuredAngle = encoderRuntime[jointIndex].measuredJointDeg + deltaDeg;
+  const float limitMargin = encoderPolicy.correctionJointLimitMarginDeg;
+  if (targetMeasuredAngle < joints[jointIndex].minDeg + limitMargin ||
+      targetMeasuredAngle > joints[jointIndex].maxDeg - limitMargin) {
+    printError("LIMIT", "align_would_cross_joint_limit");
+    return;
+  }
+
+  const long stepDelta = lroundf(
+      deltaDeg * static_cast<float>(joints[jointIndex].directionSign) * stepperStepsPerDegree(jointIndex));
+  if (stepDelta == 0) {
+    printError("ALIGN", "delta_below_one_step");
+    return;
+  }
+
+  clearTrajectory();
+  clearJogMotion(false);
+  for (int i = 0; i < kJointCount; i++) {
+    if (i != jointIndex && joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
+      stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+    }
+  }
+
+  correctionActive = true;
+  startupAlignmentActive = true;
+  startupAlignmentHold = holdAfter != 0 && !armed;
+  correctionJointIndex = jointIndex;
+  correctionStartSteps = stepperRuntime[jointIndex].currentSteps;
+  pendingCorrectionBiasDeltaDeg = deltaDeg;
+  lastCorrectionRequestedDeltaDeg = deltaDeg;
+  lastCorrectionEmittedSteps = 0;
+  correctionStartUs = micros();
+  stepperRuntime[jointIndex].targetSteps = correctionStartSteps + stepDelta;
+  correctionAttempts = 1;
+  lastSpeedDegS = speedDegS;
+  lastAccelDegS2 = accelDegS2;
+  snprintf(correctionTransactionId, sizeof(correctionTransactionId), "%s", transactionId.c_str());
+  strlcpy(correctionState, "aligning", sizeof(correctionState));
+  writeStepperEnable(jointIndex, true);
+  controllerState = ControllerState::Moving;
+  clearFaultText();
+  ARM_SERIAL.printf(
+      "OK command=ALIGNJ joint=2 delta=%.6f steps=%ld id=%s hold=%d\r\n",
+      deltaDeg,
+      stepDelta,
+      correctionTransactionId,
+      startupAlignmentHold ? 1 : 0);
 }
 
 void handleTool(const String& rawCommand, const String& upperCommand) {
@@ -2419,7 +2544,9 @@ void updateSteppers(unsigned long nowUs) {
   if (jogActive && jogVelocityMode) {
     return;
   }
-  if (!armed || controllerState == ControllerState::Estop || controllerState == ControllerState::Stopped) {
+  if ((!armed && !startupAlignmentActive) || controllerState == ControllerState::Estop ||
+      controllerState == ControllerState::Fault ||
+      (controllerState == ControllerState::Stopped && !startupAlignmentActive)) {
     return;
   }
   for (int i = 0; i < kJointCount; i++) {
@@ -2562,6 +2689,8 @@ void handleCommand(String rawCommand) {
     handleSetPose(buffer);
   } else if (strcasecmp(command, "CORRECTJ") == 0) {
     handleCorrectJ(rawCommand);
+  } else if (strcasecmp(command, "ALIGNJ") == 0) {
+    handleAlignJ(rawCommand);
   } else if (strcasecmp(command, "MOVEJ") == 0) {
     handleMoveJ(buffer);
   } else if (strcasecmp(command, "JOGJ") == 0 || strcasecmp(command, "JOGV") == 0 ||

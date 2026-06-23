@@ -4,7 +4,7 @@
 
 The shoulder AS5048A is integrated as calibrated per-joint evidence. The robot remains PC-planned and open-loop at the motion-command level.
 
-Continuous closed-loop stepper control, in-trajectory correction, automatic full-pose adoption, and encoder-driven TCP control are out of scope.
+Continuous closed-loop stepper control, in-trajectory correction, automatic full-pose adoption, and encoder-driven TCP control are out of scope. The calibrated shoulder encoder may optionally update the shoulder planning/estimated angle while the robot is idle; this is per-joint pose tracking, not full-pose adoption.
 
 ## Pose contract
 
@@ -14,14 +14,14 @@ Continuous closed-loop stepper control, in-trajectory correction, automatic full
 - **Measured** is fresh calibrated evidence for one joint. It is nullable and has an independent validity mask.
 - **Known** is derived from the planning-known mask. One shoulder measurement never makes the complete robot or TCP pose known.
 
-`reported_angles_deg` remains a compatibility name for the planning pose. Encoder telemetry updates `encoder_telemetry_revision`, not `pose_revision`, so ordinary sensor noise does not invalidate previews.
+`reported_angles_deg` remains a compatibility name for the planning pose. Diagnostic encoder telemetry updates `encoder_telemetry_revision`, not `pose_revision`, so ordinary sensor noise does not invalidate previews. When `encoders.pose_tracking.enabled` is active and all safety/health gates pass, a fresh calibrated shoulder measurement intentionally updates the shoulder entry of the planning/estimated pose, increments `pose_revision`, and marks only the shoulder joint authority as measured.
 
 ## Implemented stages
 
 ### 1. Unsafe partial support neutralized
 
 - Legacy `settle_correction` configuration is migrated to diagnostic mode.
-- Raw encoder fields no longer overwrite the planning pose.
+- Raw encoder fields no longer overwrite the planning pose. Only calibrated, fresh, stable shoulder evidence can update planning pose, and only through the explicit idle pose-tracking gate.
 - Encoder availability no longer establishes firmware whole-pose authority.
 - Encoder, actuator, servo, tool, SPI, and chip-select GPIO conflicts block controller sync.
 - Encoder I/O and calibration changes invalidate measurement authority without discarding unrelated open-loop estimates.
@@ -92,6 +92,27 @@ Joint-output mounting may receive calibrated measurement authority. Motor-shaft 
 
 Position Library captures retain the planning pose and add evidence metadata. Calibration captures explicitly identify the complete vector as estimated/simulated rather than measured.
 
+### 4a. Idle shoulder pose tracking
+
+`encoders.pose_tracking` is a PC-side policy. When enabled, the app can make the shoulder planning/estimated angle follow the calibrated shoulder encoder while the controller reports `idle` or `stopped`.
+
+Required gates:
+
+- encoder bus and shoulder axis enabled;
+- validated joint-output shoulder calibration;
+- fresh sample within age/noise limits;
+- measured shoulder angle inside configured shoulder limits;
+- latest controller status is `idle` or `stopped`; `moving`, ESTOP, and Fault statuses do not track;
+- measured jump from the current planning shoulder does not exceed `max_jump_deg`.
+
+When applied, only joint 2 is changed. Base, elbow, wrist, and TCP are not treated as measured. If the other joints are unknown, the whole pose remains unknown even though the shoulder bit may become known. This lets the desktop view and future plans start from the real shoulder angle after manual movement without moving the motor. App-side queued/executing metadata does not suppress an idle controller STATUS update; otherwise a pre-move status refresh could reintroduce stale open-loop shoulder estimates.
+
+For hardware stepper motion, the controller's internal step position must match the encoder-tracked planning shoulder before any absolute `TRAJ`/`MOVEJ` is allowed. If encoder tracking changes the shoulder away from the controller-reported open-loop shoulder, the PC marks `controller_pose_rebase_required`. Arming from a disarmed state automatically sends `SETPOSE` with the current planning pose before `ARM 1`, which rebases the controller without moving the motor. If the controller is already armed while that rebase is required, normal motion is blocked and the operator must disarm/re-arm before moving. This prevents a path planned from the encoder shoulder from being executed by firmware that still thinks the shoulder is at an old step-count angle.
+
+If pose tracking refuses a large jump, normal hardware motion is blocked until the operator verifies calibration/state or explicitly uses a safe recovery workflow.
+
+Path previews tolerate only small encoder-tracked shoulder drift between Preview and Execute. The current working default is 2 degrees via `pose_tracking.preview_stale_tolerance_deg`; base, elbow, and wrist still use the strict preview-start tolerance. If the shoulder drift is inside that window, the first trajectory waypoint is rebased to the current encoder-tracked shoulder before upload. Larger drift still requires a new preview.
+
 ### 5. Settled mismatch verification
 
 Endpoint and uploaded trajectory completion use one post-motion verification service. It waits for idle, applies the configured settle delay, requires multiple fresh stable samples, and compares measured shoulder angle with both the open-loop estimate and final command.
@@ -110,11 +131,11 @@ Sensor loss faults only when `require_encoder` and fault policy are both enabled
 
 Correction is disabled in tracked defaults and after guided calibration. Enabling it requires a local validation record, joint-output mounting, valid calibration, known planning pose, fresh stable evidence, idle armed hardware, an allow-listed manual endpoint source, and bounded angle/speed/acceleration/attempt limits.
 
-`CORRECTJ` moves only the shoulder by a relative pulse transaction. Firmware maintains a runtime correction bias between logical and physical step positions; commanded and estimated logical angles are not rebased to the encoder. Every transaction is also checked against an explicit joint-limit margin.
+`CORRECTJ` moves only the shoulder by a relative pulse transaction after normal known-pose motion. Firmware maintains a runtime correction bias between logical and physical step positions; commanded and estimated logical angles are not rebased to the encoder. Every transaction is also checked against an explicit joint-limit margin using the fresh measured shoulder angle plus the requested delta.
 
 Correction has two separate thresholds: `deadband_deg` and `max_delta_deg`. The deadband is the small-error zone where the robot deliberately does nothing to avoid chasing noise. The max delta is the hard safety cap; if the measured shoulder error is larger than this, the system reports why correction was skipped instead of moving.
 
-Go Home remains a planned move to the configured home pose, not physical homing. After that planned move settles, source `home` uses the same shoulder verification/correction service. The operator-facing **Align Shoulder** action is a separate idle-only request that compares the calibrated shoulder encoder against the current planning/target shoulder angle and, if all correction gates pass, sends one bounded `CORRECTJ` nudge. It does not rebase the software pose and does not infer the other joints.
+Go Home remains a planned move to the configured home pose, not physical homing. After that planned move settles, source `home` uses the same shoulder verification/correction service. The preferred startup/manual workflow is idle pose tracking: the planning shoulder follows the calibrated encoder, so the next path starts from the measured shoulder angle. The operator-facing **Align** action remains available as an explicit motorized recovery tool. It compares the calibrated shoulder encoder against the current planning/target shoulder angle. With firmware that advertises `alignj=1`, Align can run before full Set Pose by sending the dedicated shoulder-only `ALIGNJ` command. `ALIGNJ` can temporarily enable and hold only the shoulder stepper, but it does not mark the whole robot pose known and does not unlock normal motion. Its first move uses the normal movement speed/acceleration preset and may cover the full measured error up to `align_max_delta_deg`; after that the app rechecks and uses the slower fine correction settings for cleanup corrections as needed. Automatic post-move correction still uses `CORRECTJ` and obeys the smaller `max_delta_deg` cap. Align does not infer the other joints.
 
 The correction transaction reports ID, requested delta, emitted steps, attempts, state, and bias. Failure, timeout, excessive error, or non-convergence latches the mismatch fault.
 
@@ -138,7 +159,7 @@ POST /api/encoder/correction/policy
 POST /api/encoder/fault/clear
 ```
 
-Protocol v4 adds `CONFIG ENCODER_BUS`, `CONFIG ENCODER`, `CONFIG ENCODER_POLICY`, encoder evidence fields, `known_mask`, correction transaction fields, and `CORRECTJ`.
+Protocol v4 adds `CONFIG ENCODER_BUS`, `CONFIG ENCODER`, `CONFIG ENCODER_POLICY`, encoder evidence fields, `known_mask`, correction transaction fields, `CORRECTJ`, and firmware capability `alignj=1`/command `ALIGNJ` for explicit shoulder-only startup alignment.
 
 Legacy status lines remain parseable. Legacy `e1`/`e2` values are diagnostic-only.
 

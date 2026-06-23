@@ -4,6 +4,7 @@ from app.config import EXAMPLE_CONFIG_PATH, load_config
 from app.demo_settings import encoder_settings, tools_settings
 from app.protocol import (
     format_arm,
+    format_alignj,
     format_config_lines,
     format_correctj,
     format_jog_stop,
@@ -61,7 +62,9 @@ def test_parse_status_line():
 
 def test_parse_hello_capabilities_detects_encoder_config_support():
     legacy = parse_hello_capabilities("HELLO name=esp32s3-arm firmware=arm_controller protocol=3 config=1")
-    current = parse_hello_capabilities("HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1")
+    current = parse_hello_capabilities(
+        "HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1 alignj=1"
+    )
 
     assert legacy["protocol"] == 3
     assert legacy["config"] is True
@@ -69,6 +72,7 @@ def test_parse_hello_capabilities_detects_encoder_config_support():
     assert current["protocol"] == 4
     assert current["encoder"] is True
     assert current["encoder_config"] is True
+    assert current["alignj"] is True
 
 
 def test_parse_extended_status_line():
@@ -150,6 +154,7 @@ def test_format_hardware_config_lines_from_config():
     assert any(line.startswith("CONFIG ENCODER joint=2 ") for line in lines)
     assert any(line.startswith("CONFIG ENCODER_POLICY ") for line in lines)
     assert any("limit_margin=2.000000" in line for line in lines)
+    assert any("CONFIG ENCODER_POLICY" in line and "max_delta=60.000000" in line for line in lines)
 
 
 def test_disabled_encoder_config_formatting_tolerates_stale_local_values():
@@ -205,6 +210,9 @@ def test_format_arm_and_setpose():
     assert format_setpose([0, 1, 2, 3]) == "SETPOSE 0.000 1.000 2.000 3.000"
     assert format_correctj(2, -0.25, 2.0, 10.0, "test transaction") == (
         "CORRECTJ joint=2 delta=-0.250000 speed=2.000000 accel=10.000000 id=test_transaction"
+    )
+    assert format_alignj(2, -12.5, 20.0, 12.0, "startup align") == (
+        "ALIGNJ joint=2 delta=-12.500000 speed=20.000000 accel=12.000000 id=startup_align hold=1"
     )
 
 

@@ -59,6 +59,7 @@ TRAJ POINT index=2 t=1.000 j1=10.000 j2=30.000 j3=10.000 j4=0.000
 TRAJ START
 TRAJ CLEAR
 CORRECTJ joint=2 delta=-0.250000 speed=2.000000 accel=10.000000 id=transaction-id
+ALIGNJ joint=2 delta=-12.500000 speed=20.000000 accel=12.000000 id=transaction-id hold=1
 STOP
 ESTOP
 HOME
@@ -85,14 +86,14 @@ MOVEJ 0.0 25.0 -30.0 10.0 25.0 100.0
 
 `TRAJ` uploads a complete timed joint-space path before motion starts. Points must be sent in increasing `index` order, `t` is seconds from the start of the trajectory, the first point must be at `t=0`, and the last point must match the declared duration. The full-arm controller interpolates between uploaded points while the actuator loop runs; this avoids treating previewed joint, Cartesian, or program paths as independent `MOVEJ` endpoints.
 
-Current implementation note: this is still open-loop target/velocity following, not final closed-loop motion control. `HOME` is a legacy "move to configured home pose" command and requires an already-known pose; it is not physical homing. The PC dashboard normally implements Go Home through the same timed `TRAJ` execution path as other planned joint moves. `MOVEJ` remains available as a low-level endpoint command. The controller validates joint limits and clears the queue on `STOP`, `ESTOP`, `HOME`, `SETPOSE`, `MOVEJ`, disarm, and config changes. Low-level stepper pulse generation is still simple and should be validated on hardware.
+Current implementation note: this is still open-loop target/velocity following, not final closed-loop motion control. `HOME` is a legacy "move to configured home pose" command and requires an already-known pose; it is not physical homing. The PC dashboard normally implements Go Home through the same timed `TRAJ` execution path as other planned joint moves. `MOVEJ` remains available as a low-level endpoint command. `CORRECTJ` is the small post-move shoulder correction transaction. `ALIGNJ` is an explicit shoulder-only startup/idle alignment transaction that may run before full pose is known when the calibrated shoulder encoder is fresh; it does not mark the full robot pose known. The controller validates joint limits and clears the queue on `STOP`, `ESTOP`, `HOME`, `SETPOSE`, `MOVEJ`, disarm, and config changes. Low-level stepper pulse generation is still simple and should be validated on hardware.
 
 ## Responses
 
 Controller identity:
 
 ```text
-HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1
+HELLO name=esp32s3-arm firmware=arm_controller protocol=4 config=1 encoder=1 alignj=1
 ```
 
 Status:
@@ -104,7 +105,7 @@ STATUS state=idle homed=0 armed=0 hw=mixed enabled=1000 j1=0.0 j2=20.0 j3=20.0 j
 Protocol v4 status separates open-loop joint estimates from shoulder evidence:
 
 ```text
-STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 e2=20.0 er2=8192 ea2=180.0 em2=20.0 eage2=40 enoise2=0.08 evalidn2=4 ef2=none j1=12.4 j2=20.0 j3=20.0 j4=0.0 closed_loop=diagnostic correction=idle correction_id=none correction_delta=0 correction_steps=0 correction_attempts=0 cb1=0 cb2=0 cb3=0 cb4=0 tool_type=generic tool=open tool_value=0.000 fault=OK
+STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 e2=20.0 er2=8192 ea2=180.0 em2=20.0 eage2=40 enoise2=0.08 evalidn2=4 ef2=none j1=12.4 j2=20.0 j3=20.0 j4=0.0 closed_loop=diagnostic correction=idle correction_id=none correction_delta=0 correction_steps=0 correction_attempts=0 cb1=0 cb2=0 cb3=0 cb4=0 align_hold=0 tool_type=generic tool=open tool_value=0.000 fault=OK
 ```
 
 `j1..j4` are estimates. Encoder availability never changes `known` or `known_mask`. Legacy `e1`/`e2` fields are retained only as diagnostic compatibility fields.
@@ -128,6 +129,7 @@ OK command=TRAJ_POINT index=0
 OK command=TRAJ_START count=3 duration=1.000
 OK command=TRAJ_CLEAR
 OK command=CORRECTJ joint=2 delta=-0.250000 steps=-18 attempt=1 id=transaction-id
+OK command=ALIGNJ joint=2 delta=-12.500000 steps=-900 id=transaction-id hold=1
 OK command=CONFIG axes=4 hw=mixed enabled=1000 pose_invalidated=0
 OK command=ARM armed=1
 OK command=SETPOSE

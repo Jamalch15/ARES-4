@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 
 import pytest
 
@@ -84,6 +85,19 @@ def status_line_for(angles, state="idle"):
         f"STATUS state={state} homed=1 known=1 pose_source=setpose armed=1 "
         f"hw=mixed enabled=1100 enc=0000 "
         f"j1={angles[0]} j2={angles[1]} j3={angles[2]} j4={angles[3]} fault=OK"
+    )
+
+
+def status_line_with_shoulder_encoder(controller_angles, measured_shoulder_deg, state="idle"):
+    raw_count = round((float(measured_shoulder_deg) % 360.0) / 360.0 * 16384)
+    return (
+        f"STATUS state={state} homed=1 known=1 known_mask=1111 pose_source=setpose armed=1 "
+        f"hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        f"er2={raw_count} ea2={measured_shoulder_deg:.3f} em2={measured_shoulder_deg:.3f} "
+        f"eage2=20 enoise2=0.02 evalidn2=4 ef2=OK "
+        f"j1={controller_angles[0]} j2={controller_angles[1]} "
+        f"j3={controller_angles[2]} j4={controller_angles[3]} "
+        "closed_loop=diagnostic correction=idle fault=OK"
     )
 
 
@@ -256,6 +270,51 @@ def test_wait_for_hardware_target_times_out_when_status_never_reaches_idle(monke
     assert not ok
     assert "timeout" in message
     assert "STATUS" in fake.sent
+
+
+def test_wait_for_hardware_target_uses_controller_estimate_before_encoder_residual(monkeypatch):
+    reset_hardware_state()
+    raw = deepcopy(main.config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "min_update_delta_deg": 0.05,
+        "max_jump_deg": 180.0,
+        "set_shoulder_known": True,
+    }
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 15,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    config = type(main.config)(**{**main.config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", config)
+    target = config.home_pose.copy()
+    target[1] = 90.0
+    measured_shoulder = target[1] + 0.96
+    fake = FakeSerial(
+        repeated_status=status_line_with_shoulder_encoder(target, measured_shoulder)
+    )
+    monkeypatch.setattr(main, "serial_client", fake)
+
+    ok, message = asyncio.run(
+        main.wait_for_hardware_target(target, timeout_s=0.02, poll_interval_s=0.001)
+    )
+
+    assert ok is True
+    assert "controller target reached" in message
+    assert "planning/encoder residual" in message
+    assert main.controller_estimated_angles_from_last_status() == pytest.approx(target)
+    assert main.state.reported_angles_deg[1] == pytest.approx(measured_shoulder)
 
 
 def test_trajectory_upload_rejects_busy_controller_before_traj_begin(monkeypatch):
