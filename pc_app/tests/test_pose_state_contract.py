@@ -376,6 +376,68 @@ def test_hardware_joint_move_blocks_when_encoder_tracked_pose_not_rebased_to_con
     assert main.state.encoder_mismatch["controller_pose_rebase_required"] is True
 
 
+def test_small_encoder_tracked_delta_inside_correction_deadband_does_not_force_rebase(monkeypatch):
+    config = load_config(EXAMPLE_CONFIG_PATH)
+    raw = deepcopy(config.raw)
+    raw["encoders"]["enabled"] = True
+    raw["encoders"]["pose_tracking"] = {
+        "enabled": True,
+        "mode": "idle",
+        "min_update_delta_deg": 0.05,
+        "max_jump_deg": 180.0,
+        "set_shoulder_known": True,
+    }
+    raw["encoders"]["correction"].update(
+        {
+            "enabled": True,
+            "validation_id": "validated",
+            "deadband_deg": 0.75,
+            "max_delta_deg": 8.0,
+        }
+    )
+    raw["encoders"]["axes"][0].update(
+        {
+            "enabled": True,
+            "cs_pin": 15,
+            "reference_raw_deg": 0.0,
+            "reference_joint_deg": 0.0,
+            "direction_sign": 1,
+            "sensor_turns_per_joint_turn": 1.0,
+            "mounting_location": "joint_output",
+            "calibration_validated": True,
+            "calibration_id": "fixture",
+        }
+    )
+    patched_config = type(config)(**{**config.__dict__, "raw": raw})
+    monkeypatch.setattr(main, "config", patched_config)
+    monkeypatch.setattr(main, "RUNNING_CONFIG_ID", "encoder-small-rebase-deadband-test")
+    main.state.connected = True
+    main.state.simulation = False
+    main.state.hardware_armed = True
+    main.state.config_sync_status = "synced"
+    main.state.motion_state = MotionState.IDLE
+    main.state.update_reported_pose(
+        [0.0, 90.0, 20.0, 0.0],
+        source="open_loop_estimate",
+        known_pose=True,
+        force_revision=True,
+    )
+    main.state.target_angles_deg = [0.0, 90.0, 20.0, 0.0]
+
+    main.apply_controller_status(
+        "STATUS state=idle homed=0 known=1 known_mask=1111 pose_source=open_loop_estimate "
+        "armed=1 hw=mixed enabled=1100 enc=0100 enc_valid=0100 "
+        "em2=90.410 eage2=20 enoise2=0.05 evalidn2=4 ef2=OK "
+        "j1=0 j2=90.000 j3=20 j4=0 closed_loop=diagnostic correction=idle fault=OK"
+    )
+
+    assert main.state.reported_angles_deg[1] == pytest.approx(90.41)
+    assert main.state.pose_source == "encoder_shoulder_tracking"
+    assert main.state.encoder_mismatch["pose_tracking_status"] == "applied"
+    assert main.state.encoder_mismatch["controller_pose_rebase_required"] is False
+    assert main.controller_pose_rebase_blocking_reason() is None
+
+
 def test_completed_correction_residual_does_not_force_controller_rebase(monkeypatch):
     config = load_config(EXAMPLE_CONFIG_PATH)
     raw = deepcopy(config.raw)

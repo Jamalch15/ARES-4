@@ -3177,6 +3177,17 @@ def correction_motion_timeout_s(delta_deg: float, speed_deg_s: float, accel_deg_
     return min(30.0, max(3.0, duration * 2.0 + 2.0))
 
 
+def controller_rebase_tolerance_deg() -> float:
+    tolerance = CONTROLLER_REBASE_TOLERANCE_DEG
+    correction = encoder_settings(config).get("correction", {})
+    if isinstance(correction, dict) and bool(correction.get("enabled")):
+        try:
+            tolerance = max(tolerance, float(correction.get("deadband_deg", 0.75)))
+        except (TypeError, ValueError):
+            tolerance = max(tolerance, 0.75)
+    return tolerance
+
+
 def should_hold_pose_tracking_after_correction(delta_deg: float, min_delta_deg: float) -> bool:
     correction = encoder_settings(config).get("correction", {})
     if not isinstance(correction, dict) or not bool(correction.get("enabled")):
@@ -3187,7 +3198,7 @@ def should_hold_pose_tracking_after_correction(delta_deg: float, min_delta_deg: 
         correction_deadband = max(0.0, float(correction.get("deadband_deg", 0.75)))
     except (TypeError, ValueError):
         correction_deadband = 0.75
-    return abs(float(delta_deg)) <= max(float(min_delta_deg), correction_deadband)
+    return abs(float(delta_deg)) <= max(float(min_delta_deg), correction_deadband, controller_rebase_tolerance_deg())
 
 
 def _shoulder_alignment_target_deg() -> float | None:
@@ -3305,6 +3316,7 @@ def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> boo
     current = float(state.reported_angles_deg[1])
     delta = measured_deg - current
     min_delta = max(0.0, float(tracking.get("min_update_delta_deg", 0.10)))
+    rebase_tolerance = max(min_delta, controller_rebase_tolerance_deg())
     if should_hold_pose_tracking_after_correction(delta, min_delta):
         state.encoder_mismatch = {
             **state.encoder_mismatch,
@@ -3321,7 +3333,7 @@ def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> boo
             update_controller_rebase_state(required=False)
         return False
     if abs(delta) < min_delta:
-        if shoulder_controller_rebase_applicable() and abs(delta) <= max(min_delta, CONTROLLER_REBASE_TOLERANCE_DEG):
+        if shoulder_controller_rebase_applicable() and abs(delta) <= rebase_tolerance:
             update_controller_rebase_state(required=False)
         return False
     max_jump = max(min_delta, float(tracking.get("max_jump_deg", 180.0)))
@@ -3372,13 +3384,17 @@ def apply_shoulder_encoder_pose_tracking(status_state: str | None = None) -> boo
         "tracked_at": time(),
     }
     if shoulder_controller_rebase_applicable():
-        rebase_required = abs(delta) > max(min_delta, CONTROLLER_REBASE_TOLERANCE_DEG)
+        rebase_required = abs(delta) > rebase_tolerance
         update_controller_rebase_state(
             required=rebase_required,
             controller_deg=current,
             tracked_deg=measured_deg,
             delta_deg=delta,
-            reason="encoder_tracked_shoulder_differs_from_controller_step_position",
+            reason=(
+                "encoder_tracked_shoulder_differs_from_controller_step_position"
+                if rebase_required
+                else ""
+            ),
         )
     log_event(
         "encoder",
@@ -6805,7 +6821,7 @@ def apply_controller_status(status_line: str) -> None:
         and shoulder_controller_rebase_applicable()
         and len(reported_angles) > 1
         and len(state.reported_angles_deg) > 1
-        and abs(float(state.reported_angles_deg[1]) - float(reported_angles[1])) <= CONTROLLER_REBASE_TOLERANCE_DEG
+        and abs(float(state.reported_angles_deg[1]) - float(reported_angles[1])) <= controller_rebase_tolerance_deg()
     ):
         update_controller_rebase_state(required=False)
     state.fk = forward_kinematics(state.reported_angles_deg, config.links)
