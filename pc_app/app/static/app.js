@@ -231,6 +231,7 @@ const elements = {
   connectSimBtn: $("#connectSimBtn"),
   connectSerialBtn: $("#connectSerialBtn"),
   disconnectBtn: $("#disconnectBtn"),
+  viewportSyncHardwareBtn: $("#viewportSyncHardwareBtn"),
   homeBtn: $("#homeBtn"),
   alignShoulderBtn: $("#alignShoulderBtn"),
   setPoseBtn: $("#setPoseBtn"),
@@ -6280,16 +6281,25 @@ function updateDisabledState() {
         ? state.robotState?.config_sync_message || "Sync controller configuration and establish a known pose before arming"
         : "Arm hardware";
   }
-  if (elements.syncHardwareBtn) {
-    elements.syncHardwareBtn.disabled =
-      !state.robotState?.connected ||
-      state.robotState?.simulation ||
-      Boolean(state.robotState?.hardware_armed) ||
-      state.robotState?.motion_state === "moving";
-    elements.syncHardwareBtn.title = state.robotState?.hardware_armed
-      ? "Disarm hardware before syncing controller configuration"
-      : "";
-  }
+  const syncDisabled =
+    !state.robotState?.connected ||
+    state.robotState?.simulation ||
+    Boolean(state.robotState?.hardware_armed) ||
+    state.robotState?.motion_state === "moving";
+  const syncTitle = state.robotState?.hardware_armed
+    ? "Disarm hardware before syncing controller configuration"
+    : state.robotState?.motion_state === "moving"
+      ? "Wait for motion to finish before syncing controller configuration"
+      : state.robotState?.simulation
+        ? "Controller sync is not required in simulation"
+        : !state.robotState?.connected
+          ? "Connect the ESP before syncing controller configuration"
+          : "Save all settings and sync controller configuration to the ESP";
+  [elements.syncHardwareBtn, elements.viewportSyncHardwareBtn].forEach((button) => {
+    if (!button) return;
+    button.disabled = syncDisabled;
+    button.title = syncTitle;
+  });
   elements.executeIkBtn.disabled = !state.previewId || !enabled;
   document.querySelectorAll("[data-position-go], [data-position-preview]").forEach((button) => {
     button.disabled = !enabled || state.robotState?.motion_state === "moving";
@@ -8324,6 +8334,50 @@ async function saveAllSettings() {
   return true;
 }
 
+async function saveAndSyncHardware() {
+  const syncButtons = [elements.syncHardwareBtn, elements.viewportSyncHardwareBtn].filter(Boolean);
+  syncButtons.forEach((button) => {
+    button.disabled = true;
+  });
+
+  try {
+    const saved = await saveAllSettings();
+    if (!saved) return;
+    updateSettingsSaveBar({
+      mode: "saving",
+      title: "Syncing controller",
+      detail: "Sending the saved hardware configuration to the ESP...",
+    });
+    if (elements.statusPill) elements.statusPill.textContent = "Syncing ESP configuration...";
+    const payload = await postJson("/api/hardware/sync");
+    if (payload.state) renderState(payload.state);
+    updateSettingsSaveBar(
+      payload.ok
+        ? { title: "All settings saved", detail: payload.message || "Saved locally and synced to the controller." }
+        : {
+            mode: "error",
+            title: "Controller sync failed",
+            detail: payload.message || payload.error || "Hardware settings remain saved locally.",
+          }
+    );
+    if (elements.statusPill) {
+      elements.statusPill.textContent = payload.ok
+        ? payload.message || "ESP configuration synced."
+        : payload.message || payload.error || "ESP sync failed.";
+    }
+  } catch (error) {
+    const message = error?.message || String(error);
+    showLocalError(`Controller sync failed: ${message}`);
+    updateSettingsSaveBar({
+      mode: "error",
+      title: "Controller sync failed",
+      detail: message,
+    });
+  } finally {
+    updateDisabledState();
+  }
+}
+
 async function discardSettingsChanges() {
   updateSettingsSaveBar({
     mode: "saving",
@@ -8889,17 +8943,8 @@ function bindActions() {
       });
     }
   });
-  elements.syncHardwareBtn.addEventListener("click", async () => {
-    const saved = await saveAllSettings();
-    if (!saved) return;
-    updateSettingsSaveBar({ mode: "saving", title: "Syncing controller", detail: "Sending the saved hardware configuration to the ESP…" });
-    const payload = await postJson("/api/hardware/sync");
-    if (payload.state) renderState(payload.state);
-    updateSettingsSaveBar(
-      payload.ok
-        ? { title: "All settings saved", detail: payload.message || "Saved locally and synced to the controller." }
-        : { mode: "error", title: "Controller sync failed", detail: payload.message || payload.error || "Hardware settings remain saved locally." }
-    );
+  [elements.syncHardwareBtn, elements.viewportSyncHardwareBtn].forEach((button) => {
+    button?.addEventListener("click", saveAndSyncHardware);
   });
   [
     elements.globalSpeedInput,

@@ -477,6 +477,28 @@ def test_armed_toggle_allows_disarming_when_controller_sync_is_blocked():
     assert 'state.robotState?.hardware_armed\n      ? "Disarm hardware"' in disabled_state
 
 
+def test_viewport_sync_esp_button_saves_and_syncs_controller():
+    index_html = (main.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    app_js = (main.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    sync_function = app_js.split("async function saveAndSyncHardware()", 1)[1].split(
+        "async function discardSettingsChanges",
+        1,
+    )[0]
+    disabled_state = app_js.split("function updateDisabledState()", 1)[1].split(
+        "elements.executeIkBtn.disabled",
+        1,
+    )[0]
+
+    assert 'id="viewportSyncHardwareBtn"' in index_html
+    viewport_button = index_html.split('id="viewportSyncHardwareBtn"', 1)[1].split("</button>", 1)[0]
+    assert "disabled" in viewport_button
+    assert "viewportSyncHardwareBtn: $(\"#viewportSyncHardwareBtn\")" in app_js
+    assert "saveAllSettings()" in sync_function
+    assert 'postJson("/api/hardware/sync")' in sync_function
+    assert "elements.viewportSyncHardwareBtn" in disabled_state
+    assert "[elements.syncHardwareBtn, elements.viewportSyncHardwareBtn]" in app_js
+
+
 def test_tool_command_rejects_action_for_wrong_active_tool(monkeypatch):
     original_config = main.config
     raw = {

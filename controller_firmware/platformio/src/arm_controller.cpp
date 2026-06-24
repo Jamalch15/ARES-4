@@ -31,6 +31,8 @@ constexpr uint32_t kServoPwmMaxDuty = (1UL << kServoPwmResolutionBits) - 1UL;
 constexpr float kDefaultHome[kJointCount] = {0.0f, 20.0f, 20.0f, 0.0f};
 constexpr float kDefaultMin[kJointCount] = {-160.0f, -30.0f, -120.0f, -120.0f};
 constexpr float kDefaultMax[kJointCount] = {160.0f, 115.0f, 120.0f, 120.0f};
+constexpr float kStepperFollowLookaheadS = 0.035f;
+constexpr float kStepperVelocityEpsilonDegS = 0.0005f;
 const char* kDefaultNames[kJointCount] = {"base", "shoulder", "elbow", "wrist"};
 
 constexpr uint32_t kEncoderSpiClockHz = 1000000;
@@ -165,6 +167,9 @@ struct StepperRuntime {
   long currentSteps = 0;
   long targetSteps = 0;
   unsigned long lastStepUs = 0;
+  unsigned long lastVelocityUpdateUs = 0;
+  float velocityDegS = 0.0f;
+  float targetVelocityDegS = 0.0f;
 };
 
 struct ServoRuntime {
@@ -278,6 +283,8 @@ bool startupAlignmentHold = false;
 String commandLine;
 uint32_t lastStatusMs = 0;
 bool encoderSpiStarted = false;
+
+void resetStepperMotionState(int index, unsigned long nowUs);
 
 float clampFloat(float value, float minValue, float maxValue) {
   return min(max(value, minValue), maxValue);
@@ -466,6 +473,7 @@ void clearJogMotion(bool freezeTarget = false) {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      resetStepperMotionState(i, nowUs);
     } else if (joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].velocityDegS = 0.0f;
       servoRuntime[i].lastUpdateUs = nowUs;
@@ -785,6 +793,71 @@ float stepsToJointDeg(int index, long steps) {
          joints[index].zeroOffsetDeg - correctionBiasDeg[index];
 }
 
+void resetStepperMotionState(int index, unsigned long nowUs) {
+  StepperRuntime& runtime = stepperRuntime[index];
+  runtime.lastStepUs = nowUs;
+  runtime.lastVelocityUpdateUs = nowUs;
+  runtime.velocityDegS = 0.0f;
+  runtime.targetVelocityDegS = 0.0f;
+}
+
+float stepperSignedErrorDeg(int index, long deltaSteps) {
+  const float scale = max(0.0001f, stepperStepsPerDegree(index));
+  return static_cast<float>(deltaSteps) / scale / static_cast<float>(joints[index].directionSign);
+}
+
+float rampStepperVelocityToward(int index, unsigned long nowUs, float desiredVelocityDegS) {
+  StepperRuntime& runtime = stepperRuntime[index];
+  if (runtime.lastVelocityUpdateUs == 0) {
+    runtime.lastVelocityUpdateUs = nowUs;
+    return fabsf(runtime.velocityDegS);
+  }
+
+  const unsigned long elapsedUs = nowUs - runtime.lastVelocityUpdateUs;
+  if (elapsedUs == 0) {
+    return fabsf(runtime.velocityDegS);
+  }
+  runtime.lastVelocityUpdateUs = nowUs;
+
+  const float dtS = clampFloat(static_cast<float>(elapsedUs) / 1000000.0f, 0.0001f, 0.05f);
+  const float accelLimit = max(0.1f, min(lastAccelDegS2, joints[index].maxAccelDegS2));
+  const float maxVelocityStep = accelLimit * dtS;
+  const float velocityDelta = desiredVelocityDegS - runtime.velocityDegS;
+  if (velocityDelta > maxVelocityStep) {
+    runtime.velocityDegS += maxVelocityStep;
+  } else if (velocityDelta < -maxVelocityStep) {
+    runtime.velocityDegS -= maxVelocityStep;
+  } else {
+    runtime.velocityDegS = desiredVelocityDegS;
+  }
+
+  if (fabsf(runtime.velocityDegS) < kStepperVelocityEpsilonDegS &&
+      fabsf(desiredVelocityDegS) < kStepperVelocityEpsilonDegS) {
+    runtime.velocityDegS = 0.0f;
+  }
+  return fabsf(runtime.velocityDegS);
+}
+
+float desiredStepperVelocityDegS(int index, long deltaSteps) {
+  const StepperRuntime& runtime = stepperRuntime[index];
+  const float errorDeg = stepperSignedErrorDeg(index, deltaSteps);
+  const float speedLimit = max(0.1f, min(lastSpeedDegS, joints[index].maxSpeedDegS));
+
+  if (trajectoryRuntime.active || positionStreamRuntime.active) {
+    const float correctionVelocity = errorDeg / kStepperFollowLookaheadS;
+    return clampFloat(runtime.targetVelocityDegS + correctionVelocity, -speedLimit, speedLimit);
+  }
+
+  const float direction = errorDeg > 0.0f ? 1.0f : -1.0f;
+  const float accelLimit = max(0.1f, min(lastAccelDegS2, joints[index].maxAccelDegS2));
+  const float remainingDeg = fabsf(errorDeg);
+  const float stoppingDistanceDeg = (runtime.velocityDegS * runtime.velocityDegS) / (2.0f * accelLimit);
+  if (runtime.velocityDegS * direction > 0.0f && stoppingDistanceDeg >= remainingDeg) {
+    return 0.0f;
+  }
+  return direction * speedLimit;
+}
+
 int servoPulseForJoint(int index, float jointDeg) {
   const ServoConfig& servo = joints[index].servo;
   const float servoDeg =
@@ -935,6 +1008,7 @@ void syncRuntimeFromCurrentPose() {
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].currentSteps = jointDegToSteps(i, currentJointsDeg[i]);
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      resetStepperMotionState(i, nowUs);
     } else if (joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].velocityDegS = 0.0f;
       servoRuntime[i].lastUpdateUs = nowUs;
@@ -1153,6 +1227,7 @@ void finalizeCorrection(const char* stateText) {
       correctionBiasDeg[correctionJointIndex] += physicalDelta;
     }
     stepperRuntime[correctionJointIndex].targetSteps = stepperRuntime[correctionJointIndex].currentSteps;
+    resetStepperMotionState(correctionJointIndex, micros());
     if (wasStartupAlignment && !startupAlignmentHold && !armed) {
       writeStepperEnable(correctionJointIndex, false);
     }
@@ -1210,6 +1285,7 @@ void setTargetPose(const float requested[kJointCount]) {
     targetJointsDeg[i] = requested[i];
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = jointDegToSteps(i, requested[i]);
+      stepperRuntime[i].targetVelocityDegS = 0.0f;
     } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].lastUpdateUs = nowUs;
     } else {
@@ -1227,11 +1303,12 @@ void setTargetPose(const float requested[kJointCount]) {
   clearFaultText();
 }
 
-void setTrajectoryTargetPose(const float requested[kJointCount]) {
+void setTrajectoryTargetPose(const float requested[kJointCount], const float* requestedVelocity = nullptr) {
   for (int i = 0; i < kJointCount; i++) {
     targetJointsDeg[i] = requested[i];
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = jointDegToSteps(i, requested[i]);
+      stepperRuntime[i].targetVelocityDegS = requestedVelocity == nullptr ? 0.0f : requestedVelocity[i];
     } else if (joints[i].axisState != AxisState::Hardware) {
       currentJointsDeg[i] = requested[i];
       if (joints[i].actuator == ActuatorType::Servo) {
@@ -1266,23 +1343,32 @@ float trajectoryDerivative(int pointIndex, int jointIndex) {
          dt;
 }
 
-void interpolateTrajectory(float elapsedS, float out[kJointCount]) {
+void interpolateTrajectory(float elapsedS, float out[kJointCount], float* velocityOut = nullptr) {
   const int count = trajectoryRuntime.count;
   if (count <= 0) {
     for (int i = 0; i < kJointCount; i++) {
       out[i] = currentJointsDeg[i];
+      if (velocityOut != nullptr) {
+        velocityOut[i] = 0.0f;
+      }
     }
     return;
   }
   if (elapsedS <= trajectoryRuntime.points[0].timeS || count == 1) {
     for (int i = 0; i < kJointCount; i++) {
       out[i] = trajectoryRuntime.points[0].jointsDeg[i];
+      if (velocityOut != nullptr) {
+        velocityOut[i] = count > 1 ? trajectoryDerivative(0, i) : 0.0f;
+      }
     }
     return;
   }
   if (elapsedS >= trajectoryRuntime.points[count - 1].timeS) {
     for (int i = 0; i < kJointCount; i++) {
       out[i] = trajectoryRuntime.points[count - 1].jointsDeg[i];
+      if (velocityOut != nullptr) {
+        velocityOut[i] = 0.0f;
+      }
     }
     return;
   }
@@ -1301,6 +1387,10 @@ void interpolateTrajectory(float elapsedS, float out[kJointCount]) {
   const float h10 = u3 - 2.0f * u2 + u;
   const float h01 = -2.0f * u3 + 3.0f * u2;
   const float h11 = u3 - u2;
+  const float dh00 = 6.0f * u2 - 6.0f * u;
+  const float dh10 = 3.0f * u2 - 4.0f * u + 1.0f;
+  const float dh01 = -6.0f * u2 + 6.0f * u;
+  const float dh11 = 3.0f * u2 - 2.0f * u;
 
   for (int joint = 0; joint < kJointCount; joint++) {
     const float m0 = trajectoryDerivative(segment, joint);
@@ -1309,6 +1399,10 @@ void interpolateTrajectory(float elapsedS, float out[kJointCount]) {
     const float low = min(p0.jointsDeg[joint], p1.jointsDeg[joint]);
     const float high = max(p0.jointsDeg[joint], p1.jointsDeg[joint]);
     out[joint] = clampFloat(raw, low, high);
+    if (velocityOut != nullptr) {
+      velocityOut[joint] =
+          (dh00 * p0.jointsDeg[joint] + dh10 * dt * m0 + dh01 * p1.jointsDeg[joint] + dh11 * dt * m1) / dt;
+    }
   }
 }
 
@@ -1325,8 +1419,9 @@ void updateTrajectoryFollower(unsigned long nowUs) {
 
   const float elapsedS = static_cast<float>(nowUs - trajectoryRuntime.startUs) / 1000000.0f;
   float requested[kJointCount] = {};
-  interpolateTrajectory(elapsedS, requested);
-  setTrajectoryTargetPose(requested);
+  float requestedVelocity[kJointCount] = {};
+  interpolateTrajectory(elapsedS, requested, requestedVelocity);
+  setTrajectoryTargetPose(requested, requestedVelocity);
 
   if (elapsedS >= trajectoryRuntime.durationS) {
     for (int i = 0; i < kJointCount; i++) {
@@ -1357,9 +1452,12 @@ void updatePositionStream(unsigned long nowUs) {
     const float desired =
         positionStreamRuntime.startDeg[i] +
         (positionStreamRuntime.targetDeg[i] - positionStreamRuntime.startDeg[i]) * progress;
+    const float desiredVelocity =
+        (positionStreamRuntime.targetDeg[i] - positionStreamRuntime.startDeg[i]) / durationS;
     targetJointsDeg[i] = desired;
     if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = jointDegToSteps(i, desired);
+      stepperRuntime[i].targetVelocityDegS = desiredVelocity;
       hardwarePending = hardwarePending || stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps;
     } else if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Servo) {
       currentJointsDeg[i] = desired;
@@ -1380,6 +1478,7 @@ void updatePositionStream(unsigned long nowUs) {
       targetJointsDeg[i] = positionStreamRuntime.targetDeg[i];
       if (joints[i].axisState == AxisState::Hardware && joints[i].actuator == ActuatorType::Stepper) {
         stepperRuntime[i].targetSteps = jointDegToSteps(i, targetJointsDeg[i]);
+        stepperRuntime[i].targetVelocityDegS = 0.0f;
         hardwarePending = hardwarePending || stepperRuntime[i].currentSteps != stepperRuntime[i].targetSteps;
       } else {
         currentJointsDeg[i] = targetJointsDeg[i];
@@ -1865,6 +1964,7 @@ void handleArm(const String& rawCommand) {
       targetJointsDeg[i] = currentJointsDeg[i];
       if (joints[i].actuator == ActuatorType::Stepper) {
         stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+        resetStepperMotionState(i, nowUs);
       } else if (joints[i].actuator == ActuatorType::Servo) {
         servoRuntime[i].velocityDegS = 0.0f;
         servoRuntime[i].lastUpdateUs = nowUs;
@@ -2247,6 +2347,7 @@ void handleStop() {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      resetStepperMotionState(i, nowUs);
     } else if (joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].velocityDegS = 0.0f;
       servoRuntime[i].lastUpdateUs = nowUs;
@@ -2273,6 +2374,7 @@ void handleEstop() {
     targetJointsDeg[i] = currentJointsDeg[i];
     if (joints[i].actuator == ActuatorType::Stepper) {
       stepperRuntime[i].targetSteps = stepperRuntime[i].currentSteps;
+      resetStepperMotionState(i, nowUs);
     } else if (joints[i].actuator == ActuatorType::Servo) {
       servoRuntime[i].velocityDegS = 0.0f;
       servoRuntime[i].lastUpdateUs = nowUs;
@@ -2370,6 +2472,7 @@ void handleCorrectJ(const String& rawCommand) {
   lastCorrectionRequestedDeltaDeg = deltaDeg;
   lastCorrectionEmittedSteps = 0;
   correctionStartUs = micros();
+  resetStepperMotionState(jointIndex, correctionStartUs);
   stepperRuntime[jointIndex].targetSteps = correctionStartSteps + stepDelta;
   correctionAttempts++;
   lastSpeedDegS = speedDegS;
@@ -2477,6 +2580,7 @@ void handleAlignJ(const String& rawCommand) {
   lastCorrectionRequestedDeltaDeg = deltaDeg;
   lastCorrectionEmittedSteps = 0;
   correctionStartUs = micros();
+  resetStepperMotionState(jointIndex, correctionStartUs);
   stepperRuntime[jointIndex].targetSteps = correctionStartSteps + stepDelta;
   correctionAttempts = 1;
   lastSpeedDegS = speedDegS;
@@ -2527,19 +2631,8 @@ void handleTool(const String& rawCommand, const String& upperCommand) {
   printStatus();
 }
 
-unsigned long stepIntervalUs(int index, unsigned long nowUs) {
-  float speed = max(1.0f, min(lastSpeedDegS, joints[index].maxSpeedDegS));
-  if (correctionActive && index == correctionJointIndex) {
-    const float scale = max(0.0001f, stepperStepsPerDegree(index));
-    const float elapsedS = static_cast<float>(nowUs - correctionStartUs) / 1000000.0f;
-    const float acceleratingSpeed = max(0.1f, lastAccelDegS2 * elapsedS);
-    const float remainingDeg =
-        fabsf(static_cast<float>(stepperRuntime[index].targetSteps - stepperRuntime[index].currentSteps)) /
-        scale;
-    const float brakingSpeed = sqrtf(max(0.0f, 2.0f * lastAccelDegS2 * remainingDeg));
-    speed = max(0.1f, min(speed, min(acceleratingSpeed, brakingSpeed)));
-  }
-  const float stepRate = max(1.0f, speed * stepperStepsPerDegree(index));
+unsigned long stepIntervalUs(int index, float speedDegS) {
+  const float stepRate = max(1.0f, max(speedDegS, kStepperVelocityEpsilonDegS) * stepperStepsPerDegree(index));
   return static_cast<unsigned long>(1000000.0f / stepRate);
 }
 
@@ -2559,9 +2652,19 @@ void updateSteppers(unsigned long nowUs) {
     StepperRuntime& runtime = stepperRuntime[i];
     const long delta = runtime.targetSteps - runtime.currentSteps;
     if (delta == 0) {
+      if (trajectoryRuntime.active || positionStreamRuntime.active) {
+        rampStepperVelocityToward(i, nowUs, 0.0f);
+      } else {
+        resetStepperMotionState(i, nowUs);
+      }
       continue;
     }
-    const unsigned long interval = stepIntervalUs(i, nowUs);
+    const float desiredVelocityDegS = desiredStepperVelocityDegS(i, delta);
+    const float speedDegS = rampStepperVelocityToward(i, nowUs, desiredVelocityDegS);
+    if (speedDegS < kStepperVelocityEpsilonDegS) {
+      continue;
+    }
+    const unsigned long interval = stepIntervalUs(i, speedDegS);
     if (nowUs - runtime.lastStepUs < interval) {
       continue;
     }
